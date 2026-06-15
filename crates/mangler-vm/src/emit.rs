@@ -1,0 +1,477 @@
+//! The interpreter emitter — driven by ONE [`InterpreterSpec`] + ONE
+//! [`VmDiversity`], NOT 13 positional params.
+//!
+//! ## Why this is a validated-fragment emitter, not pure node-building
+//!
+//! WP4's mandate is to kill the "string-template / Rust-mirror sync" anti-pattern:
+//! a JS string that must be kept byte-identical to a Rust mirror by hand. The VM
+//! interpreter is ~40 hand-tuned JS handler bodies plus a dispatch skeleton with
+//! several proven-equivalent structural variants. Those handler bodies have NO Rust
+//! mirror — they are the single source of the opcode semantics, keyed by the ONE
+//! ISA table's discriminants ([`crate::isa::Instr::discriminant`]) and the ONE
+//! operator table's expressions ([`crate::isa::bin_expr_js`]/[`crate::isa::un_expr_js`]).
+//! So there is nothing to drift *against*: the serializer and this emitter both
+//! index the same `discriminant()`/`perm`, which is the consistency the round-trip
+//! test in [`crate::isa`] proves.
+//!
+//! Per WP4's allowance ("where a handler body is irreducibly a chunk of hand-tuned
+//! JS, you may build it from a small parsed-and-validated fragment IF you validate
+//! it parses"), the interpreter is assembled as a JS source string from these
+//! fragments and the whole function is then **validated by `Js::reparse`** (a unit
+//! test) AND executed end-to-end against rquickjs (the behavioral suite). The
+//! fragments themselves come from the ISA table, so they cannot silently desync from
+//! the bytecode encoding. [`emit_interpreter`] returns the validated function as an
+//! AST [`Stmt`] (parsed via the jsast layer) so callers splice a node, not a string.
+
+use mangler_core::Language;
+use mangler_jsast::lang::{Js, ParseOpts};
+use swc_core::ecma::ast::Stmt;
+
+use crate::diversity::{
+    bin_mba_expr, DECOY_FORMS, HANDLER_VARIANTS, SKELETON_VARIANTS, VmDiversity,
+};
+use crate::isa::{bin_expr_js, un_expr_js, N_BIN_OPS, N_OPCODES, N_UN_OPS};
+
+/// The lean, non-positional description of an interpreter to emit. Replaces the
+/// 13-positional-param `interpreter_src(...)` signature: the diversification seeds
+/// all live in [`VmDiversity`]; only the genuinely per-interpreter knobs (names,
+/// shape) are spelled out here.
+#[derive(Debug, Clone)]
+pub struct InterpreterSpec<'a> {
+    /// The interpreter function name (e.g. `V` / `D`).
+    pub name: &'a str,
+    /// The shared program-table variable name.
+    pub table: &'a str,
+    /// The hoisted `Reflect.construct` alias (used by the `new` opcode).
+    pub rc: &'a str,
+    /// The hoisted `Symbol.iterator` alias (used by the iterator opcodes when EH).
+    pub sy: &'a str,
+    /// Whether to emit the exception-handling / iterator / completion shape.
+    pub needs_eh: bool,
+    /// The per-file diversification (perms, key, seeds, skeleton variant).
+    pub diversity: &'a VmDiversity,
+}
+
+// ---------------------------------------------------------------------------
+// Skeleton helpers (FU3).
+// ---------------------------------------------------------------------------
+
+/// Wrap an infinite dispatch-loop BODY in the seed-chosen loop frame. All three are
+/// infinite loops broken ONLY by `return`/`throw` from inside `body`, so the loop
+/// keyword is semantically irrelevant.
+fn loop_frame(variant: usize, body: &str) -> String {
+    match variant % SKELETON_VARIANTS {
+        0 => format!("for(;;){{{body}}}"),
+        1 => format!("while(1){{{body}}}"),
+        _ => format!("do{{{body}}}while(1)"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Handler bodies — keyed by canonical opcode (the ISA discriminant).
+// ---------------------------------------------------------------------------
+
+/// The variant-0 (historical) body of each top-level opcode handler, keyed by the
+/// ISA discriminant. Empty string = "no body at this discriminant in the lean
+/// table" (the EH/iterator ops, emitted by [`eh_handler_body`] only when needed; and
+/// the dynamic ops 5/6/13/20/35 emitted specially by [`build_handlers`]).
+///
+/// Handlers fetch from the DECODED local code array `C`; the decode loop de-XORs the
+/// encrypted `code` param into `C` once at init. Reads use the scratch temps
+/// declared in the interpreter frame (`a,b,o,k,v,f,n,t,obj,base,i,...`).
+fn opcode_handler_body(canonical: usize) -> &'static str {
+    match canonical {
+        0 => "S.push(consts[C[pc++]]);break;",
+        1 => "S.push(undefined);break;",
+        2 => "S.push(null);break;",
+        3 => "S.push(L[C[pc++]]);break;",
+        4 => "L[C[pc++]]=S[S.length-1];break;",
+        // 5 (Bin) / 6 (Un) / 13 (New) / 20 (GetIter) / 35 (MakeClosure) are emitted
+        // specially by build_handlers (they interpolate perms / aliases / helpers).
+        7 => "k=S.pop();o=S.pop();S.push(o[k]);break;",
+        8 => "v=S.pop();k=S.pop();o=S.pop();o[k]=v;S.push(v);break;",
+        9 => "n=C[pc++];a=S.splice(S.length-n,n);S.push(a);break;",
+        10 => "n=C[pc++];obj={};base=S.length-2*n;\
+for(i=0;i<n;i++){obj[S[base+2*i]]=S[base+2*i+1];}\
+S.length=base;S.push(obj);break;",
+        11 => "n=C[pc++];a=S.splice(S.length-n,n);f=S.pop();S.push(f.apply(undefined,a));break;",
+        12 => "S.push(receiver);break;",
+        14 => "pc=C[pc];break;",
+        15 => "t=C[pc++];if(!S.pop())pc=t;break;",
+        16 => "S.pop();break;",
+        17 => "S.push(S[S.length-1]);break;",
+        18 => "return S.pop();",
+        19 => "n=C[pc++];a=S.splice(S.length-n,n);f=S.pop();o=S.pop();S.push(f.apply(o,a));break;",
+        25 => "throw S.pop();",
+        29 => "n=C[pc++];S.push(Array.prototype.slice.call(args,n));break;",
+        30 => "o=S.pop();a=[];for(k in o)a.push(k);S.push(a);break;",
+        31 => "k=S.pop();o=S.pop();S.push(delete o[k]);break;",
+        32 => "n=C[pc++];L[n]=[L[n]];break;",
+        33 => "S.push(L[C[pc++]][0]);break;",
+        34 => "n=C[pc++];L[n][0]=S[S.length-1];break;",
+        _ => "",
+    }
+}
+
+/// A semantically-identical alternative body for `(canonical, variant)` (Stage-1b),
+/// or `None` to fall through to [`opcode_handler_body`]. Every alternative computes
+/// byte-for-byte the same stack/local/pc effects as variant 0.
+fn opcode_handler_variant(canonical: usize, variant: usize) -> Option<&'static str> {
+    let v = variant % HANDLER_VARIANTS;
+    if v == 0 {
+        return None;
+    }
+    Some(match (canonical, v) {
+        (3, 1) => "n=C[pc++];a=L[n];S.push(a);break;",
+        (3, 2) => "S.push(L[C[pc++]]);break;",
+        (4, 1) => "n=C[pc++];L[n]=S[S.length-1];break;",
+        (4, 2) => "n=C[pc++];a=S[S.length-1];L[n]=a;break;",
+        (7, 1) => "k=S.pop();o=S.pop();a=o[k];S.push(a);break;",
+        (7, 2) => "k=S.pop();o=S.pop();S.push(o[k]);break;",
+        (8, 1) => "v=S.pop();k=S.pop();o=S.pop();S.push(o[k]=v);break;",
+        (8, 2) => "v=S.pop();k=S.pop();o=S.pop();o[k]=v;S.push(v);break;",
+        (16, 1) => "S.length=S.length-1;break;",
+        (16, 2) => "S.pop();break;",
+        (17, 1) => "a=S[S.length-1];S.push(a);break;",
+        (17, 2) => "S.push(S[S.length-1]);break;",
+        (18, 1) => "a=S.pop();return a;",
+        (18, 2) => "return S.pop();",
+        (15, 1) => "t=C[pc++];a=S.pop();if(!a)pc=t;break;",
+        (15, 2) => "t=C[pc++];if(!S.pop())pc=t;break;",
+        (11, 1) => "n=C[pc++];a=S.splice(S.length-n,n);f=S.pop();S.push(f.apply(void 0,a));break;",
+        (11, 2) => "n=C[pc++];a=S.splice(S.length-n,n);f=S.pop();S.push(f.apply(undefined,a));break;",
+        (9, 1) => "n=C[pc++];a=S.splice(S.length-n,n);S.push(a);break;",
+        (9, 2) => "n=C[pc++];o=S.splice(S.length-n,n);S.push(o);break;",
+        (1, 1) => "S.push(void 0);break;",
+        (1, 2) => "S.push(undefined);break;",
+        (33, 1) => "o=L[C[pc++]];S.push(o[0]);break;",
+        (33, 2) => "S.push(L[C[pc++]][0]);break;",
+        _ => return None,
+    })
+}
+
+/// Exception/completion + iterator handler bodies (emitted only when `needs_eh`).
+/// `GetIter` (20) is emitted by [`build_handlers`] (it interpolates the `sy` alias).
+fn eh_handler_body(canonical: usize) -> &'static str {
+    match canonical {
+        21 => "it=S.pop();r=it.next();if(r.done){S.push(false);}else{S.push(r.value);S.push(true);}break;",
+        22 => "it=S.pop();m=it.return;if(m!=null)m.call(it);break;",
+        23 => "a=C[pc++];b=C[pc++];H.push([a>2e9?-1:a,b>2e9?-1:b,S.length]);break;",
+        24 => "H.pop();break;",
+        26 => "if(comp.t===1){throw comp.v;}\
+else if(comp.t===2){if(!unwind(0)){v=comp.v;comp=NORMAL;return v;}}\
+else if(comp.t===3){if(!unwind(comp.f)){pc=comp.v;comp=NORMAL;}}break;",
+        27 => "comp={t:2,v:S.pop(),f:0};if(!unwind(0)){v=comp.v;comp=NORMAL;return v;}break;",
+        28 => "a=C[pc++];b=C[pc++];comp={t:3,v:a,f:b};if(!unwind(b)){pc=a;comp=NORMAL;}break;",
+        _ => "",
+    }
+}
+
+/// Body for a JUNK (dead) opcode case (C3). Unreachable decoys that read like real
+/// handlers; `serialize` never emits these labels.
+fn junk_case_body(form: usize) -> &'static str {
+    match form % DECOY_FORMS {
+        0 => "a=C[pc++];S.push(a^pc);break;",
+        1 => "o=S.pop();k=S.pop();S.push(o);break;",
+        2 => "n=C[pc++];L[n]=S.length;break;",
+        3 => "b=S.pop();a=S.pop();S.push(a-b);break;",
+        4 => "pc=C[pc];break;",
+        5 => "n=C[pc++];cl_n=C[pc++];cl_u=[];for(j=0;j<cl_n;j++)cl_u.push(C[pc++]);\
+S.push(Mk(n,0,cl_n,cl_n,cl_u,L,receiver));break;",
+        6 => "a=S.pop();S.push(Sd([a&65535]));break;",
+        _ => "a=S.pop();b=S.pop();o=S.pop();S.push(b);S.push(a);S.push(o);break;",
+    }
+}
+
+/// Build the `Bin` opcode body with per-file-permuted inner case labels, applying
+/// the Stage-3b MBA tangle on the proven-exact integer-domain ops. Operator
+/// expressions come from the ONE ISA table.
+fn bin_switch_body(div: &VmDiversity) -> String {
+    let mut s = String::from("op=C[pc++];b=S.pop();a=S.pop();switch(op){");
+    for k in 0..N_BIN_OPS {
+        let rendered = match div.bin_mba(k) {
+            Some(form) => bin_mba_expr(k, form),
+            None => bin_expr_js(k),
+        };
+        s.push_str(&format!("case {}:S.push({rendered});break;", div.bin_perm[k]));
+    }
+    s.push_str("}break;");
+    s
+}
+
+/// Build the `Un` opcode body with per-file-permuted inner case labels. Operator
+/// expressions come from the ONE ISA table.
+fn un_switch_body(div: &VmDiversity) -> String {
+    let mut s = String::from("uop=C[pc++];a=S.pop();switch(uop){");
+    for k in 0..N_UN_OPS {
+        s.push_str(&format!("case {}:S.push({});break;", div.un_perm[k], un_expr_js(k)));
+    }
+    s.push_str("}break;");
+    s
+}
+
+/// Rewrite a `switch`-style handler body into a closure-dispatch entry body. The
+/// only difference is dispatch-exit control flow: strip the trailing `break;`, route
+/// `Ret`'s trailing `return EXPR;` through the shared done-flag/result-slot, and keep
+/// `throw` verbatim (it propagates out of the closure/loop/function).
+fn to_closure_body(body: &str, done: &str, ret: &str) -> String {
+    if body.starts_with("throw ") {
+        return body.to_string();
+    }
+    if let Some(pos) = body.rfind("return ") {
+        let prefix = &body[..pos];
+        let after = &body[pos + "return ".len()..];
+        if let Some(expr) = after.strip_suffix(';') {
+            return format!("{prefix}{done}=1;{ret}={expr};return;");
+        }
+    }
+    match body.strip_suffix("break;") {
+        Some(rest) => rest.to_string(),
+        None => body.to_string(),
+    }
+}
+
+/// Collect `(permuted-label, body)` pairs for every real opcode + every decoy slot,
+/// in canonical order then decoy order. The dynamic ops (5/6/13/20/35) and the
+/// Stage-1b handler-variant selection are resolved here.
+fn build_handlers(spec: &InterpreterSpec) -> Vec<(usize, String)> {
+    let div = spec.diversity;
+    let mut handlers: Vec<(usize, String)> = Vec::new();
+    for (k, &label) in div.perm.iter().enumerate().take(N_OPCODES) {
+        if k == 13 {
+            handlers.push((
+                label,
+                format!(
+                    "n=C[pc++];a=S.splice(S.length-n,n);f=S.pop();S.push({}(f,a));break;",
+                    spec.rc
+                ),
+            ));
+            continue;
+        }
+        if k == 5 {
+            handlers.push((label, bin_switch_body(div)));
+            continue;
+        }
+        if k == 6 {
+            handlers.push((label, un_switch_body(div)));
+            continue;
+        }
+        if spec.needs_eh && k == 20 {
+            handlers.push((label, format!("o=S.pop();S.push(o[{}]());break;", spec.sy)));
+            continue;
+        }
+        if k == 35 {
+            handlers.push((
+                label,
+                "n=C[pc++];cl_a=C[pc++];cl_s=C[pc++];cl_p=C[pc++];cl_n=C[pc++];\
+cl_u=[];for(j=0;j<cl_n;j++)cl_u.push(C[pc++]);\
+S.push(Mk(n,cl_a,cl_s,cl_p,cl_u,L,receiver));break;"
+                    .to_string(),
+            ));
+            continue;
+        }
+        // Stage-1b: pick this opcode's seed-derived body variant (variant 0 = the
+        // historical body).
+        let body = match opcode_handler_variant(k, div.handler_variant(k)) {
+            Some(alt) => alt,
+            None => opcode_handler_body(k),
+        };
+        if !body.is_empty() {
+            handlers.push((label, body.to_string()));
+            continue;
+        }
+        if spec.needs_eh {
+            let eh = eh_handler_body(k);
+            if !eh.is_empty() {
+                handlers.push((label, eh.to_string()));
+            }
+        }
+    }
+    // Decoy handlers at the extra permutation slots.
+    for &label in &div.perm[N_OPCODES..] {
+        handlers.push((label, junk_case_body(div.decoy_form(label)).to_string()));
+    }
+    handlers
+}
+
+/// Build the hoisted `Sd`/`Mk` helper declarations + the shared decode-init prologue
+/// for `spec`, in the FU3 skeleton-variant form.
+fn decode_init(spec: &InterpreterSpec) -> String {
+    let div = spec.diversity;
+    let variant = div.skeleton();
+    let key = div.code_key;
+    let ck = (key & 0xFFFF) | 1;
+    let name = spec.name;
+    let table = spec.table;
+    let sd_decl = format!(
+        "function Sd(a){{return String.fromCharCode.apply(null,a.map(function(c){{return c^{ck};}}));}}"
+    );
+    let mk_decl = format!(
+        "function Mk(idx,ar,cs,pcnt,sl,PL,prcv){{var clo=function(){{var up=[],q;\
+for(q=0;q<sl.length;q++)up.push(sl[q]===2147483647?clo:PL[sl[q]]);\
+return {name}({table}[idx][0],{table}[idx][1],arguments,up,cs,pcnt,ar?prcv:this);}};return clo;}}"
+    );
+    let sd_expr = format!(
+        "var Sd=function(a){{return String.fromCharCode.apply(null,a.map(function(c){{return c^{ck};}}));}};"
+    );
+    let mk_expr = format!(
+        "var Mk=function(idx,ar,cs,pcnt,sl,PL,prcv){{var clo=function(){{var up=[],q;\
+for(q=0;q<sl.length;q++)up.push(sl[q]===2147483647?clo:PL[sl[q]]);\
+return {name}({table}[idx][0],{table}[idx][1],arguments,up,cs,pcnt,ar?prcv:this);}};return clo;}};"
+    );
+    let helpers = match variant {
+        0 => format!("{sd_decl}{mk_decl}"),
+        1 => format!("{mk_decl}{sd_decl}"),
+        _ => format!("{sd_expr}{mk_expr}"),
+    };
+    format!(
+        "{helpers}\
+if(!code.d){{for(i=0;i<code.length;i++)code[i]^={key};code.d=1;}}C=code;\
+if(!consts.d){{for(i=0;i<consts.length;i++){{t=consts[i];\
+if(Array.isArray(t))consts[i]=Sd(t);\
+else if(t&&t.q){{a=t.q.map(function(e){{return Array.isArray(e)?Sd(e):undefined;}});a.raw=Object.freeze(t.w.map(Sd));consts[i]=Object.freeze(a);}}}}consts.d=1;}}\
+for(i=0;i<args.length&&i<pcount;i++)L[i]=args[i];\
+for(i=0;i<caps.length;i++)L[capStart+i]=caps[i];"
+    )
+}
+
+/// Emit the interpreter as a JS source string. Internal; [`emit_interpreter`] wraps
+/// this and parses it to AST (validating it).
+pub(crate) fn interpreter_src(spec: &InterpreterSpec) -> String {
+    let div = spec.diversity;
+    let variant = div.skeleton();
+    let name = spec.name;
+    let decode_init = decode_init(spec);
+    let handlers = build_handlers(spec);
+
+    // The switch-case block (used by the switch shape AND whenever needs_eh).
+    let mut cases = String::new();
+    for (label, body) in &handlers {
+        cases.push_str(&format!("case {label}:{body}"));
+    }
+
+    if spec.needs_eh {
+        let inner = loop_frame(variant, &format!("switch(C[pc++]){{{cases}}}"));
+        let outer_body =
+            format!("try{{{inner}}}catch(e){{comp={{t:1,v:e,f:0}};if(!unwind(0))throw e;}}");
+        let outer = loop_frame(variant, &outer_body);
+        format!(
+            "function {name}(code,consts,args,caps,capStart,pcount,receiver){{\
+var L=[],S=[],C=[],pc=0,i,a,b,o,k,v,f,n,t,obj,op,uop,base,r,it,m,j,cl_a,cl_s,cl_p,cl_n,cl_u,H=[],comp={{t:0,v:0,f:0}},NORMAL={{t:0,v:0,f:0}},h;\
+{decode_init}\
+function unwind(floor){{while(H.length>floor){{h=H.pop();S.length=h[2];\
+if(comp.t===1&&h[0]>=0){{S.push(comp.v);pc=h[0];comp=NORMAL;return true;}}\
+if(h[1]>=0){{pc=h[1];return true;}}}}return false;}}\
+{outer}\
+}}"
+        )
+    } else if div.dispatch_shape(spec.needs_eh) == 1 {
+        // Stage-1a: array-of-closures dispatch (lean-only).
+        let mk_inline = format!(
+            "var mi=C[pc++],ma=C[pc++],ms=C[pc++],mp=C[pc++],mn=C[pc++],msl=[],mq,mc;\
+for(mq=0;mq<mn;mq++)msl.push(C[pc++]);\
+mc=function(){{var up=[],uq;for(uq=0;uq<msl.length;uq++)up.push(msl[uq]===2147483647?mc:L[msl[uq]]);\
+return {name}({}[mi][0],{}[mi][1],arguments,up,ms,mp,ma?receiver:this);}};S.push(mc);",
+            spec.table, spec.table
+        );
+        let mut build = String::from("var F=[],dn=0,rv;");
+        for (label, body) in &handlers {
+            let cb = if body.contains("Mk(n,cl_a,cl_s,cl_p,cl_u,L,receiver)") {
+                mk_inline.clone()
+            } else {
+                to_closure_body(body, "dn", "rv")
+            };
+            build.push_str(&format!("F[{label}]=function(){{{cb}}};"));
+        }
+        let lean = loop_frame(variant, "F[C[pc++]]();if(dn)return rv;");
+        format!(
+            "function {name}(code,consts,args,caps,capStart,pcount,receiver){{\
+var L=[],S=[],C=[],pc=0,i,a,b,o,k,v,f,n,t,obj,op,uop,base,j,cl_a,cl_s,cl_p,cl_n,cl_u;\
+{decode_init}\
+{build}\
+{lean}\
+}}"
+        )
+    } else {
+        let lean = loop_frame(variant, &format!("switch(C[pc++]){{{cases}}}"));
+        format!(
+            "function {name}(code,consts,args,caps,capStart,pcount,receiver){{\
+var L=[],S=[],C=[],pc=0,i,a,b,o,k,v,f,n,t,obj,op,uop,base,j,cl_a,cl_s,cl_p,cl_n,cl_u;\
+{decode_init}\
+{lean}\
+}}"
+        )
+    }
+}
+
+/// Emit the per-file stack-machine interpreter as a validated AST [`Stmt`].
+///
+/// The interpreter is assembled from the ISA-table-derived handler fragments and
+/// then **parsed** through the jsast layer, which both validates it is syntactically
+/// well-formed and yields a node to splice (no string handed downstream). A parse
+/// failure is a hard bug in the emitter — the returned `Result` surfaces it rather
+/// than emitting malformed JS.
+pub fn emit_interpreter(spec: &InterpreterSpec) -> mangler_core::Result<Stmt> {
+    let src = interpreter_src(spec);
+    let ast = Js.parse(&src, &ParseOpts::default())?;
+    // The source is a single function declaration; pull it out as one Stmt.
+    let program = ast.into_program();
+    let stmt = match program {
+        swc_core::ecma::ast::Program::Script(s) => s.body.into_iter().next(),
+        swc_core::ecma::ast::Program::Module(m) => {
+            m.body.into_iter().find_map(|it| match it {
+                swc_core::ecma::ast::ModuleItem::Stmt(s) => Some(s),
+                _ => None,
+            })
+        }
+    };
+    stmt.ok_or_else(|| mangler_core::Error::transform("vm-emit", "interpreter produced no statement"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diversity::VmDiversity;
+
+    fn spec_for<'a>(div: &'a VmDiversity, needs_eh: bool) -> InterpreterSpec<'a> {
+        InterpreterSpec { name: "V", table: "T", rc: "rc", sy: "sy", needs_eh, diversity: div }
+    }
+
+    #[test]
+    fn lean_interpreter_reparses_and_has_no_eh() {
+        let div = VmDiversity::baseline(2);
+        let src = interpreter_src(&spec_for(&div, false));
+        assert!(!src.contains("catch") && !src.contains("H=[]"), "lean has no EH:\n{src}");
+        assert!(Js::reparse(&src, &ParseOpts::default()).is_ok(), "lean reparses:\n{src}");
+    }
+
+    #[test]
+    fn eh_interpreter_reparses_and_has_eh() {
+        let div = VmDiversity::baseline(2);
+        let src = interpreter_src(&spec_for(&div, true));
+        assert!(src.contains("catch") && src.contains("H=[]"), "EH carries machinery");
+        assert!(Js::reparse(&src, &ParseOpts::default()).is_ok(), "EH reparses:\n{src}");
+    }
+
+    /// Every skeleton/dispatch variant the diversity space can select must reparse.
+    #[test]
+    fn all_diversity_variants_reparse() {
+        for seed in [1u64, 2, 7, 42, 100, 999, 12345] {
+            let div = VmDiversity::draw(&mut mangler_core::Rng::for_pass(seed, "vm"));
+            for needs_eh in [false, true] {
+                let src = interpreter_src(&spec_for(&div, needs_eh));
+                assert!(
+                    Js::reparse(&src, &ParseOpts::default()).is_ok(),
+                    "seed {seed} needs_eh {needs_eh} must reparse:\n{src}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn emit_interpreter_returns_a_stmt() {
+        let div = VmDiversity::baseline(2);
+        let stmt = emit_interpreter(&spec_for(&div, false)).expect("emit ok");
+        assert!(matches!(stmt, Stmt::Decl(_)), "interpreter is a fn decl");
+    }
+}

@@ -1,0 +1,16 @@
+[package]
+name = "mangler-html"
+version = "0.1.0"
+edition = "2024"
+description = "Real-DOM HTML Language impl embedding JS/CSS via the string boundary."
+
+[dependencies]
+mangler-core = { workspace = true }
+mangler-passgraph = { workspace = true }
+# Real DOM over html5ever (maintained kuchiki fork). See `lang` module rustdoc
+# for the justification of this pick over raw html5ever/markup5ever_rcdom.
+kuchikiki = "0.8.8-speedreader"
+# html5ever is kuchikiki's parser; we depend on it directly only for the
+# `QualName`/`ns!` we need to build the fragment-parsing context. Pinned to the
+# exact version kuchikiki uses so the `QualName` type matches across the seam.
+html5ever = "=0.29.1"

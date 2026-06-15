@@ -1,0 +1,31 @@
+[package]
+name = "mangler-cli"
+version = "0.1.0"
+edition = "2024"
+description = "The Engine façade and the thin clap CLI (the only binary)."
+
+[lib]
+name = "mangler_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mangler"
+path = "src/main.rs"
+
+[dependencies]
+mangler-core = { workspace = true }
+mangler-passgraph = { workspace = true }
+mangler-config = { workspace = true }
+mangler-jsast = { workspace = true }
+mangler-js = { workspace = true }
+mangler-css = { workspace = true }
+mangler-html = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+rayon = { workspace = true }
+glob = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+mangler-testkit = { workspace = true }
+tempfile = "3"

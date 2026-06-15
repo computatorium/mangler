@@ -1,0 +1,14 @@
+[package]
+name = "mangler-vm"
+version = "0.1.0"
+edition = "2024"
+description = "Self-contained VM: single data-driven opcode table generating the ISA, compiler, serializer, and interpreter emitter."
+
+[dependencies]
+mangler-core = { workspace = true }
+mangler-jsast = { workspace = true }
+swc_core = { workspace = true }
+glob = { workspace = true }
+
+[dev-dependencies]
+mangler-testkit = { workspace = true }

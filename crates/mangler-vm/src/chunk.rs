@@ -1,0 +1,92 @@
+//! The compiled-chunk data model: [`Const`], [`Compiled`], [`ChildChunk`], and the
+//! public [`Chunk`] handle the table builder accepts from both clients.
+//!
+//! A [`Compiled`] is one function body lowered to a flat stack-machine program
+//! ([`Instr`] stream + [`Const`] pool) plus the frame metadata (`slots`, `pcount`,
+//! `captures`) and any nested-function [`ChildChunk`]s. The two VM clients — the
+//! strings-decode pass and the function-virtualize pass — both produce
+//! `Compiled`s, hand them to the [`crate::TableBuilder`], and receive table indices
+//! back; this is the single shared currency that lets one table + one interpreter
+//! serve both, eliminating the legacy 13-field `DeferredStringsVm` hand-off.
+
+use crate::isa::Instr;
+
+/// A VM constant-pool entry.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Const {
+    /// A numeric literal.
+    Num(f64),
+    /// A string literal (interpreter de-XOR + `String.fromCharCode`s it on first
+    /// use).
+    Str(String),
+    /// A boolean literal.
+    Bool(bool),
+    /// D4: a tagged-template's frozen template object. `cooked[i] == None` is an
+    /// invalid-escape hole (the cooked value is JS `undefined`, legal only in a
+    /// tagged template); `raw[i]` always has a value. The interpreter builds the
+    /// frozen, `.raw`-bearing array ONCE on first use and caches it in the const
+    /// slot, so the same call site reuses the SAME object across evaluations.
+    TemplateObject {
+        /// Cooked quasis; `None` is an invalid-escape hole (`undefined`).
+        cooked: Vec<Option<String>>,
+        /// Raw quasis; always present.
+        raw: Vec<String>,
+    },
+}
+
+/// One function body lowered to a flat VM program.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Compiled {
+    /// The instruction stream.
+    pub code: Vec<Instr>,
+    /// The constant pool.
+    pub consts: Vec<Const>,
+    /// Free-global capture names, in slot order (the thunk threads them in).
+    pub captures: Vec<String>,
+    /// Total flat-frame slot count.
+    pub slots: u32,
+    /// Number of positional param slots the interpreter copies from `arguments`
+    /// (params declared *before* any trailing `...rest`). Without a rest param this
+    /// equals `params.len()`.
+    pub pcount: u32,
+    /// D5: nested functions compiled to their own chunks, in `MakeClosure` `child`
+    /// index order. Empty for a leaf body.
+    pub children: Vec<ChildChunk>,
+}
+
+impl Compiled {
+    /// The slot index where captured values begin (the thunk's `capStart` arg).
+    pub fn cap_start(&self) -> u32 {
+        self.slots - self.captures.len() as u32
+    }
+}
+
+/// A nested function compiled to its own VM chunk (D5).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChildChunk {
+    /// The child's own compiled program (may itself carry grandchildren).
+    pub compiled: Compiled,
+    /// True if the source was an arrow (`=>`): the closure threads the enclosing
+    /// `this` lexically instead of taking the call-time receiver.
+    pub is_arrow: bool,
+}
+
+/// The public handle returned to a client after it registers a compiled body with
+/// the [`crate::TableBuilder`]. It names the root program-table index plus the
+/// frame metadata the client needs to emit the calling thunk — exactly the fields
+/// the legacy embed path returned, but as a clean first-class value rather than a
+/// 13-field cross-pass struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chunk {
+    /// The root chunk's index in the shared program table.
+    pub index: usize,
+    /// Free-global capture names, in the order the thunk must thread them.
+    pub captures: Vec<String>,
+    /// Slot index where captures begin (thunk arg `capStart`).
+    pub cap_start: u32,
+    /// Positional param count (thunk arg `pcount`).
+    pub pcount: u32,
+    /// Whether this body uses exception-handling / iterator / completion opcodes,
+    /// so the assembled interpreter must be the EH shape.
+    pub needs_eh: bool,
+}

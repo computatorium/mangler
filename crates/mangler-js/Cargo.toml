@@ -1,0 +1,16 @@
+[package]
+name = "mangler-js"
+version = "0.1.0"
+edition = "2024"
+description = "The JS obfuscation passes as pass-graph nodes."
+
+[dependencies]
+mangler-core = { workspace = true }
+mangler-passgraph = { workspace = true }
+mangler-jsast = { workspace = true }
+mangler-vm = { workspace = true }
+mangler-config = { workspace = true }
+swc_core = { workspace = true }
+
+[dev-dependencies]
+mangler-testkit = { workspace = true }

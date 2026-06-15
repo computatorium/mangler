@@ -1,0 +1,10 @@
+[package]
+name = "mangler-css"
+version = "0.1.0"
+edition = "2024"
+description = "lightningcss-based CSS Language impl with a pass schedule."
+
+[dependencies]
+mangler-core = { workspace = true }
+mangler-passgraph = { workspace = true }
+lightningcss = { workspace = true }

@@ -32,6 +32,22 @@ pub enum Const {
         /// Raw quasis; always present.
         raw: Vec<String>,
     },
+    /// Phase 3 native-closure escape hatch (§4.2): a **factory function
+    /// expression** stored as already-rendered JS source, e.g.
+    /// `function(u0,u1){return function render(){…u0…}}`. The factory's params are
+    /// the threaded upvalues (enclosing VM-frame locals / cells, plus the enclosing
+    /// `this` for an arrow); its body returns the original excluded/ineligible
+    /// function or arrow with free VM-frame locals rewritten to `u0..` and free
+    /// module globals left untouched (it lives at module scope in the shared
+    /// program-table, so globals resolve to the real ones — no threading, no
+    /// obfuscation lost). The factory carries the original function's own
+    /// strictness directive (§5a.2). Rendered VERBATIM into the consts array (it is
+    /// a function value, so the interpreter's const-decode loop — which only
+    /// de-XORs `Array.isArray` string consts and `.q` template objects — leaves it
+    /// untouched); `MakeNativeClosure` then calls it with the up-slot values. The
+    /// source is built deterministically (same diversity seed ⇒ byte-identical),
+    /// since it is a pure function of the original AST + the upvalue rename map.
+    NativeFactory(String),
 }
 
 /// One function body lowered to a flat VM program.
@@ -89,4 +105,10 @@ pub struct Chunk {
     /// Whether this body uses exception-handling / iterator / completion opcodes,
     /// so the assembled interpreter must be the EH shape.
     pub needs_eh: bool,
+    /// Whether this body must execute under strict mode (§5a): the chunk routes to a
+    /// strict interpreter variant (its `Store*` opcodes throw on non-writable /
+    /// getter-only / frozen targets) and its calling thunk is emitted strict (so the
+    /// forwarded `this` is the un-coerced strict receiver). Sloppy chunks (the default)
+    /// keep today's behavior byte-for-byte.
+    pub is_strict: bool,
 }

@@ -48,12 +48,17 @@ use mangler_core::Language;
 use mangler_core::{Notes, Result, Rng};
 use mangler_jsast::lang::{Js, ParseOpts};
 use mangler_passgraph::{ArtifactBus, Pass, Resource};
-use mangler_vm::{classify_body, compile_body, Chunk, Eligibility, TableBuilder, VmNames};
+use mangler_vm::{
+    classify_body, compile_body_with_opts, Chunk, CompileOptions, Eligibility, TableBuilder,
+    VmNames,
+};
 use swc_core::common::DUMMY_SP;
 use swc_core::ecma::ast::*;
 use swc_core::ecma::visit::{VisitMut, VisitMutWith};
 
+mod desugar;
 mod glob;
+mod partition;
 
 /// Function virtualization: compile eligible named-function bodies to VM bytecode and
 /// replace them with thunks that re-enter a spliced interpreter over a shared program
@@ -65,11 +70,16 @@ impl Pass<Js, FileConfig> for VirtualizePass {
         "virtualize"
     }
 
-    /// No declared reads. In particular it does NOT read `ResolvedScopes`, so the
-    /// topological sort places it BEFORE the resolver pseudo-pass — the spliced
-    /// interpreter then gets fresh resolver marks like the rest of the module.
+    /// Reads the strings-decoder anchor (OPTIONAL, soft-degrades when absent): in
+    /// whole-program mode the partition must keep the strings-decoder stub NATIVE
+    /// (never swallow it into the VM — its `core(idx)` calls inside virtualized code
+    /// would then reference a name that no longer exists). Declaring the read orders
+    /// virtualize AFTER strings (already the registration order) without reading
+    /// `ResolvedScopes`, so it still runs BEFORE the resolver pseudo-pass — the
+    /// spliced interpreter gets fresh resolver marks like the rest of the module.
     fn reads(&self) -> &[Resource] {
-        &[]
+        const R: &[Resource] = &[Resource::decoder_anchor()];
+        R
     }
 
     /// Produces the shared VM table + interpreter. Downstream passes (expr,
@@ -79,9 +89,11 @@ impl Pass<Js, FileConfig> for VirtualizePass {
         W
     }
 
-    /// Opt-in: enabled exactly when a virtualize target glob is configured.
+    /// Opt-in: enabled when a virtualize target glob is configured OR whole-program
+    /// virtualization is requested (Phase 1).
     fn enabled(&self, cfg: &FileConfig) -> bool {
-        cfg.resolved().passes.virtualize.target.is_some()
+        let v = &cfg.resolved().passes.virtualize;
+        v.target.is_some() || v.whole_program
     }
 
     fn run(
@@ -90,12 +102,18 @@ impl Pass<Js, FileConfig> for VirtualizePass {
         cfg: &FileConfig,
         rng: &mut Rng,
         bus: &mut ArtifactBus,
-        _notes: &mut Notes,
+        notes: &mut Notes,
     ) -> Result<()> {
-        let target = match &cfg.resolved().passes.virtualize.target {
-            Some(t) => t.clone(),
+        let vcfg = &cfg.resolved().passes.virtualize;
+        let whole_program = vcfg.whole_program;
+        let exclude: Option<String> = vcfg.exclude.clone();
+        // In whole-program mode `target` is ignored (§1 matrix; validation also clears
+        // it). Outside whole-program mode it is required (`enabled` gates this).
+        let target = match (&vcfg.target, whole_program) {
+            (_, true) => String::new(),
+            (Some(t), false) => t.clone(),
             // `enabled` already gates this; defensive no-op if somehow reached.
-            None => return Ok(()),
+            (None, false) => return Ok(()),
         };
 
         // ONE diversification per file, drawn once from this pass's RNG. Every chunk in
@@ -105,22 +123,104 @@ impl Pass<Js, FileConfig> for VirtualizePass {
 
         // Draw the prologue names UP FRONT so the thunks and the spliced interpreter
         // agree (see module docs). File-wide-unique via the shared allocator.
+        //
+        // §5a byte-identity: the two STRICT interpreter names are drawn from the shared
+        // allocator ONLY when the program actually contains a strict virtualization
+        // candidate. A fully-sloppy program therefore draws the SAME five names in the
+        // SAME order as before strict support, so every name allocated by this and all
+        // downstream passes is unchanged — output is byte-for-byte identical. When no
+        // strict candidate exists the strict fields reuse the sloppy names (they are
+        // never emitted, since no strict chunk is registered).
+        let lean_interp = cfg.fresh_name();
+        let eh_interp = cfg.fresh_name();
+        let table = cfg.fresh_name();
+        let rc = cfg.fresh_name();
+        let sy = cfg.fresh_name();
+        // Whole-program: the synthetic top-level wrapper is strict iff the Program top
+        // level is strict (ES Module / `"use strict"` Script). Named mode: scan for a
+        // strict candidate. Either way we only draw the strict names when needed.
+        let need_strict_names = if whole_program {
+            program_top_is_strict(ast.program())
+        } else {
+            program_has_strict_candidate(ast.program_mut(), &target, exclude.as_deref())
+        };
+        let (lean_interp_strict, eh_interp_strict) = if need_strict_names {
+            (cfg.fresh_name(), cfg.fresh_name())
+        } else {
+            (lean_interp.clone(), eh_interp.clone())
+        };
         let names = VmNames {
-            lean_interp: cfg.fresh_name(),
-            eh_interp: cfg.fresh_name(),
-            table: cfg.fresh_name(),
-            rc: cfg.fresh_name(),
-            sy: cfg.fresh_name(),
+            lean_interp,
+            eh_interp,
+            lean_interp_strict,
+            eh_interp_strict,
+            table,
+            rc,
+            sy,
         };
 
-        let mut v = Virtualizer {
-            target: &target,
-            names: &names,
-            tb: &mut tb,
-            used: false,
+        // The strings-decoder stub (and its `core` declaration), if strings ran
+        // before us, must stay NATIVE in whole-program mode (a top-level run that
+        // swallowed it into the VM would leave the virtualized `core(idx)` decode
+        // calls referencing a name that no longer exists at module scope).
+        let protect_native: Vec<String> = match bus.get::<crate::artifacts::DecoderAnchorArtifact>()
+        {
+            Ok(Some(d)) => vec![d.core_name.clone()],
+            _ => Vec::new(),
         };
-        ast.program_mut().visit_mut_with(&mut v);
-        let used = v.used;
+
+        let used = if whole_program {
+            // Phase 1: all-or-nothing top-level wrapper. Returns true iff the whole
+            // top level was virtualized (else the program is left native).
+            virtualize_whole_program(
+                ast.program_mut(),
+                &names,
+                &mut tb,
+                exclude.as_deref(),
+                &protect_native,
+                vcfg.desugar_class,
+                vcfg.desugar_regex,
+            )
+        } else {
+            let mut v = Virtualizer {
+                target: &target,
+                exclude: exclude.as_deref(),
+                names: &names,
+                tb: &mut tb,
+                used: false,
+                strict_stack: vec![program_top_is_strict(ast.program())],
+                excluded: Vec::new(),
+            };
+            ast.program_mut().visit_mut_with(&mut v);
+            // §10: surface which functions were kept native so the user can confirm a
+            // hot path (e.g. a render loop) was excluded as intended. Deterministic and
+            // de-duplicated, in first-seen order.
+            if !v.excluded.is_empty() {
+                let glob = exclude.as_deref().unwrap_or("");
+                notes.push(mangler_core::Note::from(
+                    "virtualize",
+                    format!(
+                        "kept {} function(s) native via --virtualize-exclude '{}': {}",
+                        v.excluded.len(),
+                        glob,
+                        v.excluded.join(", ")
+                    ),
+                ));
+            }
+            v.used
+        };
+
+        // §10: in whole-program mode, report that everything was virtualized and which
+        // exclude glob (if any) protected hot paths kept native inside the VM frames.
+        if whole_program && used {
+            let msg = match exclude.as_deref() {
+                Some(g) => format!(
+                    "whole-program virtualization active; functions matching '{g}' kept native"
+                ),
+                None => "whole-program virtualization active".to_string(),
+            };
+            notes.push(mangler_core::Note::from("virtualize", msg));
+        }
 
         if !used {
             // Nothing virtualized: no table, no artifact (a reader that declared
@@ -149,20 +249,42 @@ impl Pass<Js, FileConfig> for VirtualizePass {
 struct Virtualizer<'a> {
     /// The glob pattern function names are matched against.
     target: &'a str,
+    /// Optional glob pattern: functions whose inferred name matches this are kept
+    /// native even if they match `target`. `None` = no exclusions.
+    exclude: Option<&'a str>,
     /// The prologue names (drawn up-front) every thunk references.
     names: &'a VmNames,
     tb: &'a mut TableBuilder,
     /// Set true once any function in this file was virtualized.
     used: bool,
+    /// §5a strictness propagation: a top-down inherited attribute. The top entry is
+    /// the program top-level strictness (true for ES Module / `"use strict"` Script);
+    /// entering a function whose body begins with `"use strict"`, OR any function
+    /// nested in an already-strict scope, pushes `true`. A function is virtualized
+    /// strict iff the top of this stack is `true` when its body is compiled.
+    strict_stack: Vec<bool>,
+    /// Names of functions kept native because they matched `exclude` (for the §10
+    /// `Notes` report). First-seen order, de-duplicated.
+    excluded: Vec<String>,
 }
 
 impl Virtualizer<'_> {
-    /// Try to virtualize `function` (whose own name is `name`). Returns true if its
-    /// body was replaced with a thunk. **Bail-to-safe**: any reason to skip returns
-    /// false and leaves the function untouched (never a miscompile).
+    /// Try to virtualize `function` (whose inferred name is `name`). Returns true if
+    /// its body was replaced with a thunk. **Bail-to-safe**: any reason to skip
+    /// returns false and leaves the function untouched (never a miscompile).
     fn try_virtualize(&mut self, name: &str, function: &mut Function) -> bool {
         if !glob::matches(self.target, name) {
             return false;
+        }
+        // Exclude check: if the function's inferred name matches the exclude glob,
+        // keep it native. Bail-to-safe: exclude never miscompiles.
+        if let Some(excl) = self.exclude {
+            if glob::matches(excl, name) {
+                if !self.excluded.iter().any(|n| n == name) {
+                    self.excluded.push(name.to_string());
+                }
+                return false;
+            }
         }
         // Generators/async are not modeled by the flat-slot VM.
         if function.is_generator || function.is_async {
@@ -172,41 +294,48 @@ impl Virtualizer<'_> {
             Some(b) => b,
             None => return false,
         };
-        // Structural eligibility (with/eval/await/yield + sloppy arguments-alias bail).
+        // Structural eligibility (with/eval/await/yield + sloppy arguments-alias bail
+        // + §5a `arguments.callee/.caller` bail).
         if let Eligibility::Skip(_) = classify_body(&function.params, body) {
             return false;
         }
-        // A function strict via its OWN leading `"use strict"` cannot be virtualized
-        // soundly: the VM runs the body as opcodes (no directive effect) and the
-        // directive does not survive on the replacement thunk, so a plain call would
-        // observe a sloppy `this` (globalThis) where the original sees `undefined`.
-        if has_use_strict_directive(body) {
-            return false;
-        }
+        // §5a: strictness is a top-down inherited attribute. This function is strict
+        // if an enclosing scope is strict OR its own body opens with `"use strict"`.
+        // A strict function is virtualized by routing it to a strict thunk (correct
+        // un-coerced `this`) + a strict interpreter variant (Store* throws on
+        // non-writable/getter-only/frozen targets) — no strict bail anymore.
+        let is_strict = self.current_strict() || has_use_strict_directive(body);
 
         // Compile the body to bytecode. `compile_body` is the final authority: on any
         // residual unsupported shape (incl. a nested closure that cannot compile) it
         // returns Err and we leave the whole function un-virtualized.
-        let compiled = match compile_body(&function.params, body) {
+        //
+        // Phase 3 (§4): thread the exclude glob so a NESTED function (any depth)
+        // matching it stays a native closure inside this virtualized body. In named-
+        // target mode we do NOT divert ineligible nested fns (an ineligible nested fn
+        // still bails the parent, preserving pre-Phase-3 behavior); whole-program mode
+        // (the coverage driver) enables that divert separately.
+        let opts = CompileOptions {
+            exclude: self.exclude,
+            divert_ineligible: false,
+        };
+        let compiled = match compile_body_with_opts(&function.params, body, opts) {
             Ok(c) => c,
             Err(_) => return false,
         };
 
         // Register the chunk tree (children flattened, MakeClosure child-indices
-        // resolved to table indices) and get the root chunk handle.
-        let chunk = self.tb.add(compiled);
+        // resolved to table indices) and get the root chunk handle, recording its
+        // strictness so `finish` emits the matching interpreter variant.
+        let chunk = self.tb.add_strict(compiled, is_strict);
 
         // Build the re-entry thunk and install it as the function's new body. A parse
         // failure here (it never should, the source is machine-generated) is a sound
         // skip — but note the chunk is already in the table; leaving the original body
         // would call the un-thunked function while its table entry sits unused, which
         // is fine (extra dead table entry, never a miscompile).
-        let interp = if chunk.needs_eh {
-            &self.names.eh_interp
-        } else {
-            &self.names.lean_interp
-        };
-        let stmts = match thunk_stmts(interp, &self.names.table, &chunk) {
+        let interp = self.names.interp_for(chunk.needs_eh, chunk.is_strict);
+        let stmts = match thunk_stmts(interp, &self.names.table, &chunk, is_strict) {
             Some(s) => s,
             None => return false,
         };
@@ -218,10 +347,23 @@ impl Virtualizer<'_> {
         self.used = true;
         true
     }
+
+    /// The strictness inherited by the scope currently being walked (the top of the
+    /// stack). Used to decide a function's strictness before `try_virtualize`.
+    fn current_strict(&self) -> bool {
+        *self.strict_stack.last().unwrap_or(&false)
+    }
+
+    /// Whether the body of a function/arrow we are about to descend into is strict:
+    /// strict if the enclosing scope is strict OR the body opens with `"use strict"`.
+    fn body_is_strict(&self, body: Option<&BlockStmt>) -> bool {
+        self.current_strict() || body.is_some_and(has_use_strict_directive)
+    }
 }
 
 impl VisitMut for Virtualizer<'_> {
     fn visit_mut_fn_decl(&mut self, n: &mut FnDecl) {
+        // Own ident is the canonical name for a function declaration.
         let name = n.ident.sym.to_string();
         if self.try_virtualize(&name, &mut n.function) {
             return; // replaced — don't recurse into the (now-thunk) body
@@ -230,15 +372,140 @@ impl VisitMut for Virtualizer<'_> {
     }
 
     fn visit_mut_fn_expr(&mut self, n: &mut FnExpr) {
+        // Own ident (e.g. `var x = function render(){}`): own ident wins.
         if let Some(id) = n.ident.clone() {
             let name = id.sym.to_string();
             if self.try_virtualize(&name, &mut n.function) {
                 return;
             }
         }
+        // No own ident: binding-name context is set by the parent visitor methods
+        // (`visit_mut_var_declarator`, `visit_mut_assign_expr`,
+        // `visit_mut_key_value_prop`). Those call `try_virtualize` directly before
+        // delegating here, so we only recurse into children at this point.
         n.visit_mut_children_with(self);
     }
+
+    /// `const render = function(){}` — binding-name inference from the declarator's
+    /// `Ident` pattern (§4.3 form 2). Arrow expressions are left as-is because the
+    /// thunk body uses `arguments`, which arrows do not have; they remain native or
+    /// become child chunks inside a parent virtualized function.
+    fn visit_mut_var_declarator(&mut self, n: &mut VarDeclarator) {
+        if let Pat::Ident(binding) = &n.name {
+            let binding_name = binding.id.sym.to_string();
+            if let Some(Expr::Fn(fn_expr)) = n.init.as_deref_mut() {
+                if fn_expr.ident.is_none() {
+                    // Anonymous function expression: try to virtualize under the
+                    // binding name. On success, stop; on skip, fall through to
+                    // children (the fn_expr visitor will re-encounter it but find
+                    // no own ident and do nothing).
+                    if self.try_virtualize(&binding_name, &mut fn_expr.function) {
+                        return;
+                    }
+                }
+            }
+        }
+        n.visit_mut_children_with(self);
+    }
+
+    /// `obj.render = function(){}` — binding-name inference from the last
+    /// member-expression segment (§4.3 form 3). Arrow right-hand sides are skipped
+    /// for the same reason as above (thunk uses `arguments`).
+    fn visit_mut_assign_expr(&mut self, n: &mut AssignExpr) {
+        // Only simple `=` assignment, not compound (`+=` etc.).
+        if n.op == AssignOp::Assign {
+            if let Some(member_name) = last_member_key(&n.left) {
+                if let Expr::Fn(fn_expr) = n.right.as_mut() {
+                    if fn_expr.ident.is_none() {
+                        if self.try_virtualize(&member_name, &mut fn_expr.function) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        n.visit_mut_children_with(self);
+    }
+
+    /// `{ render: function(){} }` — key-value property binding-name inference
+    /// (§4.3 form 4a). Arrow values are skipped (thunk uses `arguments`).
+    fn visit_mut_key_value_prop(&mut self, n: &mut KeyValueProp) {
+        if let Some(key_name) = static_prop_key_name(&n.key) {
+            if let Expr::Fn(fn_expr) = n.value.as_mut() {
+                if fn_expr.ident.is_none() {
+                    if self.try_virtualize(&key_name, &mut fn_expr.function) {
+                        return;
+                    }
+                }
+            }
+        }
+        n.visit_mut_children_with(self);
+    }
+
+    /// `{ render() {} }` — shorthand method property (§4.3 form 4).
+    fn visit_mut_method_prop(&mut self, n: &mut MethodProp) {
+        if let Some(key_name) = static_prop_key_name(&n.key) {
+            if self.try_virtualize(&key_name, &mut n.function) {
+                return;
+            }
+        }
+        n.visit_mut_children_with(self);
+    }
+
+    /// §5a strictness propagation: descending into a (non-virtualized) function body
+    /// pushes its strictness so nested functions inherit it (a function nested in a
+    /// strict scope is strict even without its own directive). Reached for every
+    /// `Function` whose owner visitor delegated to children (i.e. it was not
+    /// virtualized in place).
+    fn visit_mut_function(&mut self, n: &mut Function) {
+        self.strict_stack.push(self.body_is_strict(n.body.as_ref()));
+        n.visit_mut_children_with(self);
+        self.strict_stack.pop();
+    }
+
+    /// Arrows have no own `this`/`arguments` and are never virtualization entry points
+    /// here, but they ARE a lexical scope whose strictness (inherited, or via their own
+    /// block-body `"use strict"`) is inherited by nested functions.
+    fn visit_mut_arrow_expr(&mut self, n: &mut ArrowExpr) {
+        let body = match &*n.body {
+            BlockStmtOrExpr::BlockStmt(b) => Some(b),
+            BlockStmtOrExpr::Expr(_) => None,
+        };
+        self.strict_stack.push(self.body_is_strict(body));
+        n.visit_mut_children_with(self);
+        self.strict_stack.pop();
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Binding-name inference helpers (§4.3)
+// ---------------------------------------------------------------------------
+
+/// Infer a binding name from the last segment of a member-expression assignment
+/// target (`obj.render = …` → `"render"`; `a.b.c = …` → `"c"`).
+/// Only handles statically-known identifier keys; computed keys return `None`.
+fn last_member_key(left: &AssignTarget) -> Option<String> {
+    // Walk the assignment target to extract a MemberExpr on the left.
+    let member = match left {
+        AssignTarget::Simple(SimpleAssignTarget::Member(m)) => m,
+        _ => return None,
+    };
+    match &member.prop {
+        MemberProp::Ident(id) => Some(id.sym.to_string()),
+        MemberProp::PrivateName(_) | MemberProp::Computed(_) => None,
+    }
+}
+
+/// Infer a name from a static object/class property key. Returns `None` for
+/// computed keys (`[expr]`) or private names (`#x`).
+fn static_prop_key_name(key: &PropName) -> Option<String> {
+    match key {
+        PropName::Ident(id) => Some(id.sym.to_string()),
+        PropName::Str(s) => s.value.as_str().map(|v| v.to_string()),
+        PropName::Num(_) | PropName::BigInt(_) | PropName::Computed(_) => None,
+    }
+}
+
 
 /// Format + parse the thunk statements that re-enter the interpreter for `chunk`:
 ///
@@ -253,11 +520,17 @@ impl VisitMut for Virtualizer<'_> {
 /// the order the interpreter threads them. Built by formatting the call as source and
 /// reparsing it (the table index and capture names are the only variable parts; there
 /// is no Rust AST mirror to drift from), mirroring the legacy `thunk_body_src`.
-fn thunk_stmts(interp: &str, table: &str, chunk: &Chunk) -> Option<Vec<Stmt>> {
+fn thunk_stmts(interp: &str, table: &str, chunk: &Chunk, is_strict: bool) -> Option<Vec<Stmt>> {
     let caps = format!("[{}]", chunk.captures.join(","));
     let params: Vec<String> = (0..chunk.pcount).map(|i| format!("p{i}")).collect();
+    // §5a case 1: a STRICT source function's thunk must itself be strict, so a plain
+    // call (`f()`) forwards `this === undefined` (strict) rather than the boxed
+    // `globalThis` a sloppy thunk would see. The `"use strict"` directive governs the
+    // thunk's OWN `this` binding; the interpreter then receives the un-coerced
+    // receiver. Sloppy thunks are byte-for-byte unchanged (empty prefix).
+    let directive = if is_strict { "\"use strict\";" } else { "" };
     let src = format!(
-        "function _v({}){{return {interp}({table}[{idx}][0],{table}[{idx}][1],arguments,{caps},{cap_start},{pcount},this);}}",
+        "function _v({}){{{directive}return {interp}({table}[{idx}][0],{table}[{idx}][1],arguments,{caps},{cap_start},{pcount},this);}}",
         params.join(","),
         idx = chunk.index,
         cap_start = chunk.cap_start,
@@ -308,12 +581,501 @@ fn splice_prologue(program: &mut Program, prologue: Vec<Stmt>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2: whole-program virtualization with PARTITION + adaptive bisection
+// (§2, §2.1, §3.1, §3.3, §5 export-bound names / cross-run cells)
+// ---------------------------------------------------------------------------
+
+use partition::{Class, Segment};
+
+/// Partition the top-level program (§3.1), wrap each maximal run of wrappable
+/// statements as its own VM chunk (bisecting a run that fails to compile, §3.3), and
+/// re-emit native items (import/export, top-level await) in program order. Cross-run
+/// `var`/`function`/`let`/`const` bindings are preserved via native cells (§2.1).
+///
+/// Returns `true` iff at least one run was virtualized (some chunk registered). On a
+/// program with no wrappable runs (e.g. only imports) returns `false` and leaves the
+/// program native (bail-to-safe). Determinism (§7): the classification, run
+/// boundaries, cell set, and bisection split order are pure functions of the AST, so
+/// the output — including partition boundaries — is byte-identical for a given seed.
+///
+/// Phase-2 limitation (Phase 3 owns it): no native-closure escape hatch — a run
+/// containing a nested ineligible function bails its (sub-)run, which then bisects
+/// down to keep that single statement native while its neighbors still virtualize.
+#[allow(clippy::too_many_arguments)]
+fn virtualize_whole_program(
+    program: &mut Program,
+    names: &VmNames,
+    tb: &mut TableBuilder,
+    exclude: Option<&str>,
+    protect_native: &[String],
+    desugar_class: bool,
+    desugar_regex: bool,
+) -> bool {
+    // §2.1 / §5: the top-level `this`. Module / strict Script → `undefined`; sloppy
+    // Script → `globalThis`. Each chunk's strictness matches the program top level.
+    let strict = program_top_is_strict(program);
+
+    // Lift the top-level body into a uniform `Vec<ModuleItem>` (a Script body has no
+    // ModuleDecls, so each statement just wraps).
+    let items: Vec<ModuleItem> = match program {
+        Program::Script(s) => std::mem::take(&mut s.body)
+            .into_iter()
+            .map(ModuleItem::Stmt)
+            .collect(),
+        Program::Module(m) => std::mem::take(&mut m.body),
+    };
+    // Pristine copy to restore verbatim if nothing virtualizes (bail-to-safe: leave
+    // the program exactly as it was — no spurious cell churn). The pristine copy is the
+    // ORIGINAL (un-desugared) program, so a no-op restore is byte-identical to input.
+    let pristine = items.clone();
+
+    // §3.2 Phase 4: opportunistic, sound, LOCAL desugaring applied BEFORE classify so a
+    // lowered construct (class→fn, regex→RegExp) can be classified Wrappable and pulled
+    // into the VM. Each lowering is its own opt-in flag (default OFF) and only fires for
+    // constructs proven sound; an unsupported shape is left native (bail-to-safe). If
+    // nothing ends up virtualizing, the pristine (un-desugared) body is restored, so a
+    // desugaring that produced no coverage win leaves the output byte-identical to
+    // input.
+    let items = desugar::desugar_top_level(items, desugar_class, desugar_regex);
+
+    // §5: export-bound names must stay resolvable as module bindings. We treat them as
+    // cross-run (the `export` reads them outside any run), so they are hoisted to a
+    // native cell and the `export` references the cell binding. Compute BEFORE we move
+    // the items into segments.
+    let export_names = partition::export_bound_names(&items);
+
+    // §3.1 classify + segment into native items and maximal wrappable runs. The
+    // strings-decoder stub (and anything declaring/referencing a protected name) is
+    // forced NATIVE so the partition never swallows machine-generated decode
+    // infrastructure into the VM.
+    let classes: Vec<Class> = partition::classify_with_protected(items, protect_native);
+    let mut segs: Vec<Segment> = partition::segment(classes);
+
+    // §2.1 cross-run binding analysis: which top-level names declared in one run are
+    // referenced outside it (another run / native item / export). Restrict to the set
+    // we can cell-ify SOUNDLY; a run that touches an UNSAFE cross-run name is kept
+    // native wholesale (conservative, bail-to-safe).
+    let cross = partition::analyze_cross_run(&segs, &export_names);
+    let cells = partition::restrict_to_safe(&segs, &cross.cells, &export_names);
+    // Any cross-run name NOT in the safe cell set is a hazard: a run referencing or
+    // declaring it cannot fully virtualize, so we force such runs native wholesale
+    // (the export / other run keeps reading the native binding).
+    let unsafe_cross: std::collections::HashSet<String> =
+        cross.cells.difference(&cells).cloned().collect();
+
+    // Build the new top-level item list, run by run, splicing native items verbatim.
+    let mut out_items: Vec<ModuleItem> = Vec::new();
+    let mut cells_emitted = false;
+    let mut any_virtualized = false;
+
+    for seg in std::mem::take(&mut segs) {
+        match seg {
+            Segment::Native(it) => out_items.push(it),
+            Segment::Run(mut stmts) => {
+                // A run that touches an unsafe cross-run name stays native wholesale.
+                if run_touches(&stmts, &unsafe_cross) {
+                    out_items.extend(stmts.into_iter().map(ModuleItem::Stmt));
+                    continue;
+                }
+                // Cell-ify the safe cross-run names referenced/declared in this run.
+                partition::cellify_run(&mut stmts, &cells);
+                // Splice the native cell declarations once, above the first run that
+                // emits (cells `var`-hoist to top, so above-first-run is correct).
+                if !cells_emitted {
+                    if let Some(decl) = partition::cell_hoist_decls(&cells) {
+                        out_items.push(ModuleItem::Stmt(decl));
+                    }
+                    cells_emitted = true;
+                }
+                // Compile the run (bisecting on failure) into chunk re-entry calls
+                // interleaved with any sub-statements that had to stay native.
+                let produced =
+                    compile_run(stmts, names, tb, strict, exclude, &mut any_virtualized);
+                out_items.extend(produced.into_iter().map(ModuleItem::Stmt));
+            }
+        }
+    }
+
+    if !any_virtualized {
+        // Nothing virtualized — restore the PRISTINE body verbatim (bail-to-safe; no
+        // cell churn). The caller then emits no table/prologue/artifact.
+        set_body(program, pristine);
+        return false;
+    }
+
+    set_body(program, out_items);
+    true
+}
+
+/// True if any top-level statement in `stmts` references or declares a name in `set`.
+fn run_touches(stmts: &[Stmt], set: &std::collections::HashSet<String>) -> bool {
+    if set.is_empty() {
+        return false;
+    }
+    use swc_core::ecma::visit::{Visit, VisitWith};
+    struct Scan<'a> {
+        set: &'a std::collections::HashSet<String>,
+        hit: bool,
+    }
+    impl Visit for Scan<'_> {
+        fn visit_ident(&mut self, id: &Ident) {
+            if self.set.contains(id.sym.as_ref()) {
+                self.hit = true;
+            }
+        }
+    }
+    let mut sc = Scan { set, hit: false };
+    for s in stmts {
+        s.visit_with(&mut sc);
+    }
+    sc.hit
+}
+
+/// Compile a maximal wrappable RUN into a sequence of top-level statements: §2.1
+/// re-entry interpreter calls for the (sub-)runs that compiled, plus any single
+/// statement that could not compile left NATIVE in place (§3.3 adaptive bisection).
+///
+/// The bisection is deterministic: a run that fails to compile as one chunk is split
+/// at its MIDPOINT (left half first), each half recursively attempted; a single
+/// statement that still fails is emitted native. Empty halves are skipped. This
+/// preserves program order (left sub-runs precede right) and is a pure function of the
+/// statement list, so the offender-isolation sequence is reproducible (§7).
+fn compile_run(
+    stmts: Vec<Stmt>,
+    names: &VmNames,
+    tb: &mut TableBuilder,
+    strict: bool,
+    exclude: Option<&str>,
+    any_virtualized: &mut bool,
+) -> Vec<Stmt> {
+    if stmts.is_empty() {
+        return Vec::new();
+    }
+    // Try the whole (sub-)run as one chunk.
+    let block = BlockStmt {
+        span: DUMMY_SP,
+        stmts: stmts.clone(),
+        ..Default::default()
+    };
+    // Phase 3 (§4): thread the exclude glob so a NESTED function matching it stays a
+    // native closure. The ineligible-divert (async/generator/`"use strict"`/
+    // structurally-ineligible nested fns → native closures) is enabled ONLY when the
+    // user supplied an exclude glob — i.e. they opted into the native-closure escape
+    // hatch. Without an exclude, whole-program keeps the Phase-1/2 behavior exactly
+    // (an ineligible nested fn bails its run, which then bisects to keep that single
+    // statement native while neighbors virtualize) — no regression, byte-for-byte.
+    let opts = CompileOptions {
+        exclude,
+        divert_ineligible: exclude.is_some(),
+    };
+    if let Ok(compiled) = compile_body_with_opts(&[], &block, opts) {
+        let chunk = tb.add_strict(compiled, strict);
+        let interp = names.interp_for(chunk.needs_eh, chunk.is_strict);
+        if let Some(call) = top_level_call_stmt(interp, &names.table, &chunk, strict) {
+            *any_virtualized = true;
+            return vec![call];
+        }
+        // Machine-generated call failed to parse (never expected) → fall through to
+        // native for this (sub-)run.
+        return stmts;
+    }
+
+    // Did not compile. A single statement cannot bisect further → stays native.
+    if stmts.len() == 1 {
+        return stmts;
+    }
+
+    // §3.3: bisect at the midpoint, left half first. But a split is only SOUND if it
+    // does not sever a binding shared across the halves (a name declared at the top
+    // level of one half and referenced in the other would become an invisible VM-local
+    // after the split). Cross-RUN bindings were already cell-ified; an intra-run
+    // binding shared across the split point is NOT a cell, so splitting here would lose
+    // it. In that case keep the WHOLE failing (sub-)run native — bail-to-safe.
+    let mid = stmts.len() / 2;
+    if split_severs_binding(&stmts, mid) {
+        return stmts;
+    }
+    let mut left = stmts;
+    let right = left.split_off(mid);
+    let mut out = compile_run(left, names, tb, strict, exclude, any_virtualized);
+    out.extend(compile_run(right, names, tb, strict, exclude, any_virtualized));
+    out
+}
+
+/// True if splitting `stmts` at index `mid` would sever a top-level binding shared
+/// across the two halves: a `var`/`function`/`let`/`const` name declared at the top
+/// level of one half that the OTHER half references. Such a name is not a cross-run
+/// cell, so the split would turn it into an invisible per-chunk local. Conservative
+/// (over-approximate via names): any uncertainty blocks the split.
+fn split_severs_binding(stmts: &[Stmt], mid: usize) -> bool {
+    use swc_core::ecma::visit::{Visit, VisitWith};
+    fn top_decls(stmts: &[Stmt]) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        struct VarScan<'a>(&'a mut std::collections::HashSet<String>);
+        impl Visit for VarScan<'_> {
+            fn visit_var_decl(&mut self, v: &VarDecl) {
+                if matches!(v.kind, VarDeclKind::Var) {
+                    for d in &v.decls {
+                        mangler_jsast::analysis::binding_names(&d.name, &mut |id| {
+                            self.0.insert(id.sym.to_string());
+                        });
+                    }
+                }
+                v.visit_children_with(self);
+            }
+            fn visit_function(&mut self, _: &Function) {}
+            fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
+        }
+        for s in stmts {
+            s.visit_with(&mut VarScan(&mut out));
+            match s {
+                Stmt::Decl(Decl::Fn(f)) => {
+                    out.insert(f.ident.sym.to_string());
+                }
+                Stmt::Decl(Decl::Var(v))
+                    if matches!(v.kind, VarDeclKind::Let | VarDeclKind::Const) =>
+                {
+                    for d in &v.decls {
+                        mangler_jsast::analysis::binding_names(&d.name, &mut |id| {
+                            out.insert(id.sym.to_string());
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+    fn refs(stmts: &[Stmt]) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        struct RefScan<'a>(&'a mut std::collections::HashSet<String>);
+        impl Visit for RefScan<'_> {
+            fn visit_ident(&mut self, id: &Ident) {
+                self.0.insert(id.sym.to_string());
+            }
+            fn visit_member_expr(&mut self, m: &MemberExpr) {
+                m.obj.visit_with(self);
+                if let MemberProp::Computed(c) = &m.prop {
+                    c.visit_with(self);
+                }
+            }
+        }
+        for s in stmts {
+            s.visit_with(&mut RefScan(&mut out));
+        }
+        out
+    }
+    let (left, right) = stmts.split_at(mid);
+    let ld = top_decls(left);
+    let rd = top_decls(right);
+    let lr = refs(left);
+    let rr = refs(right);
+    // left-declared name used in right, or right-declared name used in left.
+    ld.iter().any(|n| rr.contains(n)) || rd.iter().any(|n| lr.contains(n))
+}
+
+/// Install `items` as the program's top-level body (Module item list / Script body).
+fn set_body(program: &mut Program, items: Vec<ModuleItem>) {
+    match program {
+        Program::Module(m) => m.body = items,
+        Program::Script(s) => {
+            s.body = items
+                .into_iter()
+                .filter_map(|it| match it {
+                    ModuleItem::Stmt(s) => Some(s),
+                    // A Script cannot hold ModuleDecls; classification never produces
+                    // them for a Script, so this is unreachable in practice.
+                    ModuleItem::ModuleDecl(_) => None,
+                })
+                .collect();
+        }
+    }
+}
+
+/// Format + parse the §2.1 top-level re-entry call:
+///
+/// ```text
+/// <interp>(T[i][0], T[i][1], [], [<caps>], <cap_start>, 0, <thisExpr>);
+/// ```
+///
+/// * `pcount = 0`, `arguments = []` (top level has no args).
+/// * `<caps>` — the run's free globals spread in capture order, referenced by their
+///   real module-scope names (they resolve to the real globals because the call sits
+///   at module scope) — the SAME capture array the function thunk builds.
+/// * `<thisExpr>` — `undefined` for Module top level / strict Script; `globalThis`
+///   for sloppy Script.
+/// * The result is discarded (a wrapped run never returns — top-level `return` is a
+///   syntax error).
+fn top_level_call_stmt(interp: &str, table: &str, chunk: &Chunk, strict: bool) -> Option<Stmt> {
+    let caps = format!("[{}]", chunk.captures.join(","));
+    let this_expr = if strict { "undefined" } else { "globalThis" };
+    let src = format!(
+        "{interp}({table}[{idx}][0],{table}[{idx}][1],[],{caps},{cap_start},0,{this_expr});",
+        idx = chunk.index,
+        cap_start = chunk.cap_start,
+    );
+    parse_one_top_stmt(&src)
+}
+
+/// Parse a single statement `src` and return it, or `None` on parse failure.
+fn parse_one_top_stmt(src: &str) -> Option<Stmt> {
+    let ast = Js.parse(src, &ParseOpts::default()).ok()?;
+    match ast.into_program() {
+        Program::Script(s) => s.body.into_iter().next(),
+        Program::Module(m) => m.body.into_iter().find_map(|it| match it {
+            ModuleItem::Stmt(s) => Some(s),
+            _ => None,
+        }),
+    }
+}
+
+/// §5a: the program top-level strictness (the base of the inherited-strictness
+/// stack). An ES Module is implicitly strict; a Script is strict iff its body opens
+/// with a `"use strict"` directive prologue.
+fn program_top_is_strict(program: &Program) -> bool {
+    match program {
+        Program::Module(_) => true,
+        Program::Script(s) => stmts_open_with_use_strict(&s.body),
+    }
+}
+
+/// §5a byte-identity guard: a cheap over-approximate pre-scan for "does this program
+/// contain a function we might virtualize STRICT?". Only when this is true do we draw
+/// the two extra strict-interpreter names — so a fully-sloppy program's name
+/// allocation (and thus its byte output) is unchanged. Over-approximation is safe: a
+/// false positive merely draws two unused names; a strict function that later bails
+/// compilation simply leaves the strict interpreter unemitted (the names are unused,
+/// harmless and deterministic).
+fn program_has_strict_candidate(program: &Program, target: &str, exclude: Option<&str>) -> bool {
+    use swc_core::ecma::visit::{Visit, VisitWith};
+
+    struct Scan<'a> {
+        target: &'a str,
+        exclude: Option<&'a str>,
+        strict_stack: Vec<bool>,
+        found: bool,
+    }
+    impl Scan<'_> {
+        fn cur(&self) -> bool {
+            *self.strict_stack.last().unwrap_or(&false)
+        }
+        /// Record a named candidate whose body would be virtualized strict.
+        fn consider(&mut self, name: &str, body_strict: bool) {
+            if self.found || !glob::matches(self.target, name) {
+                return;
+            }
+            if let Some(e) = self.exclude {
+                if glob::matches(e, name) {
+                    return;
+                }
+            }
+            if self.cur() || body_strict {
+                self.found = true;
+            }
+        }
+    }
+    impl Visit for Scan<'_> {
+        fn visit_function(&mut self, n: &Function) {
+            let strict = self.cur() || n.body.as_ref().is_some_and(has_use_strict_directive);
+            self.strict_stack.push(strict);
+            n.visit_children_with(self);
+            self.strict_stack.pop();
+        }
+        fn visit_arrow_expr(&mut self, n: &ArrowExpr) {
+            let body_strict = match &*n.body {
+                BlockStmtOrExpr::BlockStmt(b) => has_use_strict_directive(b),
+                BlockStmtOrExpr::Expr(_) => false,
+            };
+            self.strict_stack.push(self.cur() || body_strict);
+            n.visit_children_with(self);
+            self.strict_stack.pop();
+        }
+        fn visit_fn_decl(&mut self, n: &FnDecl) {
+            self.consider(
+                n.ident.sym.as_ref(),
+                n.function.body.as_ref().is_some_and(has_use_strict_directive),
+            );
+            n.visit_children_with(self);
+        }
+        fn visit_fn_expr(&mut self, n: &FnExpr) {
+            if let Some(id) = &n.ident {
+                self.consider(
+                    id.sym.as_ref(),
+                    n.function.body.as_ref().is_some_and(has_use_strict_directive),
+                );
+            }
+            n.visit_children_with(self);
+        }
+        fn visit_var_declarator(&mut self, n: &VarDeclarator) {
+            if let (Pat::Ident(b), Some(Expr::Fn(fe))) = (&n.name, n.init.as_deref()) {
+                if fe.ident.is_none() {
+                    self.consider(
+                        b.id.sym.as_ref(),
+                        fe.function.body.as_ref().is_some_and(has_use_strict_directive),
+                    );
+                }
+            }
+            n.visit_children_with(self);
+        }
+        fn visit_assign_expr(&mut self, n: &AssignExpr) {
+            if n.op == AssignOp::Assign {
+                if let (Some(name), Expr::Fn(fe)) = (last_member_key(&n.left), n.right.as_ref()) {
+                    if fe.ident.is_none() {
+                        self.consider(
+                            &name,
+                            fe.function.body.as_ref().is_some_and(has_use_strict_directive),
+                        );
+                    }
+                }
+            }
+            n.visit_children_with(self);
+        }
+        fn visit_key_value_prop(&mut self, n: &KeyValueProp) {
+            if let (Some(name), Expr::Fn(fe)) = (static_prop_key_name(&n.key), n.value.as_ref()) {
+                if fe.ident.is_none() {
+                    self.consider(
+                        &name,
+                        fe.function.body.as_ref().is_some_and(has_use_strict_directive),
+                    );
+                }
+            }
+            n.visit_children_with(self);
+        }
+        fn visit_method_prop(&mut self, n: &MethodProp) {
+            if let Some(name) = static_prop_key_name(&n.key) {
+                self.consider(
+                    &name,
+                    n.function.body.as_ref().is_some_and(has_use_strict_directive),
+                );
+            }
+            n.visit_children_with(self);
+        }
+    }
+
+    let mut scan = Scan {
+        target,
+        exclude,
+        strict_stack: vec![program_top_is_strict(program)],
+        found: false,
+    };
+    program.visit_with(&mut scan);
+    scan.found
+}
+
 /// True if `body` begins with its OWN `"use strict"` directive (strict regardless of
-/// the enclosing scope). The VM cannot preserve that strictness on the replacement
-/// thunk, so such functions are skipped to keep `this`/strict-mode semantics sound.
+/// the enclosing scope). Strict functions are now virtualized via a strict thunk +
+/// strict interpreter variant (§5a); this still computes the function's own
+/// directive contribution to the inherited-strictness attribute.
 /// Scans only the leading directive prologue (leading string-literal statements).
 fn has_use_strict_directive(body: &BlockStmt) -> bool {
-    for s in &body.stmts {
+    stmts_open_with_use_strict(&body.stmts)
+}
+
+/// True if a statement list opens with a `"use strict"` directive prologue (leading
+/// string-literal expression statements, one of which is exactly `"use strict"`).
+fn stmts_open_with_use_strict(stmts: &[Stmt]) -> bool {
+    for s in stmts {
         match s {
             Stmt::Expr(es) => match &*es.expr {
                 Expr::Lit(Lit::Str(lit)) => {

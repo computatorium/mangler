@@ -14,6 +14,14 @@ pub(crate) fn emit_expr(cx: &mut Cx<'_>, expr: &Expr) {
     if cx.bailed() {
         return;
     }
+    // §4.3: a binding name (`const render = …`, `obj.render = …`, `{render: …}`)
+    // applies ONLY when the value is DIRECTLY a function/arrow expression. Take it
+    // here and re-stash it solely for the direct Fn/Arrow arms below, so a closure
+    // nested elsewhere in the value (e.g. `const x = foo(() => …)`) is NOT mis-named.
+    let pending_name = cx.pending_fn_name.take();
+    if matches!(expr, Expr::Fn(_) | Expr::Arrow(_)) {
+        cx.pending_fn_name = pending_name;
+    }
     match expr {
         Expr::Fn(fe) => {
             // A (possibly named) function expression: `var g = function f(){…}`.

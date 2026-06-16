@@ -48,6 +48,12 @@ pub struct InterpreterSpec<'a> {
     pub sy: &'a str,
     /// Whether to emit the exception-handling / iterator / completion shape.
     pub needs_eh: bool,
+    /// Whether to emit the interpreter body under a leading `"use strict"` directive
+    /// (§5a case 2): a strict interpreter's `Store*` opcodes (`o[k]=v`) throw a
+    /// `TypeError` on a non-writable / getter-only / frozen target, where a sloppy
+    /// interpreter silently no-ops. `false` (the default) is byte-for-byte today's
+    /// output — the directive is the ONLY structural difference between the two.
+    pub is_strict: bool,
     /// The per-file diversification (perms, key, seeds, skeleton variant).
     pub diversity: &'a VmDiversity,
 }
@@ -270,6 +276,22 @@ S.push(Mk(n,cl_a,cl_s,cl_p,cl_u,L,receiver));break;"
             ));
             continue;
         }
+        if k == 36 {
+            // Phase 3 native-closure escape hatch: build the closure by CALLING the
+            // factory const with the threaded upvalue slot values. `n` is the const
+            // index, `cl_a` the (informational) arrow flag, `cl_n` the upvalue count;
+            // each upvalue is the enclosing-frame slot value `L[C[pc++]]` (a local,
+            // or a cell array for a mutable capture, or the receiver for an arrow's
+            // lexical `this`). The factory returns the native fn, run in its own mode.
+            handlers.push((
+                label,
+                "n=C[pc++];cl_a=C[pc++];cl_n=C[pc++];\
+cl_u=[];for(j=0;j<cl_n;j++){t=C[pc++];cl_u.push(t===2147483646?receiver:L[t]);}\
+S.push(consts[n].apply(null,cl_u));break;"
+                    .to_string(),
+            ));
+            continue;
+        }
         // Stage-1b: pick this opcode's seed-derived body variant (variant 0 = the
         // historical body).
         let body = match opcode_handler_variant(k, div.handler_variant(k)) {
@@ -343,6 +365,10 @@ pub(crate) fn interpreter_src(spec: &InterpreterSpec) -> String {
     let name = spec.name;
     let decode_init = decode_init(spec);
     let handlers = build_handlers(spec);
+    // §5a case 2: a strict interpreter carries a leading `"use strict"` so its
+    // `Store*` opcodes throw on non-writable/getter-only/frozen targets. For a sloppy
+    // interpreter this is the empty string, leaving the body byte-for-byte unchanged.
+    let strict = if spec.is_strict { "\"use strict\";" } else { "" };
 
     // The switch-case block (used by the switch shape AND whenever needs_eh).
     let mut cases = String::new();
@@ -356,7 +382,7 @@ pub(crate) fn interpreter_src(spec: &InterpreterSpec) -> String {
             format!("try{{{inner}}}catch(e){{comp={{t:1,v:e,f:0}};if(!unwind(0))throw e;}}");
         let outer = loop_frame(variant, &outer_body);
         format!(
-            "function {name}(code,consts,args,caps,capStart,pcount,receiver){{\
+            "function {name}(code,consts,args,caps,capStart,pcount,receiver){{{strict}\
 var L=[],S=[],C=[],pc=0,i,a,b,o,k,v,f,n,t,obj,op,uop,base,r,it,m,j,cl_a,cl_s,cl_p,cl_n,cl_u,H=[],comp={{t:0,v:0,f:0}},NORMAL={{t:0,v:0,f:0}},h;\
 {decode_init}\
 function unwind(floor){{while(H.length>floor){{h=H.pop();S.length=h[2];\
@@ -385,7 +411,7 @@ return {name}({}[mi][0],{}[mi][1],arguments,up,ms,mp,ma?receiver:this);}};S.push
         }
         let lean = loop_frame(variant, "F[C[pc++]]();if(dn)return rv;");
         format!(
-            "function {name}(code,consts,args,caps,capStart,pcount,receiver){{\
+            "function {name}(code,consts,args,caps,capStart,pcount,receiver){{{strict}\
 var L=[],S=[],C=[],pc=0,i,a,b,o,k,v,f,n,t,obj,op,uop,base,j,cl_a,cl_s,cl_p,cl_n,cl_u;\
 {decode_init}\
 {build}\
@@ -395,7 +421,7 @@ var L=[],S=[],C=[],pc=0,i,a,b,o,k,v,f,n,t,obj,op,uop,base,j,cl_a,cl_s,cl_p,cl_n,
     } else {
         let lean = loop_frame(variant, &format!("switch(C[pc++]){{{cases}}}"));
         format!(
-            "function {name}(code,consts,args,caps,capStart,pcount,receiver){{\
+            "function {name}(code,consts,args,caps,capStart,pcount,receiver){{{strict}\
 var L=[],S=[],C=[],pc=0,i,a,b,o,k,v,f,n,t,obj,op,uop,base,j,cl_a,cl_s,cl_p,cl_n,cl_u;\
 {decode_init}\
 {lean}\
@@ -434,7 +460,11 @@ mod tests {
     use crate::diversity::VmDiversity;
 
     fn spec_for<'a>(div: &'a VmDiversity, needs_eh: bool) -> InterpreterSpec<'a> {
-        InterpreterSpec { name: "V", table: "T", rc: "rc", sy: "sy", needs_eh, diversity: div }
+        InterpreterSpec { name: "V", table: "T", rc: "rc", sy: "sy", needs_eh, is_strict: false, diversity: div }
+    }
+
+    fn spec_for_strict<'a>(div: &'a VmDiversity, needs_eh: bool) -> InterpreterSpec<'a> {
+        InterpreterSpec { name: "V", table: "T", rc: "rc", sy: "sy", needs_eh, is_strict: true, diversity: div }
     }
 
     #[test]
@@ -463,6 +493,34 @@ mod tests {
                 assert!(
                     Js::reparse(&src, &ParseOpts::default()).is_ok(),
                     "seed {seed} needs_eh {needs_eh} must reparse:\n{src}"
+                );
+            }
+        }
+    }
+
+    /// §5a byte-identity proof at the emitter level: a sloppy spec (`is_strict:false`)
+    /// must produce EXACTLY the source the pre-strict emitter produced — the only
+    /// difference a strict spec introduces is a leading `"use strict";` directive.
+    #[test]
+    fn strict_spec_only_prepends_use_strict_directive() {
+        for seed in [1u64, 7, 42, 999] {
+            let div = VmDiversity::draw(&mut mangler_core::Rng::for_pass(seed, "vm"));
+            for needs_eh in [false, true] {
+                let sloppy = interpreter_src(&spec_for(&div, needs_eh));
+                let strict = interpreter_src(&spec_for_strict(&div, needs_eh));
+                // The strict body is the sloppy body with `"use strict";` inserted
+                // right after the function's opening brace.
+                let brace = sloppy.find('{').expect("fn has a body brace");
+                let expected = format!(
+                    "{}{{\"use strict\";{}",
+                    &sloppy[..brace],
+                    &sloppy[brace + 1..]
+                );
+                assert_eq!(strict, expected, "seed {seed} eh {needs_eh}");
+                assert!(strict.contains("\"use strict\""), "strict carries the directive");
+                assert!(
+                    Js::reparse(&strict, &ParseOpts::default()).is_ok(),
+                    "strict reparses:\n{strict}"
                 );
             }
         }

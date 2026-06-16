@@ -195,13 +195,42 @@ impl PassPreset for AntiTamperConfig {
 /// Function virtualization (opt-in; never a preset default).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct VirtualizeConfig {
-    /// Glob matching function names to virtualize. `None` = pass disabled.
+    /// Glob matching function names to virtualize. `None` = pass disabled (unless
+    /// `whole_program` is set). Ignored when `whole_program` is true (§1 matrix:
+    /// whole-program wins).
     pub target: Option<String>,
+    /// NEW (Phase 1): wrap the ENTIRE top-level program body as one synthetic VM
+    /// chunk (all-or-nothing — if it compiles the whole top level is virtualized,
+    /// else the program is left native). Opt-in; never a preset default. When set,
+    /// `target` is ignored. Bail-to-safe: a program that cannot compile (or that
+    /// contains `import`/`export`) is left entirely native.
+    pub whole_program: bool,
+    /// Glob matching function names to KEEP NATIVE (exclude from virtualization).
+    /// `None` = no exclusions. Evaluated after `target`: a function must match
+    /// `target` AND NOT match `exclude` to be virtualized. Bail-to-safe: exclude
+    /// only ever keeps a function native; it never miscompiles.
+    pub exclude: Option<String>,
+    /// NEW (Phase 4, opt-in): lower a sound top-level `class C extends B {…}` to
+    /// function/prototype form before classification, so it becomes wrappable. Only
+    /// has effect when `whole_program` is set. Unsupported class shapes stay native
+    /// (bail-to-safe). Default false; never a preset default.
+    pub desugar_class: bool,
+    /// NEW (Phase 4, opt-in): lower a regex literal `/re/g` to `new RegExp("re","g")`
+    /// before classification. Only has effect when `whole_program` is set. Default
+    /// false; never a preset default. (Left OFF by default pending fuzz sign-off —
+    /// see the virtualize pass `desugar` module.)
+    pub desugar_regex: bool,
 }
 
 impl PassPreset for VirtualizeConfig {
     fn for_preset(_level: Intensity) -> Self {
-        VirtualizeConfig { target: None }
+        VirtualizeConfig {
+            target: None,
+            whole_program: false,
+            exclude: None,
+            desugar_class: false,
+            desugar_regex: false,
+        }
     }
 }
 
@@ -249,7 +278,13 @@ impl PassConfigs {
     pub fn for_fragment(&self) -> Self {
         let mut f = self.clone();
         f.anti_tamper = AntiTamperConfig { self_defending: false, debug_protection: false };
-        f.virtualize = VirtualizeConfig { target: None };
+        f.virtualize = VirtualizeConfig {
+            target: None,
+            whole_program: false,
+            exclude: None,
+            desugar_class: false,
+            desugar_regex: false,
+        };
         f.strings.in_vm = false;
         f.strings.self_coupled_key = false;
         f.strings.exec_trace_key = false;
@@ -327,7 +362,11 @@ mod tests {
             assert!(!p.strings.exec_trace_key, "{l}: exec_trace_key must be opt-in");
             assert!(p.strings.dynamic_key.is_none(), "{l}: dynamic_key must be opt-in");
             assert!(!p.global_indirect.harden_anchor, "{l}: harden_anchor must be opt-in");
-            assert!(p.virtualize.target.is_none(), "{l}: virtualize must be opt-in");
+            assert!(p.virtualize.target.is_none(), "{l}: virtualize.target must be opt-in");
+            assert!(!p.virtualize.whole_program, "{l}: virtualize.whole_program must be opt-in");
+            assert!(p.virtualize.exclude.is_none(), "{l}: virtualize.exclude must be opt-in");
+            assert!(!p.virtualize.desugar_class, "{l}: virtualize.desugar_class must be opt-in");
+            assert!(!p.virtualize.desugar_regex, "{l}: virtualize.desugar_regex must be opt-in");
             // Aggressive / Soup never preset defaults.
             assert_ne!(p.global_indirect.mode, GlobalIndirect::Aggressive);
             assert_ne!(p.mangle.naming, IdNaming::Soup);
@@ -338,6 +377,10 @@ mod tests {
     fn for_fragment_strips_anti_tamper_and_vm_but_keeps_rest() {
         let mut p = PassConfigs::for_preset(Intensity::High);
         p.virtualize.target = Some("*".to_string());
+        p.virtualize.whole_program = true;
+        p.virtualize.exclude = Some("render*".to_string());
+        p.virtualize.desugar_class = true;
+        p.virtualize.desugar_regex = true;
         p.strings.in_vm = true;
         p.strings.self_coupled_key = true;
         p.strings.exec_trace_key = true;
@@ -345,6 +388,10 @@ mod tests {
         assert!(!f.anti_tamper.self_defending);
         assert!(!f.anti_tamper.debug_protection);
         assert!(f.virtualize.target.is_none());
+        assert!(!f.virtualize.whole_program, "fragment strips whole_program too");
+        assert!(f.virtualize.exclude.is_none(), "fragment strips exclude too");
+        assert!(!f.virtualize.desugar_class, "fragment strips desugar_class too");
+        assert!(!f.virtualize.desugar_regex, "fragment strips desugar_regex too");
         assert!(!f.strings.in_vm);
         assert!(!f.strings.self_coupled_key);
         assert!(!f.strings.exec_trace_key);

@@ -386,9 +386,17 @@ fn build_vm_decode(
     let mut tb = TableBuilder::with_diversity(VmDiversity::draw(rng));
     let chunk = tb.add(compiled);
 
+    let lean_interp = cfg.fresh_name();
+    let eh_interp = cfg.fresh_name();
     let names = VmNames {
-        lean_interp: cfg.fresh_name(),
-        eh_interp: cfg.fresh_name(),
+        // The decode primitive is always sloppy (it `add`s a sloppy chunk), so the
+        // strict interpreter variants are never emitted. Reuse the sloppy names rather
+        // than drawing fresh ones, so the name-allocator order — and thus the byte
+        // output of this sloppy-only client — is unchanged from before strict support.
+        lean_interp_strict: lean_interp.clone(),
+        eh_interp_strict: eh_interp.clone(),
+        lean_interp,
+        eh_interp,
         table: cfg.fresh_name(),
         rc: cfg.fresh_name(),
         sy: cfg.fresh_name(),

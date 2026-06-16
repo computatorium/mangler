@@ -448,6 +448,16 @@ pub(crate) fn emit_spread_array(cx: &mut Cx<'_>, elems: &[ExprOrSpread]) {
 /// Emit one object-literal entry as a key then a value (two stack slots), shared
 /// by the plain `MakeObject` path and the spread `Object.assign` segments. Only
 /// data props are modeled; `__proto__` and accessor/method props bail.
+/// §4.3 binding-name inference from a static object/class property key. Returns
+/// `None` for computed (`[expr]`), numeric, bigint, or private-name keys.
+pub(crate) fn static_prop_key_name(key: &PropName) -> Option<String> {
+    match key {
+        PropName::Ident(id) => Some(id.sym.to_string()),
+        PropName::Str(s) => s.value.as_str().map(|v| v.to_string()),
+        PropName::Num(_) | PropName::BigInt(_) | PropName::Computed(_) => None,
+    }
+}
+
 pub(crate) fn emit_object_entry(cx: &mut Cx<'_>, prop: &Prop) {
     match prop {
         Prop::KeyValue(kv) => {
@@ -455,7 +465,11 @@ pub(crate) fn emit_object_entry(cx: &mut Cx<'_>, prop: &Prop) {
             if cx.bailed() {
                 return;
             }
+            // §4.3: infer the binding name from a static property key
+            // (`{ render: () => … }` → `render`) for the native-closure divert.
+            cx.pending_fn_name = static_prop_key_name(&kv.key);
             emit_expr(cx, &kv.value);
+            cx.pending_fn_name = None;
         }
         Prop::Shorthand(ident) => {
             // `{x}` -> key "x", value = binding `x`. `obj[k]=v` would set the
@@ -546,7 +560,14 @@ pub(crate) fn emit_assign(cx: &mut Cx<'_>, a: &AssignExpr) {
                 if cx.bailed() {
                     return;
                 }
+                // §4.3: infer the binding name from the last static member segment
+                // (`obj.render = function(){}` → `render`) for the native-closure
+                // divert. Computed/private keys yield no name.
+                if let MemberProp::Ident(id) = &m.prop {
+                    cx.pending_fn_name = Some(id.sym.to_string());
+                }
                 emit_expr(cx, &a.right);
+                cx.pending_fn_name = None;
                 // Per the VM contract, SetProp does `o[k]=v; push v` — it leaves
                 // the assigned value on the stack, exactly like StoreLocal. So a
                 // member assignment used as an expression (`y = (o.k = v)`) is

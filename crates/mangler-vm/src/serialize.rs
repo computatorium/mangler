@@ -114,6 +114,21 @@ pub fn serialize(
                     out.push(*s as f64);
                 }
             }
+            // NativeClosure-layout: const index, arrow flag, upvalue count, then
+            // each upvalue slot (no SELF sentinel — a native fn keeps its own JS
+            // self reference).
+            Instr::MakeNativeClosure {
+                const_idx,
+                is_arrow,
+                up_slots,
+            } => {
+                out.push(*const_idx as f64);
+                out.push(if *is_arrow { 1.0 } else { 0.0 });
+                out.push(up_slots.len() as f64);
+                for s in up_slots {
+                    out.push(*s as f64);
+                }
+            }
             // Nullary-layout ops have no operand words.
             _ => debug_assert_eq!(i.layout(), Layout::Nullary, "unhandled operand layout for {i:?}"),
         }
@@ -203,6 +218,17 @@ pub fn consts_array_js(consts: &[Const], key: u32) -> String {
                     s.push_str(&enc_str(st, ck));
                 }
                 s.push_str("]}");
+            }
+            // Phase 3: a native-closure factory renders VERBATIM as its function
+            // expression source, parenthesized so it is unambiguously an expression
+            // element of the array literal. It is a function value (not an array /
+            // `.q` object), so the interpreter's const-decode loop leaves it
+            // untouched. The source is already deterministic (built from the AST), so
+            // the bytes are identical for a given seed.
+            Const::NativeFactory(src) => {
+                s.push('(');
+                s.push_str(src);
+                s.push(')');
             }
         }
     }
@@ -309,6 +335,7 @@ mod tests {
             Instr::LoadCell(0),
             Instr::StoreCell(0),
             Instr::MakeClosure { child: 0, is_arrow: true, cap_start: 1, pcount: 0, up_slots: vec![0, 1, 2] },
+            Instr::MakeNativeClosure { const_idx: 0, is_arrow: true, up_slots: vec![0, 1] },
         ];
         assert_eq!(code.len(), N_OPCODES);
         let src_discs: Vec<usize> = code.iter().map(|i| i.discriminant()).collect();
@@ -333,6 +360,8 @@ mod tests {
                 Layout::Binary => 2,
                 // Closure: 5 fixed operands + nUp (the word at pc+5) upvalue slots.
                 Layout::Closure => 5 + words[pc + 5] as usize,
+                // NativeClosure: 3 fixed operands + nUp (the word at pc+3) slots.
+                Layout::NativeClosure => 3 + words[pc + 3] as usize,
             };
             decoded_sizes.push(1 + n_operands as u32);
             pc += 1 + n_operands;
@@ -403,6 +432,45 @@ mod tests {
         let (code, _) = serialize(&c, &id_perm(), &id_bin(), &id_un());
         // disc 35, child 7, arrow 1, capStart 2, pcount 1, nUp 2, slots 0,5.
         assert_eq!(code, vec![35.0, 7.0, 1.0, 2.0, 1.0, 2.0, 0.0, 5.0]);
+    }
+
+    #[test]
+    fn makenativeclosure_variable_length() {
+        let c = compiled(
+            vec![Instr::MakeNativeClosure {
+                const_idx: 4,
+                is_arrow: true,
+                up_slots: vec![0, 5],
+            }],
+            vec![],
+        );
+        let (code, _) = serialize(&c, &id_perm(), &id_bin(), &id_un());
+        // disc 36, constIdx 4, arrow 1, nUp 2, slots 0,5.
+        assert_eq!(code, vec![36.0, 4.0, 1.0, 2.0, 0.0, 5.0]);
+    }
+
+    #[test]
+    fn native_factory_const_renders_verbatim_and_deterministic() {
+        // A NativeFactory const renders as its parenthesized function-expression
+        // source, verbatim and untouched by the XOR/Str encoding. Same input ⇒
+        // byte-identical output (determinism).
+        let key = 0x9E37_79B9;
+        let factory = "function(u0){return function render(){return u0[0]}}";
+        let consts = vec![
+            Const::Num(1.0),
+            Const::NativeFactory(factory.to_string()),
+            Const::Str("x".to_string()),
+        ];
+        let a = consts_array_js(&consts, key);
+        let b = consts_array_js(&consts, key);
+        assert_eq!(a, b, "same input ⇒ byte-identical");
+        assert!(
+            a.contains(&format!("({factory})")),
+            "factory rendered verbatim parenthesized: {a}"
+        );
+        // The factory text is NOT XOR-mangled (it is a function value, decoded by
+        // running it, not by the Str/template de-XOR path).
+        assert!(a.contains("function render"), "function body intact: {a}");
     }
 
     #[test]

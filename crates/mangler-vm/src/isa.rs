@@ -26,10 +26,10 @@
 
 use swc_core::ecma::ast::{AssignOp, BinaryOp, UnaryOp};
 
-/// Number of top-level opcode slots in the dispatch space (canonical `0..36`).
-/// Matches the legacy `N_OPCODES`. The opcode permutation is sized
-/// `N_OPCODES + junk`; the first `N_OPCODES` entries are the real opcodes.
-pub const N_OPCODES: usize = 36;
+/// Number of top-level opcode slots in the dispatch space (canonical `0..37`).
+/// The opcode permutation is sized `N_OPCODES + junk`; the first `N_OPCODES`
+/// entries are the real opcodes.
+pub const N_OPCODES: usize = 37;
 
 /// Number of binary-operator sub-codes (the inner `switch` under the `Bin`
 /// opcode). Permuted per file (C2).
@@ -42,6 +42,13 @@ pub const N_UN_OPS: usize = 7;
 /// named function expression's self reference. Chosen well above any real slot
 /// index (a program with this many slots bails `too_large`).
 pub const SELF_UPVALUE: u32 = 0x7FFF_FFFF;
+
+/// Upvalue-slot sentinel meaning "the enclosing frame's `receiver` (`this`)" — used
+/// by [`Instr::MakeNativeClosure`] to thread the lexical `this` into an excluded /
+/// native ARROW's factory (arrows ignore the call-time receiver, so closing over the
+/// enclosing `this` preserves lexical `this`). One below [`SELF_UPVALUE`]; also well
+/// above any real slot index.
+pub const RECEIVER_UPVALUE: u32 = 0x7FFF_FFFE;
 
 // ---------------------------------------------------------------------------
 // The ONE opcode table.
@@ -68,6 +75,10 @@ pub enum Layout {
     /// isArrow, capStart, pcount, nUp) + one word per upvalue slot. Size is
     /// `6 + up_slots.len()`.
     Closure,
+    /// The variable-length `MakeNativeClosure` form: 3 fixed operand words
+    /// (constIdx, isArrow, nUp) + one word per upvalue slot. Size is
+    /// `4 + up_slots.len()`.
+    NativeClosure,
 }
 
 impl Layout {
@@ -80,6 +91,7 @@ impl Layout {
             Layout::Unary => 2,
             Layout::Binary => 3,
             Layout::Closure => 6 + n_up as u32,
+            Layout::NativeClosure => 4 + n_up as u32,
         }
     }
 }
@@ -226,6 +238,21 @@ opcodes! {
         pcount: u32,
         up_slots: Vec<u32>,
     } = 35 => Closure,
+    /// Phase 3 native-closure escape hatch. Builds a closure that runs as native
+    /// JS at full speed: `L[dst] = consts[const_idx](L[up0], L[up1], …)`. The
+    /// const is a [`crate::chunk::Const::NativeFactory`] — a factory function
+    /// expression that closes over the threaded upvalues (enclosing VM-frame
+    /// locals / cells, plus the enclosing `this` for an arrow) and returns the
+    /// original (excluded / ineligible) function or arrow, run in its own
+    /// strictness. `up_slots` are the enclosing-frame slots, in factory-param
+    /// order; the [`SELF_UPVALUE`] sentinel is never used here (a native fn keeps
+    /// its own JS-level self reference). `is_arrow` is informational (the factory
+    /// itself encodes arrow-vs-function).
+    MakeNativeClosure {
+        const_idx: u32,
+        is_arrow: bool,
+        up_slots: Vec<u32>,
+    } = 36 => NativeClosure,
 }
 
 impl Instr {
@@ -233,7 +260,8 @@ impl Instr {
     /// for the closure form, its upvalue count.
     pub fn size(&self) -> u32 {
         let n_up = match self {
-            Instr::MakeClosure { up_slots, .. } => up_slots.len(),
+            Instr::MakeClosure { up_slots, .. }
+            | Instr::MakeNativeClosure { up_slots, .. } => up_slots.len(),
             _ => 0,
         };
         self.layout().size_with(n_up)
@@ -375,6 +403,7 @@ mod tests {
         assert_eq!(Layout::Unary.size_with(0), 2);
         assert_eq!(Layout::Binary.size_with(0), 3);
         assert_eq!(Layout::Closure.size_with(2), 8);
+        assert_eq!(Layout::NativeClosure.size_with(2), 6);
     }
 
     /// A representative instance of every variant: discriminant matches the table
@@ -419,6 +448,7 @@ mod tests {
             Instr::LoadCell(0),
             Instr::StoreCell(0),
             Instr::MakeClosure { child: 0, is_arrow: false, cap_start: 0, pcount: 0, up_slots: vec![1, 2] },
+            Instr::MakeNativeClosure { const_idx: 0, is_arrow: false, up_slots: vec![1, 2] },
         ];
         assert_eq!(samples.len(), N_OPCODES, "one sample per opcode");
         // Each discriminant appears exactly once across the samples.
@@ -428,12 +458,18 @@ mod tests {
             assert!(!seen[d], "duplicate discriminant {d}");
             seen[d] = true;
             // size() matches the declared layout for this instance.
-            let n_up = if let Instr::MakeClosure { up_slots, .. } = ins { up_slots.len() } else { 0 };
+            let n_up = match ins {
+                Instr::MakeClosure { up_slots, .. }
+                | Instr::MakeNativeClosure { up_slots, .. } => up_slots.len(),
+                _ => 0,
+            };
             assert_eq!(ins.size(), ins.layout().size_with(n_up), "size/layout mismatch for {ins:?}");
         }
         assert!(seen.iter().all(|&b| b), "every discriminant covered");
         // Spot-check the closure variable length: 5 fixed + 1 nUp + 2 slots = 8.
         assert_eq!(samples[35].size(), 8);
+        // MakeNativeClosure: 1 opcode + constIdx + isArrow + nUp + 2 slots = 6.
+        assert_eq!(samples[36].size(), 6);
     }
 
     /// The Bin/Un operator tables: codes are dense, the Rust op→code maps invert

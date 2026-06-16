@@ -22,7 +22,10 @@ pub mod test_support;
 
 pub use cells::{plan_and_rewrite, BoxPlan};
 pub use chunk::{Chunk, ChildChunk, Compiled, Const};
-pub use compile::{compile_body, compile_body_boxed, compile_body_with_plan};
+pub use compile::{
+    compile_body, compile_body_boxed, compile_body_with_opts, compile_body_with_plan,
+    CompileOptions,
+};
 pub use diversity::VmDiversity;
 pub use eligibility::{classify_body, Eligibility};
 pub use emit::{emit_interpreter, InterpreterSpec};

@@ -71,6 +71,34 @@ pub struct ConfigFlags {
     #[arg(long)]
     pub virtualize: Option<String>,
 
+    /// Virtualize the ENTIRE top-level program as one synthetic VM chunk
+    /// (all-or-nothing: if it compiles the whole top level is virtualized, else the
+    /// program is left native). Opt-in; bail-to-safe. When set, `--virtualize`
+    /// (`target`) is ignored. Phase-1 limitation: a program containing `import`/
+    /// `export` is left entirely native.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub virtualize_program: bool,
+
+    /// Keep functions whose names match this glob NATIVE (never virtualized), even
+    /// when they would otherwise be selected by `--virtualize`. Opt-in; bail-to-safe.
+    #[arg(long, value_name = "GLOB")]
+    pub virtualize_exclude: Option<String>,
+
+    /// (Phase 4, opt-in) Opportunistically lower a top-level `class C extends B {…}`
+    /// to function/prototype form BEFORE classification, so it becomes a wrappable
+    /// construct and gets virtualized. Only fires for classes with no unsupported
+    /// member shapes (private `#x`, `static{}`, decorators, computed keys); anything
+    /// else stays a native class (bail-to-safe). Only has effect together with
+    /// `--virtualize-program`. Default OFF.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub virtualize_desugar_class: bool,
+
+    /// (Phase 4, opt-in) Lower a regex literal `/re/g` to `new RegExp("re","g")` so it
+    /// leaves the VM compiler's regex-literal bail and becomes a normal call. Only has
+    /// effect together with `--virtualize-program`. Default OFF.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub virtualize_desugar_regex: bool,
+
     /// Global-reference indirection (`off|safe|aggressive`).
     #[arg(long, value_enum)]
     pub global_indirect: Option<GlobalIndirect>,

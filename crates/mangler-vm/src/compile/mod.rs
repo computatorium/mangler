@@ -47,8 +47,27 @@ use crate::cells;
 use crate::chunk::{ChildChunk, Compiled, Const};
 use crate::isa::Instr;
 
+/// Compile-time options that steer the Phase-3 native-closure escape hatch (§4).
+/// Threaded from the virtualize pass (which owns the `--virtualize-exclude` glob)
+/// down into [`emit_nested_closure`], where the divert decision is made. The
+/// default (`exclude: None`, `divert_ineligible: false`) is byte-for-byte the
+/// pre-Phase-3 behavior: a nested fn always becomes a child chunk and an
+/// ineligible one bails the parent.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CompileOptions<'a> {
+    /// Name-glob of nested functions to KEEP NATIVE (run as a native closure
+    /// inside the VM frame). `None` = match nothing.
+    pub exclude: Option<&'a str>,
+    /// When true, a nested function that is async/generator/`"use strict"`/
+    /// structurally-ineligible/otherwise un-virtualizable is diverted to a native
+    /// closure instead of bailing the whole parent (coverage maximization, §4.1).
+    /// When false (the default), such a nested fn bails the parent as before.
+    pub divert_ineligible: bool,
+}
+
 pub(crate) mod destructure;
 pub(crate) mod expr;
+pub(crate) mod native;
 pub(crate) mod stmt;
 
 // Re-export the construct-family emit entry points used across submodules and by
@@ -152,6 +171,14 @@ pub(crate) struct Cx<'a> {
     /// statement arm when the labeled body is a loop, and consumed via `take()`
     /// when that loop pushes its frame; `None` otherwise.
     pub(crate) pending_label: Option<String>,
+    /// Phase 3 (§4.3): the binding name inferred for the next function/arrow
+    /// EXPRESSION emitted in a value position (`const render = () => …`,
+    /// `obj.render = function(){}`, `{ render: () => … }`). Set by the emit site
+    /// that holds the binding context just before `emit_expr` on the initializer/
+    /// RHS/value, and consumed (taken) by the `Expr::Fn`/`Expr::Arrow` arms of
+    /// `emit_expr` so the divert can match the exclude glob on it. A function's own
+    /// `ident` (`function render(){}`) takes precedence and does not use this.
+    pub(crate) pending_fn_name: Option<String>,
     pub(crate) bail_reason: Option<&'static str>,
     /// D5: nested-function chunks compiled while emitting this body, in
     /// `MakeClosure` `child` index order. A nested `function`/`arrow` is compiled
@@ -162,6 +189,29 @@ pub(crate) struct Cx<'a> {
     /// `LoadCell`/`StoreCell`). `None` when compiling standalone (tests / the
     /// no-nesting path) — nested fns then compile with an empty boxed set.
     pub(crate) box_plan: Option<&'a cells::BoxPlan>,
+    /// Phase 3 (§4): the native-closure divert options (exclude glob +
+    /// ineligible-divert flag), threaded down so `emit_nested_closure` can decide
+    /// whether a nested function stays native. Inherited unchanged by every child
+    /// chunk compiled while emitting this body.
+    pub(crate) opts: CompileOptions<'a>,
+    /// Phase 3 capture-liveness guard: the names guaranteed already-initialized when
+    /// the fn-decl hoist prologue runs (params + destructuring-param leaves). A
+    /// native closure built during hoisting that captures a NON-celled binding NOT in
+    /// this set would snapshot it BEFORE its body initializer ran (reading
+    /// `undefined`), diverging from JS's live-binding semantics — so it bails (§4.4),
+    /// keeping the enclosing subtree native via §3.3 bisection.
+    pub(crate) param_names: std::collections::HashSet<String>,
+    /// True while emitting the fn-decl hoist prologue (closures built before any body
+    /// statement / `var`/`let`/`const` initializer). Drives the capture-liveness bail.
+    pub(crate) in_fndecl_hoist: bool,
+}
+
+/// Phase 3: glob match for the `--virtualize-exclude` name test. An invalid glob
+/// matches nothing (mirrors `cells::glob_matches`).
+pub(crate) fn glob_matches(glob: &str, name: &str) -> bool {
+    glob::Pattern::new(glob)
+        .map(|p| p.matches(name))
+        .unwrap_or(false)
 }
 
 impl<'a> Cx<'a> {
@@ -949,6 +999,25 @@ pub fn compile_body(params: &[Param], body: &BlockStmt) -> Result<Compiled, &'st
     compile_body_boxed(params, body, &std::collections::HashSet::new())
 }
 
+/// Phase 3 entry point: compile `body` with native-closure divert [`CompileOptions`]
+/// (the `--virtualize-exclude` glob and the ineligible-divert flag). Otherwise
+/// identical to [`compile_body`] (empty boxed set, no `BoxPlan`); the options are
+/// inherited by every nested child chunk so a deeply-nested excluded/ineligible fn
+/// is diverted too.
+pub fn compile_body_with_opts(
+    params: &[Param],
+    body: &BlockStmt,
+    opts: CompileOptions<'_>,
+) -> Result<Compiled, &'static str> {
+    compile_body_inner_opts(
+        params,
+        body,
+        &std::collections::HashSet::new(),
+        None,
+        opts,
+    )
+}
+
 /// Compile `body`, treating every free name in `boxed` as a BOXED mutable capture
 /// (D1): its slot holds a one-element cell `[v]` shared by reference with the
 /// enclosing scope, so reads compile to `LoadCell` and writes to `StoreCell` and a
@@ -987,6 +1056,16 @@ pub(crate) fn compile_body_inner(
     boxed: &std::collections::HashSet<String>,
     plan: Option<&cells::BoxPlan>,
 ) -> Result<Compiled, &'static str> {
+    compile_body_inner_opts(params, body, boxed, plan, CompileOptions::default())
+}
+
+pub(crate) fn compile_body_inner_opts<'a>(
+    params: &[Param],
+    body: &BlockStmt,
+    boxed: &std::collections::HashSet<String>,
+    plan: Option<&'a cells::BoxPlan>,
+    opts: CompileOptions<'a>,
+) -> Result<Compiled, &'static str> {
     let mut cx = Cx {
         code: Vec::new(),
         consts: Vec::new(),
@@ -1010,9 +1089,13 @@ pub(crate) fn compile_body_inner(
         frames: Vec::new(),
         handler_depth: 0,
         pending_label: None,
+        pending_fn_name: None,
         bail_reason: None,
         children: Vec::new(),
         box_plan: plan,
+        opts,
+        param_names: std::collections::HashSet::new(),
+        in_fndecl_hoist: false,
     };
 
     // 1. Params first. Record default-value params so their init prologue can
@@ -1113,6 +1196,12 @@ pub(crate) fn compile_body_inner(
     if let Some(r) = cx.bail_reason {
         return Err(r);
     }
+    // Phase 3 capture-liveness: the names already bound (params + destructuring-param
+    // leaves) are exactly those guaranteed initialized before the fn-decl hoist
+    // prologue runs. Body `var`/`let`/`const`/fn-decl names are added later, so they
+    // are NOT in this set and a hoisted native closure capturing one (non-celled)
+    // bails (§4.4).
+    cx.param_names = cx.scopes[0].keys().cloned().collect();
 
     // 2. Body-declared locals (and, in the same walk, the count_temps pre-pass).
     //    The reserved temp pool must cover both the body's needs and the (separate,
@@ -1338,7 +1427,10 @@ pub(crate) fn compile_body_inner(
     }
 
     // Hoisted fn-decl closures: build each closure and store it into its slot before
-    // the body runs (function declarations are fully hoisted in JS).
+    // the body runs (function declarations are fully hoisted in JS). Phase 3: mark
+    // that we are in the hoist prologue so a native-closure divert can guard against
+    // snapshotting a not-yet-initialized body local.
+    cx.in_fndecl_hoist = true;
     for (slot, fd) in &fn_decl_slots {
         let Some(fbody) = &fd.function.body else {
             return Err("fn_decl_no_body");
@@ -1367,6 +1459,7 @@ pub(crate) fn compile_body_inner(
             return Err(r);
         }
     }
+    cx.in_fndecl_hoist = false;
 
     for stmt in &body.stmts {
         emit_stmt(&mut cx, stmt);

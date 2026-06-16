@@ -99,6 +99,25 @@ impl ResolvedConfig {
         if let Some(g) = flags.virtualize {
             passes.virtualize.target = Some(g);
         }
+        if flags.virtualize_program {
+            passes.virtualize.whole_program = true;
+        }
+        if let Some(e) = flags.virtualize_exclude {
+            passes.virtualize.exclude = Some(e);
+        }
+        if flags.virtualize_desugar_class {
+            passes.virtualize.desugar_class = true;
+        }
+        if flags.virtualize_desugar_regex {
+            passes.virtualize.desugar_regex = true;
+        }
+        // §1 matrix: whole-program wins; `target` is meaningless alongside it. We do
+        // not reject the combo (it is harmless — the pass ignores `target` when
+        // `whole_program` is set), we just clear it so the resolved config records the
+        // effective behavior unambiguously.
+        if passes.virtualize.whole_program {
+            passes.virtualize.target = None;
+        }
 
         // -- runtime-bound decode key (mutually-exclusive forms) --
         passes.strings.dynamic_key = resolve_dynamic_key(
@@ -262,6 +281,18 @@ mod tests {
         let r = ResolvedConfig::from_flags_with_seed(f, 0).unwrap();
         assert_eq!(r.engine.keep_names, vec!["myExport", "init*"]);
         assert_eq!(r.passes.mangle.keep_names, vec!["myExport", "init*"]);
+    }
+
+    #[test]
+    fn whole_program_sets_flag_and_clears_target() {
+        // `virtualize_program` true clears any `target` (whole-program wins, §1).
+        let r = resolve("virtualize = \"hot*\"\nvirtualize_program = true").unwrap();
+        assert!(r.passes.virtualize.whole_program);
+        assert!(r.passes.virtualize.target.is_none(), "target ignored under whole_program");
+        // Plain `target` (no whole_program) is unchanged.
+        let r2 = resolve("virtualize = \"hot*\"").unwrap();
+        assert!(!r2.passes.virtualize.whole_program);
+        assert_eq!(r2.passes.virtualize.target.as_deref(), Some("hot*"));
     }
 
     // ---- Constraint (1): --strings-in-vm requires string obfuscation ----

@@ -45,7 +45,12 @@ pub(crate) fn emit_stmt(cx: &mut Cx<'_>, stmt: &Stmt) {
                             // capture; a plain local uses `StoreLocal`.
                             let celled = cx.is_boxed_local(name);
                             let slot = cx.resolve(name);
+                            // §4.3: infer the binding name for an anon fn/arrow init
+                            // (`const render = () => …`) so the native-closure divert
+                            // can match the exclude glob.
+                            cx.pending_fn_name = Some(name.to_string());
                             emit_expr(cx, init);
+                            cx.pending_fn_name = None;
                             cx.emit(if celled {
                                 Instr::StoreCell(slot)
                             } else {
@@ -1065,6 +1070,21 @@ pub(crate) fn compute_boxed_locals(params: &[Param], body: &BlockStmt) -> std::c
         .collect()
 }
 
+/// Add every name `body` binds locally (`var`/fn-decl/`let`/`const`/`catch`/
+/// destructuring leaves, NOT descending into nested fns) into `out`. Phase 3 uses
+/// this to know which names the native fn binds itself (so a same-named enclosing
+/// upvalue is shadowed, not rewritten).
+pub(crate) fn collect_body_local_decls(
+    body: &BlockStmt,
+    out: &mut std::collections::HashSet<String>,
+) {
+    let mut d = BodyLocalDecls {
+        names: std::mem::take(out),
+    };
+    body.visit_with(&mut d);
+    *out = d.names;
+}
+
 /// Collects every name a function body binds locally (params seeded by the caller):
 /// `var`, fn-decl, `let`/`const`, `catch` params, destructuring leaves — at any
 /// nesting WITHIN this function (NOT descending into nested functions, whose bindings
@@ -1261,6 +1281,42 @@ pub(crate) fn emit_nested_closure(
     is_generator: bool,
     self_name: Option<&str>,
 ) {
+    // §4.3: the binding name to test against the exclude glob — the function's own
+    // ident (`function render`) wins, else the binding context the emit site stashed
+    // in `pending_fn_name` (`const render = …` / `obj.render = …` / `{render: …}`).
+    // Consume the pending name regardless so it never leaks to a sibling expression.
+    let pending = cx.pending_fn_name.take();
+    let inferred_name = self_name.map(|s| s.to_string()).or(pending);
+
+    // §4.1 divert decision. A nested function is diverted to a NATIVE closure when:
+    //   (a) its inferred name matches `--virtualize-exclude`; or
+    //   (b) `divert_ineligible` is set AND the fn cannot be virtualized (async /
+    //       generator / own `"use strict"` / structurally ineligible / would hit a
+    //       compile bail). Otherwise the existing child-chunk path runs.
+    let name_excluded = match (&cx.opts.exclude, &inferred_name) {
+        (Some(glob), Some(n)) => super::glob_matches(glob, n),
+        _ => false,
+    };
+    let structurally_ineligible = is_async
+        || is_generator
+        || has_use_strict_directive_block(body)
+        || (is_arrow && uses_arguments(body))
+        || matches!(
+            crate::eligibility::classify_body(
+                &params
+                    .iter()
+                    .map(|p| Param { span: swc_core::common::DUMMY_SP, decorators: vec![], pat: p.clone() })
+                    .collect::<Vec<_>>(),
+                body,
+            ),
+            crate::eligibility::Eligibility::Skip(_)
+        );
+
+    if name_excluded || (cx.opts.divert_ineligible && structurally_ineligible) {
+        emit_native_closure(cx, params, body, is_arrow, is_async, is_generator, self_name);
+        return;
+    }
+
     if is_async || is_generator {
         cx.bail_with("nested_async_generator");
         return;
@@ -1322,15 +1378,25 @@ pub(crate) fn emit_nested_closure(
         child_boxed.extend(p.boxed_for(body.span.lo));
     }
 
-    // Recursively compile the child chunk WITH the same plan so grandchildren box
-    // correctly too. A bail propagates to the parent.
-    let compiled = match compile_body_inner(&wrapped, body, &child_boxed, cx.box_plan) {
-        Ok(c) => c,
-        Err(r) => {
-            cx.bail_with(r);
-            return;
-        }
-    };
+    // Recursively compile the child chunk WITH the same plan AND options so
+    // grandchildren box + divert correctly too. On an `Err`: if the divert-ineligible
+    // option is set, this nested fn hit a compile bail the classifier didn't catch
+    // (§4.1) — divert it to a native closure instead of bailing the whole parent.
+    // Otherwise the bail propagates (pre-Phase-3 behavior).
+    let compiled =
+        match compile_body_inner_opts(&wrapped, body, &child_boxed, cx.box_plan, cx.opts) {
+            Ok(c) => c,
+            Err(r) => {
+                if cx.opts.divert_ineligible {
+                    emit_native_closure(
+                        cx, params, body, is_arrow, is_async, is_generator, self_name,
+                    );
+                } else {
+                    cx.bail_with(r);
+                }
+                return;
+            }
+        };
 
     // The child's capture order (from its own compile) is authoritative; recompute
     // the same first-encounter free-name order to map each capture to a parent slot.
@@ -1361,6 +1427,170 @@ pub(crate) fn emit_nested_closure(
         pcount,
         up_slots,
     });
+}
+
+/// §4: emit a NATIVE closure for an excluded / ineligible nested function. The
+/// original function/arrow is stored as a factory function-expression const
+/// (`crate::compile::native`); the threaded upvalues are the enclosing-VM-frame
+/// bindings it references (params/locals/cells/upvalues), plus the enclosing `this`
+/// for an arrow. Module globals it references are left untouched (resolved at module
+/// scope). `MakeNativeClosure` builds the closure at runtime by calling the factory
+/// with the up-slot values.
+///
+/// §4.4 soundness guards (bail to keep the enclosing subtree native via §3.3
+/// bisection rather than risk a wrong capture):
+///   * the native fn captures the enclosing frame's `arguments`;
+///   * it WRITES a free enclosing binding that is NOT a cell (the write could not
+///     propagate back to the VM frame).
+pub(crate) fn emit_native_closure(
+    cx: &mut Cx<'_>,
+    params: &[Pat],
+    body: &BlockStmt,
+    is_arrow: bool,
+    is_async: bool,
+    is_generator: bool,
+    self_name: Option<&str>,
+) {
+    use crate::compile::native::{build_factory_src, Upvalue};
+
+    // Free names of the native fn (its own params/locals/self-name excluded), in
+    // deterministic first-encounter order. A regular function has its OWN
+    // `arguments`, so it is local there; an arrow has no `arguments`, so a reference
+    // is a (lexical) capture that the §4.4 guard rejects below.
+    let mut free = ordered_nested_free_names(params, body, self_name);
+    if !is_arrow {
+        free.retain(|n| n != "arguments");
+    }
+    // Names the native fn WRITES (assign/++/--/compound/for-head/destructure),
+    // anywhere incl. its own nested fns — used by the §4.4 mutable-capture guard.
+    let writes = collect_all_writes(body);
+
+    let mut upvalues: Vec<Upvalue> = Vec::new();
+    let mut up_slots: Vec<u32> = Vec::new();
+
+    for name in &free {
+        // §4.4: capturing the enclosing frame's implicit `arguments` cannot be
+        // exposed as a slot — bail (the run bisects, this subtree stays native).
+        if name == "arguments" && !cx.is_param_or_local("arguments") {
+            cx.bail_with("native_closure_captures_arguments");
+            return;
+        }
+        // A name bound in an enclosing VM frame (param / local / cell / already-held
+        // upvalue) is threaded as an upvalue; a name bound NOWHERE in the frame is a
+        // module global, left untouched (no threading, no obfuscation lost).
+        let Some(slot) = cx.lookup(name) else {
+            continue; // module global
+        };
+        let celled = cx.is_celled(name);
+        // §4.4 capture-liveness: a HOISTED fn-decl native closure is built before the
+        // body runs. If it snapshots a NON-celled body local (not a param/destructure
+        // leaf) by value, it would read the binding's pre-initializer value
+        // (`undefined`) instead of JS's live binding — a miscompile. Bail to keep the
+        // enclosing subtree native via §3.3 bisection. (A celled binding is shared
+        // live, and a param is already initialized, so both are safe.)
+        if cx.in_fndecl_hoist && !celled && !cx.param_names.contains(name) {
+            cx.bail_with("native_closure_hoist_capture_liveness");
+            return;
+        }
+        // §4.4: a write to a non-celled enclosing binding cannot propagate back to
+        // the VM frame's slot (the factory gets the value by-copy). `compute_boxed_
+        // locals` already cells any captured-and-mutated function-frame local, so a
+        // remaining un-celled written capture (e.g. a deeper block `let`, or a
+        // global) is unsound — bail to native subtree.
+        if writes.contains(name) && !celled {
+            cx.bail_with("native_closure_mutates_uncelled");
+            return;
+        }
+        upvalues.push(Upvalue { name: Some(name.clone()), celled, is_this: false });
+        up_slots.push(slot);
+    }
+
+    // An arrow's lexical `this` is threaded as a trailing synthetic upvalue (the
+    // RECEIVER sentinel), and the factory closes over it. A regular function gets
+    // its own `this` at call time, so no `this` upvalue.
+    if is_arrow {
+        upvalues.push(Upvalue { name: None, celled: false, is_this: true });
+        up_slots.push(crate::isa::RECEIVER_UPVALUE);
+    }
+
+    let Some(src) = build_factory_src(
+        params, body, is_arrow, is_async, is_generator, self_name, &upvalues,
+    ) else {
+        // Codegen / reparse failure (never expected) — bail to native subtree.
+        cx.bail_with("native_closure_codegen");
+        return;
+    };
+
+    let const_idx = cx.consts.len() as u32;
+    if cx.consts.len() >= u32::MAX as usize {
+        cx.bail_with("too_large");
+        return;
+    }
+    cx.consts.push(crate::chunk::Const::NativeFactory(src));
+    cx.emit(Instr::MakeNativeClosure {
+        const_idx,
+        is_arrow,
+        up_slots,
+    });
+}
+
+/// Free names a nested fn references (its own params/locals/self-name excluded), in
+/// deterministic first-encounter (source) order. Mirrors `nested_free_names` (which
+/// returns an unordered set) but preserves order so the threaded-upvalue list — and
+/// thus the serialized bytecode + factory params — is byte-stable for a given seed.
+fn ordered_nested_free_names(
+    params: &[Pat],
+    body: &BlockStmt,
+    self_name: Option<&str>,
+) -> Vec<String> {
+    let mut local = std::collections::HashSet::new();
+    for p in params {
+        binding_names(p, &mut |id| {
+            local.insert(id.sym.to_string());
+        });
+    }
+    if let Some(n) = self_name {
+        local.insert(n.to_string());
+    }
+    let mut d = BodyLocalDecls { names: local };
+    body.visit_with(&mut d);
+    let mut order: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut s = OrderedFreeScan {
+        local: d.names,
+        order: &mut order,
+        seen: &mut seen,
+    };
+    body.visit_with(&mut s);
+    order
+}
+
+struct OrderedFreeScan<'a> {
+    local: std::collections::HashSet<String>,
+    order: &'a mut Vec<String>,
+    seen: &'a mut std::collections::HashSet<String>,
+}
+impl Visit for OrderedFreeScan<'_> {
+    fn visit_ident(&mut self, id: &Ident) {
+        let n = id.sym.as_ref();
+        if !self.local.contains(n)
+            && n != "undefined"
+            && self.seen.insert(n.to_string())
+        {
+            self.order.push(n.to_string());
+        }
+    }
+    fn visit_member_expr(&mut self, m: &MemberExpr) {
+        m.obj.visit_with(self);
+        if let MemberProp::Computed(c) = &m.prop {
+            c.visit_with(self);
+        }
+    }
+    fn visit_prop_name(&mut self, p: &PropName) {
+        if let PropName::Computed(c) = p {
+            c.visit_with(self);
+        }
+    }
 }
 
 /// True if a block body begins with its own `"use strict"` directive. Mirrors

@@ -362,6 +362,147 @@ pub fn build_sink_program(body: &str) -> String {
     )
 }
 
+/// As [`build_sink_program`] but the generated `function f` opens with a leading
+/// `"use strict"` directive, so the differential fuzzer can exercise the §5a strict
+/// virtualization path (strict thunk + strict interpreter variant) over the full
+/// generated construct space. The numeric-return bodies the [`Gen`] emits are valid
+/// strict code, so the original and a strict-virtualized transform must agree.
+pub fn build_strict_sink_program(body: &str) -> String {
+    format!(
+        "(function(){{\n\
+         function f(a, b, c) {{\n\"use strict\";\n{body}}}\n\
+         var __o = '';\n\
+         __o += String(f(1, 2, 3));\n\
+         __o += '|' + String(f(0, -1, 7));\n\
+         __o += '|' + String(f(5, 5, 5));\n\
+         __o += '|' + String(f(-3, 4, -2));\n\
+         __o += '|' + String(f(11, 0, -8));\n\
+         globalThis.__out = String(__o);\n\
+         }})();\n"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Phase-4 desugar fuzzing: class / regex program generators (§9.1)
+// ---------------------------------------------------------------------------
+
+/// Deterministically generate a complete program that exercises a randomly-shaped
+/// *class* hierarchy (the input to the Phase-4 class→function desugaring). The program
+/// is wrapped in an IIFE (so whole-program virtualization pulls it into a chunk) and
+/// stores a result string in `globalThis.__out`. Every generated class stays within the
+/// VM-eligible + desugarable surface (plain methods, instance/static fields, single
+/// `extends` + `super(...)`, no private/#/static-block/computed/accessor/`instanceof`),
+/// so original-vs-desugared parity is the only thing under test.
+pub fn build_class_program(seed: u64) -> String {
+    let mut rng = Rng::new(seed ^ 0xC1A5_5C1A_55C1_A55C);
+    // Base class `A` with a field, a method, and optionally a static.
+    let a_field0 = rng.below(100) as i64 - 30;
+    let a_field1 = rng.below(100) as i64 - 30;
+    let has_static_method = rng.chance(1, 2);
+    let has_static_field = rng.chance(1, 2);
+    let dog_field = rng.below(100) as i64;
+    let mut p = String::new();
+    p.push_str("(function(){\n");
+    // Base class.
+    p.push_str(&format!(
+        "class A {{ constructor(x) {{ this.x = x; this.y = {a_field1}; }} \
+          sum() {{ return this.x + this.y; }} \
+          bump(d) {{ this.x += d; return this.x; }} ",
+    ));
+    if has_static_method {
+        p.push_str("static make(v) { return new A(v); } ");
+    }
+    if has_static_field {
+        p.push_str("static tag = 'A'; ");
+    }
+    p.push_str("}\n");
+    // Derived class with super() and its own field + method. Half the time the super
+    // call is a single top-level statement (lowerable); the other half it is a
+    // CONDITIONAL super (`if(c) super(x) else super(y)`) — which must NOT be lowered
+    // (the skip predicate keeps it native) yet must still behave identically. Crossing
+    // both shapes against the desugar flag exercises the skip path under fuzzing.
+    let conditional_super = rng.chance(1, 2);
+    if conditional_super {
+        p.push_str(&format!(
+            "class B extends A {{ constructor(x) {{ if (x > 0) super(x); else super(0 - x); this.z = {dog_field}; }} \
+              total() {{ return this.sum() + this.z; }} \
+              label() {{ return 'B' + this.x; }} }}\n",
+        ));
+    } else {
+        p.push_str(&format!(
+            "class B extends A {{ constructor(x) {{ super(x); this.z = {dog_field}; }} \
+              total() {{ return this.sum() + this.z; }} \
+              label() {{ return 'B' + this.x; }} }}\n",
+        ));
+    }
+    // A field-only base (instance field init order).
+    p.push_str(&format!(
+        "class C {{ a = {a_field0}; b = this.a + 1; m() {{ return this.a + this.b; }} }}\n",
+    ));
+    // Drive them.
+    p.push_str(&format!(
+        "var a = new A({});\n", rng.below(50) as i64 - 10
+    ));
+    p.push_str(&format!(
+        "var b = new B({});\n", rng.below(50) as i64 - 10
+    ));
+    p.push_str("var c = new C();\n");
+    p.push_str("var o = '';\n");
+    p.push_str("o += String(a.sum());\n");
+    p.push_str("o += '|' + String(a.bump(3));\n");
+    p.push_str("o += '|' + String(b.total());\n");
+    p.push_str("o += '|' + b.label();\n");
+    p.push_str("o += '|' + String(c.m());\n");
+    p.push_str("o += '|' + Object.keys(b).join(',');\n");
+    p.push_str("o += '|' + String(Object.getPrototypeOf(b) === B.prototype);\n");
+    p.push_str("o += '|' + String(Object.getOwnPropertyDescriptor(A.prototype, 'sum').enumerable);\n");
+    if has_static_method {
+        p.push_str("o += '|' + String(A.make(7).sum());\n");
+    }
+    if has_static_field {
+        p.push_str("o += '|' + A.tag;\n");
+    }
+    p.push_str("globalThis.__out = o;\n");
+    p.push_str("})();\n");
+    p
+}
+
+/// Deterministically generate a program exercising regex literals (`/re/flags`) used
+/// with `.test`/`.exec` (lastIndex statefulness on `g`) and `String.prototype.replace`.
+/// The input to the Phase-4 regex→RegExp desugaring; original-vs-desugared parity is
+/// what is under test.
+pub fn build_regex_program(seed: u64) -> String {
+    let mut rng = Rng::new(seed ^ 0x5EED_4EE9_4EE9_4EE9);
+    let global = rng.chance(1, 2);
+    let icase = rng.chance(1, 3);
+    let flags = match (global, icase) {
+        (true, true) => "gi",
+        (true, false) => "g",
+        (false, true) => "i",
+        (false, false) => "",
+    };
+    let n = 2 + rng.below(3);
+    let mut tokens = Vec::new();
+    for i in 0..n {
+        tokens.push(format!("a{}", rng.below(9)));
+        let _ = i;
+    }
+    let hay = tokens.join(" ");
+    format!(
+        "(function(){{\n\
+         var re = /a(\\d)/{flags};\n\
+         var s = '{hay}';\n\
+         var acc = '';\n\
+         var m;\n\
+         if (re.global) {{ while ((m = re.exec(s)) !== null) {{ acc += m[1]; if (acc.length > 50) break; }} }}\n\
+         else {{ m = re.exec(s); acc = m ? m[1] : 'none'; }}\n\
+         var rep = s.replace(/a/{flags}, 'X');\n\
+         var t = String(/a\\d/.test(s));\n\
+         globalThis.__out = acc + '|' + rep + '|' + t + '|' + String(re.lastIndex);\n\
+         }})();\n"
+    )
+}
+
 /// Differentially check one complete program: run it (original) and `transform(it)`
 /// (transformed), comparing under the sink capture mode. Returns the [`DiffResult`].
 pub fn check_program<F>(program: &str, transform: &mut F) -> DiffResult
@@ -403,6 +544,44 @@ where
     if let Some((seed, program, diff)) = failures.first() {
         panic!(
             "VM fuzz divergence (seed {seed}): {}\n  original:    {}\n  transformed: {}\n--- program ---\n{program}",
+            diff.reason, diff.original, diff.transformed
+        );
+    }
+}
+
+/// §5a strict variant of [`fuzz_transform`]: each generated `function f` opens with
+/// `"use strict"` (via [`build_strict_sink_program`]), so `transform` exercises the
+/// strict thunk + strict interpreter route over the whole construct space.
+pub fn fuzz_transform_strict<F>(
+    n: u64,
+    base_seed: u64,
+    mut transform: F,
+) -> Vec<(u64, String, DiffResult)>
+where
+    F: FnMut(&str) -> String,
+{
+    let mut failures = Vec::new();
+    for i in 0..n {
+        let gen_seed = base_seed.wrapping_add(i.wrapping_mul(0x0100_0001));
+        let body = Gen::new(gen_seed).function();
+        let program = build_strict_sink_program(&body);
+        let diff = check_program(&program, &mut transform);
+        if diff.is_divergent() {
+            failures.push((gen_seed, program, diff));
+        }
+    }
+    failures
+}
+
+/// Panicking wrapper over [`fuzz_transform_strict`].
+pub fn assert_fuzz_transform_strict<F>(n: u64, base_seed: u64, transform: F)
+where
+    F: FnMut(&str) -> String,
+{
+    let failures = fuzz_transform_strict(n, base_seed, transform);
+    if let Some((seed, program, diff)) = failures.first() {
+        panic!(
+            "strict VM fuzz divergence (seed {seed}): {}\n  original:    {}\n  transformed: {}\n--- program ---\n{program}",
             diff.reason, diff.original, diff.transformed
         );
     }

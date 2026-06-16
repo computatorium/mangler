@@ -1,6 +1,6 @@
 [package]
 name = "mangler-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Dependency-free foundation for mangler: per-pass RNG, name allocation, hashing, errors, diagnostics, and the Language trait."
 

@@ -119,6 +119,8 @@ fn virtualize(src: &str, seed: u64) -> Option<String> {
     let names = VmNames {
         lean_interp: "Vv".into(),
         eh_interp: "Dd".into(),
+        lean_interp_strict: "Vs".into(),
+        eh_interp_strict: "Ds".into(),
         table: "Tt".into(),
         rc: "rcc".into(),
         sy: "syy".into(),
@@ -275,6 +277,16 @@ fn deterministic_same_seed_same_bytes() {
 /// is never a miscompile — the function simply stays un-virtualized). This mirrors
 /// what the real virtualize pass does in-place.
 fn fuzz_virtualize(program: &str, seed: u64) -> String {
+    fuzz_virtualize_mode(program, seed, false)
+}
+
+/// As [`fuzz_virtualize`] but registers `f` STRICT and emits a strict thunk — the
+/// §5a route exercised by the strict fuzz net.
+fn fuzz_virtualize_strict(program: &str, seed: u64) -> String {
+    fuzz_virtualize_mode(program, seed, true)
+}
+
+fn fuzz_virtualize_mode(program: &str, seed: u64, strict: bool) -> String {
     use mangler_core::Language;
     use mangler_jsast::lang::{Js, ParseOpts};
     use swc_core::ecma::visit::{VisitMut, VisitMutWith};
@@ -288,6 +300,7 @@ fn fuzz_virtualize(program: &str, seed: u64) -> String {
     // the body with a thunk. We collect the prologue out of the visitor.
     struct V {
         seed: u64,
+        strict: bool,
         prologue: Option<Vec<Stmt>>,
     }
     impl VisitMut for V {
@@ -301,19 +314,22 @@ fn fuzz_virtualize(program: &str, seed: u64) -> String {
 
             let div = VmDiversity::draw(&mut Rng::for_pass(self.seed, "vm"));
             let mut tb = TableBuilder::with_diversity(div);
-            let chunk = tb.add(compiled);
+            let chunk = tb.add_strict(compiled, self.strict);
             let names = VmNames {
                 lean_interp: "Vv".into(),
                 eh_interp: "Dd".into(),
+                lean_interp_strict: "Vs".into(),
+                eh_interp_strict: "Ds".into(),
                 table: "Tt".into(),
                 rc: "rcc".into(),
                 sy: "syy".into(),
             };
             let vt = tb.finish(&names).expect("finish");
-            let interp = if chunk.needs_eh { &names.eh_interp } else { &names.lean_interp };
+            let interp = names.interp_for(chunk.needs_eh, chunk.is_strict);
             let caps = format!("[{}]", chunk.captures.join(","));
+            let directive = if self.strict { "\"use strict\";" } else { "" };
             let thunk_src = format!(
-                "return {interp}({}[{}][0],{}[{}][1],arguments,{caps},{},{},this);",
+                "{directive}return {interp}({}[{}][0],{}[{}][1],arguments,{caps},{},{},this);",
                 names.table, chunk.index, names.table, chunk.index, chunk.cap_start, chunk.pcount,
             );
             // Parse the thunk body and install it.
@@ -331,7 +347,7 @@ fn fuzz_virtualize(program: &str, seed: u64) -> String {
         fn visit_mut_arrow_expr(&mut self, _: &mut ArrowExpr) {}
     }
 
-    let mut v = V { seed, prologue: None };
+    let mut v = V { seed, strict, prologue: None };
     ast.program_mut().visit_mut_with(&mut v);
     let Some(prologue) = v.prologue else {
         return program.to_string(); // f not found or bailed
@@ -367,6 +383,356 @@ fn fuzz_across_vm_seeds() {
             fuzz_virtualize(program, vm_seed)
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// §5a strict-mode coverage (Phase 0b).
+// ---------------------------------------------------------------------------
+
+/// Build a program that defines `f` as a VM thunk for an anonymous function-expression
+/// `src`, virtualized under the given strictness. When `is_strict`, the chunk is
+/// registered strict (routing to a strict interpreter variant) and the thunk carries a
+/// leading `"use strict"` so a plain call forwards the un-coerced (`undefined`)
+/// receiver. Returns `None` on a compile bail.
+fn virtualize_with_strict(src: &str, seed: u64, is_strict: bool) -> Option<String> {
+    let (params, body) = parse_fn(src);
+    let compiled = mangler_vm::compile_body(&params, &body).ok()?;
+
+    let div = VmDiversity::draw(&mut Rng::for_pass(seed, "vm"));
+    let mut tb = TableBuilder::with_diversity(div);
+    let chunk = tb.add_strict(compiled, is_strict);
+
+    let names = VmNames {
+        lean_interp: "Vv".into(),
+        eh_interp: "Dd".into(),
+        lean_interp_strict: "Vs".into(),
+        eh_interp_strict: "Ds".into(),
+        table: "Tt".into(),
+        rc: "rcc".into(),
+        sy: "syy".into(),
+    };
+    let vt = tb.finish(&names).expect("finish");
+    let interp = names.interp_for(chunk.needs_eh, chunk.is_strict);
+    let caps = format!("[{}]", chunk.captures.join(","));
+    let param_src: Vec<String> = (0..chunk.pcount).map(|i| format!("p{i}")).collect();
+    let directive = if is_strict { "\"use strict\";" } else { "" };
+    let thunk = format!(
+        "function f({}){{{directive}return {interp}({}[{}][0],{}[{}][1],arguments,{caps},{},{},this);}}",
+        param_src.join(","),
+        names.table,
+        chunk.index,
+        names.table,
+        chunk.index,
+        chunk.cap_start,
+        chunk.pcount,
+    );
+    let prologue = render(vt.prologue);
+    Some(format!("{prologue}\n{thunk}"))
+}
+
+/// §5a case 1: a STRICT virtualized function called plainly (`f()`) must see
+/// `this === undefined`, NOT the sloppy `globalThis`. The strict thunk governs this.
+#[test]
+fn strict_plain_call_this_is_undefined() {
+    let src = "function(){ return typeof this; }";
+    for seed in [1u64, 7, 42] {
+        let v = virtualize_with_strict(src, seed, true).expect("compiles");
+        let prog = format!("{v}\nglobalThis.__out=JSON.stringify(f());");
+        // The strict source, plainly called, yields `this === undefined`.
+        let orig = "var f=(function(){ \"use strict\"; return typeof this; });globalThis.__out=JSON.stringify(f());";
+        assert_behaviorally_equal_with(orig, &prog, &CaptureMode::sink());
+    }
+}
+
+/// §5a case 1 (contrast): a SLOPPY virtualized function called plainly coerces `this`
+/// to the global object — the existing behavior, preserved.
+#[test]
+fn sloppy_plain_call_this_is_global() {
+    let src = "function(){ return this === globalThis; }";
+    for seed in [1u64, 7, 42] {
+        let v = virtualize_with_strict(src, seed, false).expect("compiles");
+        let prog = format!("{v}\nglobalThis.__out=JSON.stringify(f());");
+        let orig = format!("var f=({src});globalThis.__out=JSON.stringify(f());");
+        assert_behaviorally_equal_with(&orig, &prog, &CaptureMode::sink());
+    }
+}
+
+/// §5a case 2: a store to a `writable:false` property THROWS a TypeError under strict,
+/// no-ops under sloppy — governed by the interpreter's strictness. Differential vs the
+/// real strict / sloppy source.
+#[test]
+fn strict_store_to_nonwritable_throws() {
+    // Store to a frozen property.
+    let src = "function(o){ o.x = 9; return o.x; }";
+    let call = "Object.freeze({x:1})";
+    for seed in [1u64, 7, 42] {
+        // STRICT: both the strict source and the strict-virtualized version throw.
+        let v = virtualize_with_strict(src, seed, true).expect("compiles");
+        let prog = format!("{v}\nglobalThis.__out=JSON.stringify((function(){{try{{return f({call});}}catch(e){{return 'THROW:'+e.constructor.name;}}}})());");
+        let orig = format!(
+            "var f=(function(o){{\"use strict\"; o.x = 9; return o.x; }});globalThis.__out=JSON.stringify((function(){{try{{return f({call});}}catch(e){{return 'THROW:'+e.constructor.name;}}}})());"
+        );
+        assert_behaviorally_equal_with(&orig, &prog, &CaptureMode::sink());
+
+        // SLOPPY: both silently no-op (the frozen value is returned, no throw).
+        let v = virtualize_with_strict(src, seed, false).expect("compiles");
+        let prog = format!("{v}\nglobalThis.__out=JSON.stringify((function(){{try{{return f({call});}}catch(e){{return 'THROW:'+e.constructor.name;}}}})());");
+        let orig = format!(
+            "var f=({src});globalThis.__out=JSON.stringify((function(){{try{{return f({call});}}catch(e){{return 'THROW:'+e.constructor.name;}}}})());"
+        );
+        assert_behaviorally_equal_with(&orig, &prog, &CaptureMode::sink());
+    }
+}
+
+/// §5a case 2: a store to a getter-only accessor THROWS under strict, no-ops sloppy.
+#[test]
+fn strict_store_to_getter_only_throws() {
+    let src = "function(o){ o.g = 5; return o.g; }";
+    let call = "Object.defineProperty({}, 'g', {get:function(){return 7;}, configurable:true})";
+    for seed in [1u64, 7, 42] {
+        let v = virtualize_with_strict(src, seed, true).expect("compiles");
+        let prog = format!("{v}\nglobalThis.__out=JSON.stringify((function(){{try{{return f({call});}}catch(e){{return 'THROW:'+e.constructor.name;}}}})());");
+        let orig = format!(
+            "var f=(function(o){{\"use strict\"; o.g = 5; return o.g; }});globalThis.__out=JSON.stringify((function(){{try{{return f({call});}}catch(e){{return 'THROW:'+e.constructor.name;}}}})());"
+        );
+        assert_behaviorally_equal_with(&orig, &prog, &CaptureMode::sink());
+
+        let v = virtualize_with_strict(src, seed, false).expect("compiles");
+        let prog = format!("{v}\nglobalThis.__out=JSON.stringify((function(){{try{{return f({call});}}catch(e){{return 'THROW:'+e.constructor.name;}}}})());");
+        let orig = format!(
+            "var f=({src});globalThis.__out=JSON.stringify((function(){{try{{return f({call});}}catch(e){{return 'THROW:'+e.constructor.name;}}}})());"
+        );
+        assert_behaviorally_equal_with(&orig, &prog, &CaptureMode::sink());
+    }
+}
+
+/// §5a case 3: reading `arguments.callee` is an irreducible divergence → the body must
+/// BAIL eligibility (stay native), so the VM never miscompiles it.
+#[test]
+fn arguments_callee_bails() {
+    for src in [
+        "function(){ return arguments.callee; }",
+        "function(){ return arguments.caller; }",
+        "function(){ return arguments[\"callee\"]; }",
+    ] {
+        let (params, body) = parse_fn(src);
+        assert!(
+            matches!(
+                mangler_vm::classify_body(&params, &body),
+                mangler_vm::Eligibility::Skip("arguments_callee")
+            ),
+            "`{src}` must bail arguments_callee"
+        );
+    }
+    // Plain `arguments` use (no callee/caller) stays eligible.
+    let (params, body) = parse_fn("function(){ return arguments.length; }");
+    assert!(matches!(
+        mangler_vm::classify_body(&params, &body),
+        mangler_vm::Eligibility::Eligible
+    ));
+}
+
+/// Determinism: same seed ⇒ byte-identical strict output (incl. the strict thunk +
+/// strict interpreter variant).
+#[test]
+fn strict_deterministic_same_seed_same_bytes() {
+    let src = "function(o){ o.x = 1; return typeof this; }";
+    let v1 = virtualize_with_strict(src, 99, true).unwrap();
+    let v2 = virtualize_with_strict(src, 99, true).unwrap();
+    assert_eq!(v1, v2, "same seed must produce byte-identical strict VM output");
+}
+
+/// §9.1 strict-divergence fuzz net: the same generated bodies, but each `function f`
+/// is `"use strict"` and virtualized via the strict thunk + strict interpreter route.
+/// Every one must behave identically to its strict native original — proving the
+/// strict variant is never a miscompile across the construct space.
+///
+/// NOTE (§9.1): the generator emits numeric-return arithmetic bodies, so this net
+/// exercises the strict thunk's `this`-forwarding and the strict interpreter's full
+/// opcode coverage, but NOT the store-to-frozen/getter divergence (case 2) — those are
+/// covered by the targeted hand-written probes (`strict_store_to_nonwritable_throws`,
+/// `strict_store_to_getter_only_throws`, `strict_plain_call_this_is_undefined`,
+/// `arguments_callee_bails`). A full generator extension that emits frozen-target
+/// stores and a sloppy-vs-strict cross-product is left as a follow-up (§9.1).
+#[test]
+fn fuzz_strict_bodies_round_trip() {
+    mangler_testkit::fuzz::assert_fuzz_transform_strict(300, 0xF0F0_5678, |program| {
+        fuzz_virtualize_strict(program, 0xABCD)
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: native-closure escape hatch (§4)
+// ---------------------------------------------------------------------------
+
+/// Virtualize an OUTER (anonymous) function `src` with Phase-3 [`CompileOptions`]
+/// (exclude glob + divert-ineligible flag). Returns `(program, rendered_output)`:
+/// `program` defines `f` as the virtualized thunk; `rendered_output` is the full
+/// prologue+table+thunk source (used to assert the excluded fn's native body appears
+/// byte-for-byte). `None` on a compile bail.
+fn virtualize_opts(
+    src: &str,
+    seed: u64,
+    exclude: Option<&str>,
+    divert_ineligible: bool,
+) -> Option<String> {
+    use mangler_vm::CompileOptions;
+    let (params, body) = parse_fn(src);
+    let opts = CompileOptions { exclude, divert_ineligible };
+    let compiled = mangler_vm::compile_body_with_opts(&params, &body, opts).ok()?;
+
+    let div = VmDiversity::draw(&mut Rng::for_pass(seed, "vm"));
+    let mut tb = TableBuilder::with_diversity(div);
+    let chunk = tb.add(compiled);
+
+    let names = VmNames {
+        lean_interp: "Vv".into(),
+        eh_interp: "Dd".into(),
+        lean_interp_strict: "Vs".into(),
+        eh_interp_strict: "Ds".into(),
+        table: "Tt".into(),
+        rc: "rcc".into(),
+        sy: "syy".into(),
+    };
+    let vt = tb.finish(&names).expect("finish");
+    let interp = if chunk.needs_eh { &names.eh_interp } else { &names.lean_interp };
+    let caps = format!("[{}]", chunk.captures.join(","));
+    let param_src: Vec<String> = (0..chunk.pcount).map(|i| format!("p{i}")).collect();
+    let thunk = format!(
+        "function f({}){{return {interp}({}[{}][0],{}[{}][1],arguments,{caps},{},{},this);}}",
+        param_src.join(","),
+        names.table,
+        chunk.index,
+        names.table,
+        chunk.index,
+        chunk.cap_start,
+        chunk.pcount,
+    );
+    let prologue = render(vt.prologue);
+    Some(format!("{prologue}\n{thunk}"))
+}
+
+/// Assert the virtualized program (built via `virtualize_opts`) behaves identically
+/// to the original for the given call args, across seeds.
+fn assert_opts_equiv(src: &str, call_args: &str, exclude: Option<&str>, divert: bool) {
+    let orig = original_program(src, call_args);
+    for seed in [1u64, 7, 42] {
+        let Some(v) = virtualize_opts(src, seed, exclude, divert) else {
+            return; // bailed: never a miscompile
+        };
+        let prog = format!("{v}\nglobalThis.__out=JSON.stringify(f({call_args}));");
+        assert_behaviorally_equal_with(&orig, &prog, &CaptureMode::sink());
+    }
+}
+
+/// An excluded nested `function render` inside a virtualized body stays native: the
+/// rendered output carries its body byte-for-byte (a `function render` literal, not a
+/// thunk/bytecode), AND it behaves identically.
+#[test]
+fn excluded_function_decl_stays_native() {
+    let src = "function(n){ function render(){ return n * 3; } return render() + 1; }";
+    let v = virtualize_opts(src, 7, Some("render"), false).expect("compiles");
+    assert!(
+        v.contains("function render("),
+        "excluded `render` must appear as native source, not bytecode:\n{v}"
+    );
+    assert_opts_equiv(src, "5", Some("render"), false);
+}
+
+/// Binding-name inference (§4.3): `const render = () => …` and `obj.render = …` are
+/// excluded by name and stay native.
+#[test]
+fn excluded_arrow_and_member_binding_stay_native() {
+    // `const render = () => …`
+    let src = "function(n){ const render = () => n * 2; return render() + render(); }";
+    let v = virtualize_opts(src, 7, Some("render"), false).expect("compiles");
+    assert!(v.contains("=>"), "excluded arrow must stay native (arrow source):\n{v}");
+    assert_opts_equiv(src, "4", Some("render"), false);
+
+    // `obj.render = function(){}`
+    let src2 = "function(n){ var obj={}; obj.render = function(){ return n + 7; }; return obj.render(); }";
+    let v2 = virtualize_opts(src2, 7, Some("render"), false).expect("compiles");
+    assert!(v2.contains("function"), "member-assigned excluded fn stays native:\n{v2}");
+    assert_opts_equiv(src2, "10", Some("render"), false);
+}
+
+/// An excluded MUTABLE-CAPTURING nested fn, run as a native closure, shares the
+/// enclosing local through a cell: the written value is observed after the calls.
+#[test]
+fn excluded_mutable_capture_native_closure() {
+    // `tick` captures-and-mutates `count`; excluded → native closure over the cell.
+    let src = "function(){ var count=0; function tick(){ count = count + 1; return count; } \
+               tick(); tick(); return tick() + count; }";
+    let v = virtualize_opts(src, 7, Some("tick"), false).expect("compiles");
+    assert!(v.contains("function tick("), "excluded `tick` stays native:\n{v}");
+    // 1,2,3 → returns 3 + count(=3) = 6.
+    assert_opts_equiv(src, "", Some("tick"), false);
+}
+
+/// An excluded ARROW with lexical `this`, run as a native closure: the enclosing
+/// `this` is threaded as an upvalue and the factory closes over it, so `this` is
+/// preserved (an arrow ignores the call-time receiver).
+#[test]
+fn excluded_arrow_lexical_this_native_closure() {
+    // The outer fn is called with a receiver; the excluded arrow reads `this.v`.
+    let src = "function(){ const get = () => this.v * 2; return get(); }";
+    let v = virtualize_opts(src, 7, Some("get"), false).expect("compiles");
+    assert!(v.contains("=>"), "excluded arrow stays native:\n{v}");
+    // Call with `f.call({v:21})` → 42, for both original and virtualized.
+    let orig = format!("var f=({src});globalThis.__out=JSON.stringify(f.call({{v:21}}));");
+    let prog = format!("{v}\nglobalThis.__out=JSON.stringify(f.call({{v:21}}));");
+    assert_behaviorally_equal_with(&orig, &prog, &CaptureMode::sink());
+}
+
+/// Coverage (§4.1): async / generator / `with` / `"use strict"` nested functions
+/// divert to native closures under `divert_ineligible`, and the whole program still
+/// runs identically (instead of failing the parent compile).
+#[test]
+fn ineligible_nested_diverts_to_native() {
+    // generator
+    let g = "function(){ function* gen(){ yield 1; yield 2; } var it=gen(); return it.next().value + it.next().value; }";
+    let v = virtualize_opts(g, 7, None, true).expect("compiles with divert");
+    assert!(v.contains("function*"), "generator stays native:\n{v}");
+    assert_opts_equiv(g, "", None, true);
+
+    // async (observed via a sync wrapper that checks the returned value is a Promise)
+    let a = "function(){ async function af(){ return 5; } return typeof af().then; }";
+    let v2 = virtualize_opts(a, 7, None, true).expect("compiles with divert");
+    assert!(v2.contains("async"), "async stays native:\n{v2}");
+    assert_opts_equiv(a, "", None, true);
+
+    // `with` (structurally ineligible) diverts to native.
+    let w = "function(o){ function rd(){ with(o){ return x + y; } } return rd(); }";
+    let v3 = virtualize_opts(w, 7, None, true).expect("compiles with divert");
+    assert!(v3.contains("with("), "with-using fn stays native:\n{v3}");
+    assert_opts_equiv(w, "{x:3,y:4}", None, true);
+
+    // own `"use strict"` nested fn diverts to native.
+    let s = "function(){ function st(){ \"use strict\"; return typeof this; } return st(); }";
+    let v4 = virtualize_opts(s, 7, None, true).expect("compiles with divert");
+    assert!(v4.contains("use strict"), "strict nested fn stays native:\n{v4}");
+    assert_opts_equiv(s, "", None, true);
+}
+
+/// A native closure that reads a module GLOBAL leaves it untouched (resolved at
+/// module scope), while threading only the enclosing-frame local it captures.
+#[test]
+fn native_closure_reads_global_untouched() {
+    // `mk` reads global `Math` (untouched) and captures local `base` (threaded).
+    let src = "function(base){ function mk(x){ return Math.max(base, x); } return mk(3) + mk(9); }";
+    let v = virtualize_opts(src, 7, Some("mk"), false).expect("compiles");
+    assert!(v.contains("Math.max"), "global Math left untouched in native body:\n{v}");
+    assert_opts_equiv(src, "5", Some("mk"), false);
+}
+
+/// Determinism (§4.4): same seed ⇒ byte-identical output, INCLUDING the native
+/// factory const and the divert decision.
+#[test]
+fn native_closure_deterministic_same_seed_same_bytes() {
+    let src = "function(n){ function render(){ return n + 1; } return render(); }";
+    let v1 = virtualize_opts(src, 99, Some("render"), false).unwrap();
+    let v2 = virtualize_opts(src, 99, Some("render"), false).unwrap();
+    assert_eq!(v1, v2, "same seed ⇒ byte-identical native-closure output");
 }
 
 #[test]

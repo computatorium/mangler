@@ -40,11 +40,62 @@ pub fn classify_body(params: &[Param], body: &BlockStmt) -> Eligibility {
     // virtualize descended into method wrappers (only the inner fn/arrow was skipped).
     match body_classify(body, SkipMethodWrappers::InnerOnly, &reject) {
         Eligibility::Skip(r) => Eligibility::Skip(r),
+        // §5a case 3: `arguments.callee`/`.caller` is an irreducible strict/sloppy
+        // divergence — strict throws on access, but the VM materializes `arguments` as
+        // a plain array so the access is silently `undefined`. There is no sound VM
+        // shape for it, so bail (stay native) regardless of mode.
+        Eligibility::Eligible if reads_arguments_callee_or_caller(body) => {
+            Eligibility::Skip("arguments_callee")
+        }
         Eligibility::Eligible if arguments_alias(params, body) => {
             Eligibility::Skip("arguments_alias")
         }
         Eligibility::Eligible => Eligibility::Eligible,
     }
+}
+
+/// §5a case 3: does `body` read `arguments.callee` or `arguments.caller`? Mirrors the
+/// `arguments_alias` post-check shape: a write-free member-access scan that does NOT
+/// descend into nested functions/arrows (each has its OWN `arguments` and is checked
+/// when its own chunk compiles). Matches `arguments.callee`, `arguments.caller`,
+/// `arguments["callee"]`, and `arguments["caller"]`.
+fn reads_arguments_callee_or_caller(body: &BlockStmt) -> bool {
+    struct Scan {
+        hit: bool,
+    }
+    impl Scan {
+        fn is_arguments(e: &Expr) -> bool {
+            match e {
+                Expr::Ident(id) => id.sym.as_ref() == "arguments",
+                Expr::Paren(p) => Self::is_arguments(&p.expr),
+                _ => false,
+            }
+        }
+    }
+    impl Visit for Scan {
+        fn visit_member_expr(&mut self, n: &MemberExpr) {
+            if Self::is_arguments(&n.obj) {
+                let key = match &n.prop {
+                    MemberProp::Ident(id) => Some(id.sym.as_ref().to_string()),
+                    MemberProp::Computed(c) => match &*c.expr {
+                        Expr::Lit(Lit::Str(s)) => s.value.as_str().map(|v| v.to_string()),
+                        _ => None,
+                    },
+                    MemberProp::PrivateName(_) => None,
+                };
+                if matches!(key.as_deref(), Some("callee") | Some("caller")) {
+                    self.hit = true;
+                }
+            }
+            n.visit_children_with(self);
+        }
+        // Nested functions/arrows have their own `arguments`; checked in their chunk.
+        fn visit_function(&mut self, _: &Function) {}
+        fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
+    }
+    let mut s = Scan { hit: false };
+    body.visit_with(&mut s);
+    s.hit
 }
 
 /// virtualize's structural reject set, evaluated at the shared walker's visit points.
@@ -343,6 +394,33 @@ mod tests {
                 "`{src}` must bail arguments_alias"
             );
         }
+    }
+
+    #[test]
+    fn arguments_callee_caller_bails() {
+        // §5a case 3: `arguments.callee`/`.caller` is an irreducible strict/sloppy
+        // divergence (strict throws on access, the VM's plain-array `arguments` does
+        // not), so any body reading it bails — stays native.
+        for src in [
+            "function(){ return arguments.callee; }",
+            "function(){ return arguments.caller; }",
+            "function(){ return arguments['callee']; }",
+            "function(){ return arguments[\"caller\"].x; }",
+        ] {
+            let (params, body) = parse_fn_with_params(src);
+            assert!(
+                matches!(classify_body(&params, &body), Eligibility::Skip("arguments_callee")),
+                "`{src}` must bail arguments_callee"
+            );
+        }
+        // A nested function's `arguments.callee` does NOT bail the outer body (each
+        // function has its own `arguments`, checked when its own chunk compiles).
+        let (params, body) =
+            parse_fn_with_params("function(){ var g = function(){ return arguments.callee; }; return g; }");
+        assert!(matches!(classify_body(&params, &body), Eligibility::Eligible));
+        // Plain `arguments.length` / element read is still eligible.
+        let (params, body) = parse_fn_with_params("function(){ return arguments.length; }");
+        assert!(matches!(classify_body(&params, &body), Eligibility::Eligible));
     }
 
     #[test]

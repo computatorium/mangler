@@ -49,7 +49,10 @@ impl ResolvedConfig {
     /// `TryFrom` passes a freshly-randomized fallback; tests pass a fixed one so
     /// they are deterministic without touching the global RNG. Either way the
     /// chosen seed plumbs through to [`EngineConfig::seed`] unchanged.
-    pub fn from_flags_with_seed(flags: ConfigFlags, fallback_seed: u64) -> Result<Self, ConfigError> {
+    pub fn from_flags_with_seed(
+        flags: ConfigFlags,
+        fallback_seed: u64,
+    ) -> Result<Self, ConfigError> {
         let seed = flags.seed.unwrap_or(fallback_seed);
         let level = flags.preset.unwrap_or(Intensity::High);
 
@@ -99,6 +102,12 @@ impl ResolvedConfig {
         if let Some(g) = flags.virtualize {
             passes.virtualize.target = Some(g);
         }
+        if let Some(g) = flags.require_virtualized {
+            if passes.virtualize.target.is_none() {
+                passes.virtualize.target = Some(g.clone());
+            }
+            passes.virtualize.required = Some(g);
+        }
         if flags.virtualize_program {
             passes.virtualize.whole_program = true;
         }
@@ -110,6 +119,19 @@ impl ResolvedConfig {
         }
         if flags.virtualize_desugar_regex {
             passes.virtualize.desugar_regex = true;
+        }
+        for (flag, pattern) in [
+            ("--virtualize", &passes.virtualize.target),
+            ("--require-virtualized", &passes.virtualize.required),
+            ("--virtualize-exclude", &passes.virtualize.exclude),
+        ] {
+            if let Some(pattern) = pattern {
+                glob::Pattern::new(pattern).map_err(|error| ConfigError::InvalidGlob {
+                    flag,
+                    value: pattern.clone(),
+                    reason: error.to_string(),
+                })?;
+            }
         }
         // §1 matrix: whole-program wins; `target` is meaningless alongside it. We do
         // not reject the combo (it is harmless — the pass ignores `target` when
@@ -194,7 +216,10 @@ fn resolve_dynamic_key(
         };
         return match key_expected {
             // (5)
-            Some(tok) => Ok(Some(DynamicKey { source_expr, expected: tok })),
+            Some(tok) => Ok(Some(DynamicKey {
+                source_expr,
+                expected: tok,
+            })),
             None => Err(ConfigError::MissingDependency {
                 flag: "--remote-key",
                 requires: "--key-expected (the per-session token baked into the ciphertext)",
@@ -218,7 +243,10 @@ fn resolve_dynamic_key(
 
     // (5) the explicit pair must be complete.
     match (key_source, key_expected) {
-        (Some(src), Some(exp)) => Ok(Some(DynamicKey { source_expr: src, expected: exp })),
+        (Some(src), Some(exp)) => Ok(Some(DynamicKey {
+            source_expr: src,
+            expected: exp,
+        })),
         (Some(_), None) => Err(ConfigError::MissingDependency {
             flag: "--key-source",
             requires: "--key-expected (the value to bake into the ciphertext)",
@@ -266,7 +294,8 @@ mod tests {
 
     #[test]
     fn flag_overrides_beat_preset() {
-        let r = resolve("preset = \"high\"\nmangle = false\nglobal_indirect = \"aggressive\"").unwrap();
+        let r =
+            resolve("preset = \"high\"\nmangle = false\nglobal_indirect = \"aggressive\"").unwrap();
         assert_eq!(r.engine.level, Intensity::High);
         assert!(!r.passes.mangle.enabled);
         assert_eq!(r.passes.global_indirect.mode, GlobalIndirect::Aggressive);
@@ -288,7 +317,10 @@ mod tests {
         // `virtualize_program` true clears any `target` (whole-program wins, §1).
         let r = resolve("virtualize = \"hot*\"\nvirtualize_program = true").unwrap();
         assert!(r.passes.virtualize.whole_program);
-        assert!(r.passes.virtualize.target.is_none(), "target ignored under whole_program");
+        assert!(
+            r.passes.virtualize.target.is_none(),
+            "target ignored under whole_program"
+        );
         // Plain `target` (no whole_program) is unchanged.
         let r2 = resolve("virtualize = \"hot*\"").unwrap();
         assert!(!r2.passes.virtualize.whole_program);
@@ -316,12 +348,15 @@ mod tests {
     #[test]
     fn self_coupled_key_requires_vm() {
         assert!(resolve("preset = \"high\"\nself_coupled_key = true").is_err());
-        assert!(resolve("preset = \"high\"\nstrings_in_vm = false\nself_coupled_key = true").is_err());
+        assert!(
+            resolve("preset = \"high\"\nstrings_in_vm = false\nself_coupled_key = true").is_err()
+        );
     }
 
     #[test]
     fn self_coupled_key_accepts_with_vm() {
-        let r = resolve("preset = \"high\"\nstrings_in_vm = true\nself_coupled_key = true").unwrap();
+        let r =
+            resolve("preset = \"high\"\nstrings_in_vm = true\nself_coupled_key = true").unwrap();
         assert!(r.passes.strings.self_coupled_key);
         assert!(r.passes.strings.in_vm);
     }
@@ -343,12 +378,24 @@ mod tests {
 
     #[test]
     fn key_off_by_default() {
-        assert!(resolve("preset = \"high\"").unwrap().passes.strings.dynamic_key.is_none());
+        assert!(
+            resolve("preset = \"high\"")
+                .unwrap()
+                .passes
+                .strings
+                .dynamic_key
+                .is_none()
+        );
     }
 
     #[test]
     fn domain_lock_expands_to_hostname() {
-        let dk = resolve("domain_lock = \"example.com\"").unwrap().passes.strings.dynamic_key.unwrap();
+        let dk = resolve("domain_lock = \"example.com\"")
+            .unwrap()
+            .passes
+            .strings
+            .dynamic_key
+            .unwrap();
         assert_eq!(dk.source_expr, "location.hostname");
         assert_eq!(dk.expected, "example.com");
     }
@@ -356,7 +403,11 @@ mod tests {
     #[test]
     fn key_source_with_expected_resolves() {
         let dk = resolve("key_source = \"window.__S\"\nkey_expected = \"tok\"")
-            .unwrap().passes.strings.dynamic_key.unwrap();
+            .unwrap()
+            .passes
+            .strings
+            .dynamic_key
+            .unwrap();
         assert_eq!(dk.source_expr, "window.__S");
         assert_eq!(dk.expected, "tok");
     }
@@ -380,7 +431,11 @@ mod tests {
     #[test]
     fn remote_key_with_expected_resolves() {
         let dk = resolve("remote_key = \"window.__sess\"\nkey_expected = \"s3cr3t\"")
-            .unwrap().passes.strings.dynamic_key.unwrap();
+            .unwrap()
+            .passes
+            .strings
+            .dynamic_key
+            .unwrap();
         assert_eq!(dk.source_expr, "window.__sess");
         assert_eq!(dk.expected, "s3cr3t");
     }
@@ -389,7 +444,11 @@ mod tests {
     fn remote_key_bare_uses_default_slot() {
         // The empty string stands in for clap's bare `--remote-key`.
         let dk = resolve("remote_key = \"\"\nkey_expected = \"tok\"")
-            .unwrap().passes.strings.dynamic_key.unwrap();
+            .unwrap()
+            .passes
+            .strings
+            .dynamic_key
+            .unwrap();
         assert_eq!(dk.source_expr, DEFAULT_SESSION_SLOT);
         assert_eq!(dk.expected, "tok");
     }
@@ -428,5 +487,14 @@ mod tests {
         assert!(!frag.passes.anti_tamper.self_defending);
         assert!(!frag.passes.strings.in_vm);
         assert_eq!(frag.engine.level, Intensity::High);
+    }
+    #[test]
+    fn required_virtualization_selects_targets_and_rejects_invalid_globs() {
+        let resolved = resolve("require_virtualized = \"pay*\"").unwrap();
+        assert_eq!(resolved.passes.virtualize.required.as_deref(), Some("pay*"));
+        assert_eq!(resolved.passes.virtualize.target.as_deref(), Some("pay*"));
+        for key in ["virtualize", "require_virtualized", "virtualize_exclude"] {
+            assert!(resolve(&format!("{key} = \"[\"")).is_err());
+        }
     }
 }

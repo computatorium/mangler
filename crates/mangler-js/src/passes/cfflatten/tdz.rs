@@ -33,7 +33,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use swc_core::common::{SyntaxContext, DUMMY_SP};
+use swc_core::common::{DUMMY_SP, SyntaxContext};
 use swc_core::ecma::ast::*;
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
@@ -66,7 +66,10 @@ struct Binding {
 /// the body.
 pub fn loop_let_captured(body: &BlockStmt, names: &[String]) -> bool {
     let names: HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
-    let mut cs = CaptureScan { names: &names, found: false };
+    let mut cs = CaptureScan {
+        names: &names,
+        found: false,
+    };
     body.visit_with(&mut cs);
     cs.found
 }
@@ -78,14 +81,20 @@ struct CaptureScan<'a> {
 }
 impl<'a> Visit for CaptureScan<'a> {
     fn visit_function(&mut self, n: &Function) {
-        let mut r = NameRefScan { names: self.names, found: false };
+        let mut r = NameRefScan {
+            names: self.names,
+            found: false,
+        };
         n.visit_with(&mut r);
         if r.found {
             self.found = true;
         }
     }
     fn visit_arrow_expr(&mut self, n: &ArrowExpr) {
-        let mut r = NameRefScan { names: self.names, found: false };
+        let mut r = NameRefScan {
+            names: self.names,
+            found: false,
+        };
         n.visit_with(&mut r);
         if r.found {
             self.found = true;
@@ -145,7 +154,7 @@ pub fn rewrite(body: &mut BlockStmt, cfg: &FileConfig, helpers: &TdzHelpers) -> 
         val_decls.push(declarator(&b.val, None));
         tdz_decls.push(declarator(&b.tdz, Some(num(1.0))));
     }
-    let mut hoist = vec![
+    let hoist = vec![
         Stmt::Decl(Decl::Var(Box::new(VarDecl {
             span: DUMMY_SP,
             ctxt: SyntaxContext::empty(),
@@ -161,8 +170,8 @@ pub fn rewrite(body: &mut BlockStmt, cfg: &FileConfig, helpers: &TdzHelpers) -> 
             decls: tdz_decls,
         }))),
     ];
-    hoist.append(&mut body.stmts);
-    body.stmts = hoist;
+    let at = mangler_jsast::directives::leading_directive_count(&body.stmts);
+    body.stmts.splice(at..at, hoist);
     true
 }
 
@@ -341,7 +350,12 @@ impl<'a> VisitMut for Rewriter<'a> {
                                 span: DUMMY_SP,
                                 exprs: vec![
                                     rhs,
-                                    Box::new(guard(&b.tdz, &self.helpers.throw_tdz, &b.val, throw_const)),
+                                    Box::new(guard(
+                                        &b.tdz,
+                                        &self.helpers.throw_tdz,
+                                        &b.val,
+                                        throw_const,
+                                    )),
                                 ],
                             })
                         } else {
@@ -435,7 +449,11 @@ fn ident_target(name: &str) -> AssignTarget {
 }
 
 fn num(v: f64) -> Expr {
-    Expr::Lit(Lit::Num(Number { span: DUMMY_SP, value: v, raw: None }))
+    Expr::Lit(Lit::Num(Number {
+        span: DUMMY_SP,
+        value: v,
+        raw: None,
+    }))
 }
 
 fn undefined_expr() -> Expr {
@@ -445,7 +463,10 @@ fn undefined_expr() -> Expr {
 fn declarator(name: &str, init: Option<Expr>) -> VarDeclarator {
     VarDeclarator {
         span: DUMMY_SP,
-        name: Pat::Ident(BindingIdent { id: ident(name), type_ann: None }),
+        name: Pat::Ident(BindingIdent {
+            id: ident(name),
+            type_ann: None,
+        }),
         init: init.map(Box::new),
         definite: false,
     }
@@ -457,7 +478,12 @@ fn decl_stmt(kind: VarDeclKind, name: Pat, init: Option<Box<Expr>>) -> Stmt {
         ctxt: SyntaxContext::empty(),
         kind,
         declare: false,
-        decls: vec![VarDeclarator { span: DUMMY_SP, name, init, definite: false }],
+        decls: vec![VarDeclarator {
+            span: DUMMY_SP,
+            name,
+            init,
+            definite: false,
+        }],
     })))
 }
 
@@ -471,7 +497,10 @@ fn assign_expr(name: &str, op: AssignOp, rhs: Expr) -> Expr {
 }
 
 fn assign_stmt(name: &str, op: AssignOp, rhs: Expr) -> Stmt {
-    Stmt::Expr(ExprStmt { span: DUMMY_SP, expr: Box::new(assign_expr(name, op, rhs)) })
+    Stmt::Expr(ExprStmt {
+        span: DUMMY_SP,
+        expr: Box::new(assign_expr(name, op, rhs)),
+    })
 }
 
 fn call_throw(fn_name: &str, arg: &str) -> Expr {

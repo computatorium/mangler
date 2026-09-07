@@ -49,6 +49,7 @@ fn merge(cli: ConfigFlags, file: ConfigFlags) -> ConfigFlags {
         self_defending: cli.self_defending.or(file.self_defending),
         debug_protection: cli.debug_protection.or(file.debug_protection),
         virtualize: cli.virtualize.or(file.virtualize),
+        require_virtualized: cli.require_virtualized.or(file.require_virtualized),
         virtualize_program: cli.virtualize_program || file.virtualize_program,
         virtualize_exclude: cli.virtualize_exclude.or(file.virtualize_exclude),
         virtualize_desugar_class: cli.virtualize_desugar_class || file.virtualize_desugar_class,
@@ -151,7 +152,10 @@ mod tests {
 
     #[test]
     fn merge_cli_beats_file() {
-        let cli = ConfigFlags { seed: Some(42), ..Default::default() };
+        let cli = ConfigFlags {
+            seed: Some(42),
+            ..Default::default()
+        };
         let file = ConfigFlags {
             seed: Some(7),
             preset: Some(Intensity::Max),

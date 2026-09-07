@@ -21,12 +21,12 @@
 //! assigned. Mirrors the legacy `inside_core_init` guard, using
 //! [`DecoderAnchorArtifact::is_core_declarator`].
 
-use crate::artifacts::DecoderAnchorArtifact;
+use crate::artifacts::{DecoderAnchorArtifact, VmTableArtifact};
 use crate::config::FileConfig;
-use crate::opaque::{anchor_from_bus_or_inject, opaque_bool, OpaqueAnchor};
+use crate::opaque::{OpaqueAnchor, anchor_from_bus_or_inject, opaque_bool};
 use mangler_core::{Language, Note, Notes, PassConfig, Result, Rng};
-use mangler_jsast::build as b;
 use mangler_jsast::Js;
+use mangler_jsast::build as b;
 use mangler_passgraph::{ArtifactBus, Pass, Resource};
 use swc_core::ecma::ast::{
     ArrowExpr, BlockStmt, BlockStmtOrExpr, Function, IfStmt, Pat, Stmt, VarDeclKind,
@@ -48,7 +48,7 @@ impl Pass<Js, FileConfig> for DeadCodePass {
     /// `get::<DecoderAnchorArtifact>()` and orders this pass after strings when
     /// strings is enabled.
     fn reads(&self) -> &[Resource] {
-        const R: &[Resource] = &[Resource::decoder_anchor()];
+        const R: &[Resource] = &[Resource::decoder_anchor(), Resource::vm_table()];
         R
     }
 
@@ -98,6 +98,10 @@ impl Pass<Js, FileConfig> for DeadCodePass {
 
         let rate = cfg.resolved().passes.cf_flatten.dead_code_rate as f32;
         let mut injector = DeadInjector {
+            runtime: bus
+                .get::<VmTableArtifact>()
+                .map_err(|e| mangler_core::Error::transform(self.id(), e.to_string()))?
+                .cloned(),
             cfg,
             rng,
             anchor,
@@ -114,6 +118,7 @@ impl Pass<Js, FileConfig> for DeadCodePass {
 /// swc visitor that prepends always-false dead branches to every function / arrow
 /// body (except the decoder-`core` initializer subtree).
 struct DeadInjector<'a> {
+    runtime: Option<VmTableArtifact>,
     cfg: &'a FileConfig,
     rng: &'a mut Rng,
     anchor: OpaqueAnchor,
@@ -197,9 +202,8 @@ impl DeadInjector<'_> {
         for _ in 0..n {
             branches.push(self.dead_branch());
         }
-        for branch in branches.into_iter().rev() {
-            body.stmts.insert(0, branch);
-        }
+        let at = mangler_jsast::directives::leading_directive_count(&body.stmts);
+        body.stmts.splice(at..at, branches);
     }
 }
 
@@ -207,7 +211,13 @@ impl VisitMut for DeadInjector<'_> {
     fn visit_mut_fn_decl(&mut self, n: &mut swc_core::ecma::ast::FnDecl) {
         // Skip the anchor function entirely (decode-path / self-recursion guard):
         // neither inject into it nor descend into its body.
-        if n.ident.sym.as_ref() == self.skip_fn_name {
+        if n.ident.sym.as_ref() == self.skip_fn_name
+            || self.runtime.as_ref().is_some_and(|vm| {
+                vm.interpreter_names
+                    .iter()
+                    .any(|name| name == n.ident.sym.as_ref())
+            })
+        {
             return;
         }
         n.visit_mut_children_with(self);
@@ -228,6 +238,13 @@ impl VisitMut for DeadInjector<'_> {
     }
 
     fn visit_mut_var_declarator(&mut self, n: &mut swc_core::ecma::ast::VarDeclarator) {
+        if self
+            .runtime
+            .as_ref()
+            .is_some_and(|vm| is_named_declarator(&n.name, &vm.program_table_name))
+        {
+            return;
+        }
         // Suppress injection inside the decoder `core`'s own initializer subtree:
         // a `core(0)`-anchored guard there would call `core` before it is assigned.
         let is_core = self
@@ -296,9 +313,10 @@ mod tests {
 
         let mut rng = Rng::for_pass(cfg.seed(), "deadcode");
         let mut notes = Notes::default();
-        bus.enter_pass("deadcode", &[Resource::decoder_anchor()], &[]);
+        bus.enter_pass("deadcode", DeadCodePass.reads(), &[]);
         let pass = DeadCodePass;
-        pass.run(&mut ast, &cfg, &mut rng, &mut bus, &mut notes).unwrap();
+        pass.run(&mut ast, &cfg, &mut rng, &mut bus, &mut notes)
+            .unwrap();
         Js.print(&ast)
     }
 
@@ -313,7 +331,10 @@ mod tests {
     fn pass_contract() {
         let pass = DeadCodePass;
         assert_eq!(pass.id(), "deadcode");
-        assert_eq!(pass.reads(), &[Resource::decoder_anchor()]);
+        assert_eq!(
+            pass.reads(),
+            &[Resource::decoder_anchor(), Resource::vm_table()]
+        );
         assert!(pass.writes().is_empty());
         assert!(pass.enabled(&config(Intensity::High, 1, Some(0.5))));
         assert!(!pass.enabled(&config(Intensity::High, 1, Some(0.0))));
@@ -366,7 +387,10 @@ mod tests {
     #[test]
     fn deterministic_for_same_seed() {
         let core = "_core";
-        let src = with_decoder(core, "function f(x){return x+1;}globalThis.__out=String(f(3));");
+        let src = with_decoder(
+            core,
+            "function f(x){return x+1;}globalThis.__out=String(f(3));",
+        );
         let a = run_pass(&src, 7, 1.0, Some(core));
         let b = run_pass(&src, 7, 1.0, Some(core));
         assert_eq!(a, b);
@@ -388,10 +412,7 @@ mod tests {
         );
         // Rate 1: every body fires.
         let out_high = run_pass(&src, 3, 1.0, Some(core));
-        assert!(
-            out_high.contains("if("),
-            "rate 1.0 must inject: {out_high}"
-        );
+        assert!(out_high.contains("if("), "rate 1.0 must inject: {out_high}");
     }
 
     /// The decoder `core` initializer subtree is NOT injected into (no `core(0)`
@@ -415,5 +436,11 @@ mod tests {
             let out = run_pass(&src, seed, 1.0, Some(core));
             assert_behaviorally_equal(&reference, &out);
         }
+    }
+    #[test]
+    fn injected_branches_preserve_function_strictness() {
+        let src = "function f(a){'use strict';a=9;return String(this===undefined)+':'+arguments[0];}globalThis.__out=f(1);";
+        let out = run_pass(src, 1, 1.0, None);
+        assert_behaviorally_equal(src, &out);
     }
 }

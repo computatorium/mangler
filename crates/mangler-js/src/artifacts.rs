@@ -88,8 +88,8 @@ impl Artifact for DecoderAnchorArtifact {
 /// hoisted bytecode-integer arrays (expr, cf-flatten, dead-code skip these names).
 #[derive(Debug, Clone)]
 pub struct VmTableArtifact {
-    /// Name of the injected VM interpreter function.
-    pub interp_name: String,
+    /// Every generated interpreter variant (strict/sloppy, lean/exception-aware).
+    pub interpreter_names: Vec<String>,
     /// Name of the hoisted bytecode program-table binding shared by all
     /// virtualized chunks. Downstream passes read this to skip (not bloat) it.
     pub program_table_name: String,
@@ -105,7 +105,7 @@ impl Artifact for VmTableArtifact {
 /// interpreter + decode-wrapper and rewrite the `SCK<digits>` sentinel.
 ///
 /// Written by the strings pass ONLY when `self_coupled_key` is active (flag on, a VM
-/// decode chunk was produced, not `--verify`); read by the runner after
+/// decode chunk was produced); read by the runner before
 /// `selfdefend::wrap`. Reuses the `decoder_anchor` resource channel — the strings
 /// pass already declares it in `writes()`, and putting two artifacts on one resource
 /// is fine (the bus keys on the concrete type). Absent = the finalizer is skipped.
@@ -169,7 +169,7 @@ impl Artifact for GlobalNameLiteralsArtifact {
 mod tests {
     use super::*;
     use mangler_passgraph::ArtifactBus;
-    use swc_core::common::{SyntaxContext, DUMMY_SP};
+    use swc_core::common::{DUMMY_SP, SyntaxContext};
     use swc_core::ecma::ast::{BindingIdent, Ident};
 
     fn ident_pat(sym: &str) -> Pat {
@@ -208,7 +208,7 @@ mod tests {
         })
         .unwrap();
         bus.put(VmTableArtifact {
-            interp_name: "v".into(),
+            interpreter_names: vec!["v".into()],
             program_table_name: "t".into(),
         })
         .unwrap();

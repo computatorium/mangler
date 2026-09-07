@@ -11,51 +11,52 @@ env:
 
 jobs:
   test:
-    name: build + test
+    name: semantics + real engines + release budgets
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo + target
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build (debug, locked, all targets)
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Require explicitly configured real engines
+        run: |
+          echo "MANGLER_TESTKIT_NODE=$(command -v node)" >> "$GITHUB_ENV"
+          echo "MANGLER_TESTKIT_CHROME=$(command -v google-chrome)" >> "$GITHUB_ENV"
+          echo "MANGLER_TESTKIT_REQUIRE_ENGINES=1" >> "$GITHUB_ENV"
+          test -x "$(command -v google-chrome)"
+      - name: Build all targets
+        timeout-minutes: 10
         run: cargo build --locked --all-targets
-
-      - name: Unit tests (fast gate)
-        run: cargo test --locked --lib
-
-      - name: Full suite (integration + QuickJS differential)
-        # The QuickJS differential/virtualize tests are slower and have hung in
-        # pathological cases; cap the step so a hang fails fast instead of burning
-        # the whole CI budget.
-        timeout-minutes: 25
-        run: cargo test --locked
+      - name: Full suite including QuickJS, Node and Chrome artifacts
+        timeout-minutes: 20
+        run: cargo test --locked --workspace -- --test-threads=2
+      - name: Release build and minification throughput
+        timeout-minutes: 12
+        run: |
+          cargo build --locked --release -p mangler-cli
+          cargo test --locked --release -p mangler-js --test performance -- --nocapture
+      - name: VM behavior and raw, gzip, Brotli size budgets
+        timeout-minutes: 4
+        run: '"$MANGLER_TESTKIT_NODE" scripts/measure-vm.cjs --binary target/release/mangler --check'
 
   lint:
-    name: fmt + clippy (informational)
+    name: changed-file formatting + strict clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust (stable) with rustfmt + clippy
-        uses: dtolnay/rust-toolchain@stable
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
-      - name: Cache cargo + target
-        uses: Swatinem/rust-cache@v2
-
-      # Non-blocking for now: the tree is not yet rustfmt-clean and clippy is
-      # untriaged. Drop `continue-on-error` to make these gates AFTER a one-time
-      # `cargo fmt` + clippy cleanup (tracked as a follow-up).
-      - name: rustfmt (check)
-        continue-on-error: true
-        run: cargo fmt --all --check
-
-      - name: clippy
-        continue-on-error: true
-        run: cargo clippy --all-targets
+      - uses: Swatinem/rust-cache@v2
+      - name: Format changed Rust files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python3 .github/scripts/check-format.py
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings

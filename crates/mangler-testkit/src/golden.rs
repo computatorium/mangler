@@ -23,7 +23,8 @@ where
     let once = transform(src);
     let twice = transform(&once);
     assert_eq!(
-        once, twice,
+        once,
+        twice,
         "transform is not idempotent (transform∘transform != transform)\n\
          --- once ({} bytes) ---\n{}\n--- twice ({} bytes) ---\n{}",
         once.len(),
@@ -46,18 +47,28 @@ pub fn bless_from_env() -> bool {
 pub enum GoldenResult {
     /// Output matched the committed golden exactly.
     Matched,
-    /// The golden file did not exist or `bless` was set; it was written.
+    /// `bless` was set; the golden was written.
     Wrote,
     /// Output differed from the golden (with the two byte counts).
-    Mismatch { golden_len: usize, actual_len: usize },
+    Mismatch {
+        golden_len: usize,
+        actual_len: usize,
+    },
 }
 
-/// Compare `actual` against the golden file at `golden_path`. If `bless` is true (or
-/// the file is missing), write `actual` to the path and return [`GoldenResult::Wrote`].
+/// Compare `actual` against the golden file at `golden_path`. If `bless` is true, write `actual` to the path and return [`GoldenResult::Wrote`].
 /// Otherwise return [`GoldenResult::Matched`] or [`GoldenResult::Mismatch`]. Never
 /// panics — the caller decides (use [`assert_golden`] for the panicking variant).
-pub fn compare_golden(golden_path: &Path, actual: &str, bless: bool) -> std::io::Result<GoldenResult> {
-    let existing = std::fs::read_to_string(golden_path).ok();
+pub fn compare_golden(
+    golden_path: &Path,
+    actual: &str,
+    bless: bool,
+) -> std::io::Result<GoldenResult> {
+    let existing = match std::fs::read_to_string(golden_path) {
+        Ok(value) => Some(value),
+        Err(error) if bless && error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
     match existing {
         Some(golden) if !bless => {
             if golden == actual {
@@ -92,7 +103,10 @@ pub fn assert_golden(golden_path: &Path, actual: &str) {
                 actual.len()
             );
         }
-        Ok(GoldenResult::Mismatch { golden_len, actual_len }) => {
+        Ok(GoldenResult::Mismatch {
+            golden_len,
+            actual_len,
+        }) => {
             panic!(
                 "golden mismatch for {}: golden {golden_len} bytes, actual {actual_len} bytes — \
                  review and re-bless with MANGLER_TESTKIT_BLESS=1 if intended\n--- actual ---\n{actual}",
@@ -144,18 +158,34 @@ mod tests {
         let path = dir.join(format!("mangler_testkit_golden_{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
-        // Missing file -> Wrote.
-        assert_eq!(compare_golden(&path, "hello", false).unwrap(), GoldenResult::Wrote);
+        // A missing baseline fails unless blessing was explicit.
+        assert_eq!(
+            compare_golden(&path, "hello", false).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            compare_golden(&path, "hello", true).unwrap(),
+            GoldenResult::Wrote
+        );
         // Now matches.
-        assert_eq!(compare_golden(&path, "hello", false).unwrap(), GoldenResult::Matched);
+        assert_eq!(
+            compare_golden(&path, "hello", false).unwrap(),
+            GoldenResult::Matched
+        );
         // Different -> Mismatch.
         assert!(matches!(
             compare_golden(&path, "world!", false).unwrap(),
             GoldenResult::Mismatch { .. }
         ));
         // Bless rewrites.
-        assert_eq!(compare_golden(&path, "world!", true).unwrap(), GoldenResult::Wrote);
-        assert_eq!(compare_golden(&path, "world!", false).unwrap(), GoldenResult::Matched);
+        assert_eq!(
+            compare_golden(&path, "world!", true).unwrap(),
+            GoldenResult::Wrote
+        );
+        assert_eq!(
+            compare_golden(&path, "world!", false).unwrap(),
+            GoldenResult::Matched
+        );
 
         let _ = std::fs::remove_file(&path);
     }

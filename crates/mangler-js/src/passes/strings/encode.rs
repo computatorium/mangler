@@ -66,8 +66,7 @@ pub struct EncodingParams {
 /// Hand-rolled because the `base64` crate is not a dependency of this crate and the
 /// file-ownership rules forbid editing `Cargo.toml`. Deterministic and total.
 pub fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -163,7 +162,11 @@ fn build_entry(
     for (j, b) in pt.iter().enumerate() {
         let bk_byte = base_key[j % bk_len];
         let ref_byte = if rl == 0 { 0 } else { ref_full[j % rl] };
-        let rk_byte = if rk_len == 0 { 0 } else { runtime_key[j % rk_len] };
+        let rk_byte = if rk_len == 0 {
+            0
+        } else {
+            runtime_key[j % rk_len]
+        };
         raw.push(*b ^ bk_byte ^ ref_byte ^ rk_byte);
     }
     raw.push(suffix.len() as u8);
@@ -176,11 +179,18 @@ fn build_entry(
 /// Deterministic given `rng`: the DAG `refs` table and every junk prefix/suffix are
 /// drawn from the seeded RNG, so the same (seed, corpus) yields byte-identical
 /// output.
-pub fn encode_entries(plaintexts: &[String], params: &EncodingParams, rng: &mut Rng) -> EncodedBlob {
+pub fn encode_entries(
+    plaintexts: &[String],
+    params: &EncodingParams,
+    rng: &mut Rng,
+) -> EncodedBlob {
     assert!(!params.base_key.is_empty(), "base_key must be non-empty");
     let n = plaintexts.len();
     if n == 0 {
-        return EncodedBlob { entries: Vec::new(), refs: Vec::new() };
+        return EncodedBlob {
+            entries: Vec::new(),
+            refs: Vec::new(),
+        };
     }
 
     // junk_rate=0 -> max_junk=0 (no junk). junk_rate=255 -> max_junk=64.
@@ -197,8 +207,16 @@ pub fn encode_entries(plaintexts: &[String], params: &EncodingParams, rng: &mut 
     // 2) Single forward pass: encode entry i using FINAL bytes of entry refs[i].
     let mut raws: Vec<Vec<u8>> = Vec::with_capacity(n);
     for (i, pt) in plaintexts.iter().enumerate() {
-        let prefix_len = if max_junk == 0 { 0 } else { rng.pick(max_junk + 1) };
-        let suffix_len = if max_junk == 0 { 0 } else { rng.pick(max_junk + 1) };
+        let prefix_len = if max_junk == 0 {
+            0
+        } else {
+            rng.pick(max_junk + 1)
+        };
+        let suffix_len = if max_junk == 0 {
+            0
+        } else {
+            rng.pick(max_junk + 1)
+        };
         let prefix = rng.random_bytes(prefix_len);
         let suffix = rng.random_bytes(suffix_len);
 
@@ -216,7 +234,10 @@ pub fn encode_entries(plaintexts: &[String], params: &EncodingParams, rng: &mut 
 
     let entries = raws
         .into_iter()
-        .map(|raw| EncodedEntry { b64: base64_encode(&raw), raw })
+        .map(|raw| EncodedEntry {
+            b64: base64_encode(&raw),
+            raw,
+        })
         .collect();
     EncodedBlob { entries, refs }
 }
@@ -255,7 +276,11 @@ pub fn derive_key_mask(len: usize, refs: &[u32], lut_p: &[u32], lut_s: &[u32]) -
 /// inverse).
 pub fn mask_base_key(base_key: &[u8], refs: &[u32], lut_p: &[u32], lut_s: &[u32]) -> Vec<u8> {
     let mask = derive_key_mask(base_key.len(), refs, lut_p, lut_s);
-    base_key.iter().zip(mask.iter()).map(|(b, m)| b ^ m).collect()
+    base_key
+        .iter()
+        .zip(mask.iter())
+        .map(|(b, m)| b ^ m)
+        .collect()
 }
 
 /// DJB2 hash (`h = (h*33 + x) >>> 0`, seeded `5381`) over the concatenated
@@ -308,7 +333,14 @@ mod tests {
     fn build_params(seed: u64, junk_rate: u8) -> (EncodingParams, Rng) {
         let mut rng = Rng::for_pass(seed, "strings");
         let base_key = rng.random_bytes(17);
-        (EncodingParams { base_key, junk_rate, runtime_key: Vec::new() }, rng)
+        (
+            EncodingParams {
+                base_key,
+                junk_rate,
+                runtime_key: Vec::new(),
+            },
+            rng,
+        )
     }
 
     #[test]
@@ -354,8 +386,8 @@ mod tests {
             let (params, mut rng) = build_params(42, junk_rate);
             let blob = encode_entries(&corpus, &params, &mut rng);
             assert_eq!(blob.refs[0], 0);
-            for i in 1..corpus.len() {
-                assert!((blob.refs[i] as usize) < i);
+            for (i, reference) in blob.refs.iter().enumerate().take(corpus.len()).skip(1) {
+                assert!((*reference as usize) < i);
             }
             for (i, original) in corpus.iter().enumerate() {
                 assert_eq!(&decode_entry_rust(&blob, i, &params), original, "entry {i}");
@@ -365,8 +397,10 @@ mod tests {
 
     #[test]
     fn runtime_key_round_trips_with_matching_key() {
-        let corpus: Vec<String> =
-            ["getContext", "webgl2", "Φωνή", ""].iter().map(|s| (*s).to_string()).collect();
+        let corpus: Vec<String> = ["getContext", "webgl2", "Φωνή", ""]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         let mut rng = Rng::for_pass(7, "strings");
         let base_key = rng.random_bytes(17);
         let params = EncodingParams {

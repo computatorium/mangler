@@ -31,11 +31,11 @@
 //! Built on [`mangler_jsast::build`] node helpers — no hand-spelled node structs.
 
 use crate::artifacts::DecoderAnchorArtifact;
+use mangler_core::Rng;
 use mangler_jsast::build as b;
 use mangler_jsast::codegen;
-use mangler_core::Rng;
 use mangler_passgraph::ArtifactBus;
-use swc_core::ecma::ast::{BinaryOp, Expr, Lit, ModuleItem, Program, Stmt, VarDeclKind};
+use swc_core::ecma::ast::{BinaryOp, Expr, Lit, Program, Stmt, VarDeclKind};
 
 /// The non-foldable anchor an opaque expression couples its value to.
 ///
@@ -133,10 +133,7 @@ pub fn anchor_from_bus_or_inject(
 
 /// Prepend one statement to the program body (module or script).
 fn prepend_stmt(program: &mut Program, stmt: Stmt) {
-    match program {
-        Program::Module(m) => m.body.insert(0, ModuleItem::Stmt(stmt)),
-        Program::Script(s) => s.body.insert(0, stmt),
-    }
+    mangler_jsast::directives::insert_program_statements(program, vec![stmt]);
 }
 
 /// Number of value-determining templates the selector chooses among. Each shares a
@@ -163,7 +160,14 @@ pub fn opaque_u32(rng: &mut Rng, anchor: &OpaqueAnchor, value: u32) -> Expr {
         n => n,
     };
     let bconst = rng.random_u32();
-    zero_fill(build_template(template, guard, anchor.name(), value, a, bconst))
+    zero_fill(build_template(
+        template,
+        guard,
+        anchor.name(),
+        value,
+        a,
+        bconst,
+    ))
 }
 
 /// An expression that evaluates to the SIGNED 32-bit `value` (including
@@ -177,7 +181,14 @@ pub fn opaque_i32(rng: &mut Rng, anchor: &OpaqueAnchor, value: i32) -> Expr {
         n => n,
     };
     let bconst = rng.random_u32();
-    int32_coerce(build_template(template, guard, anchor.name(), value as u32, a, bconst))
+    int32_coerce(build_template(
+        template,
+        guard,
+        anchor.name(),
+        value as u32,
+        a,
+        bconst,
+    ))
 }
 
 /// An expression that evaluates to the boolean `value` but resists folding, drawn
@@ -420,7 +431,11 @@ fn true_guard(guard: usize, anchor: &str) -> Expr {
             b::num_u32(0),
         ),
         // s.indexOf(s) === 0
-        2 => b::bin(BinaryOp::EqEqEq, anchor_index_of_self(anchor), b::num_u32(0)),
+        2 => b::bin(
+            BinaryOp::EqEqEq,
+            anchor_index_of_self(anchor),
+            b::num_u32(0),
+        ),
         // s.length === (s + "").length
         3 => b::bin(
             BinaryOp::EqEqEq,
@@ -433,7 +448,11 @@ fn true_guard(guard: usize, anchor: &str) -> Expr {
             anchor_len_is_zero(anchor),
             b::paren(b::bin(
                 BinaryOp::EqEqEq,
-                b::paren(b::bin(BinaryOp::BitAnd, anchor_char0(anchor), b::num_u32(0xFFFF))),
+                b::paren(b::bin(
+                    BinaryOp::BitAnd,
+                    anchor_char0(anchor),
+                    b::num_u32(0xFFFF),
+                )),
                 anchor_char0(anchor),
             )),
         ),
@@ -465,7 +484,11 @@ fn false_guard(guard: usize, anchor: &str) -> Expr {
             b::num_u32(0),
         ),
         // s.indexOf(s) !== 0
-        2 => b::bin(BinaryOp::NotEqEq, anchor_index_of_self(anchor), b::num_u32(0)),
+        2 => b::bin(
+            BinaryOp::NotEqEq,
+            anchor_index_of_self(anchor),
+            b::num_u32(0),
+        ),
         // s.length !== (s + "").length
         3 => b::bin(
             BinaryOp::NotEqEq,
@@ -478,7 +501,11 @@ fn false_guard(guard: usize, anchor: &str) -> Expr {
             b::paren(b::bin(BinaryOp::NotEqEq, anchor_len(anchor), b::num_u32(0))),
             b::paren(b::bin(
                 BinaryOp::NotEqEq,
-                b::paren(b::bin(BinaryOp::BitAnd, anchor_char0(anchor), b::num_u32(0xFFFF))),
+                b::paren(b::bin(
+                    BinaryOp::BitAnd,
+                    anchor_char0(anchor),
+                    b::num_u32(0xFFFF),
+                )),
                 anchor_char0(anchor),
             )),
         ),
@@ -501,10 +528,10 @@ fn false_guard(guard: usize, anchor: &str) -> Expr {
 mod tests {
     use super::*;
     use mangler_testkit::eval::assert_behaviorally_equal;
-    use swc_core::ecma::ast::Script;
-    use swc_core::ecma::codegen::{text_writer::JsWriter, Config as CodegenConfig, Emitter};
-    use swc_core::common::sync::Lrc;
     use swc_core::common::SourceMap;
+    use swc_core::common::sync::Lrc;
+    use swc_core::ecma::ast::Script;
+    use swc_core::ecma::codegen::{Config as CodegenConfig, Emitter, text_writer::JsWriter};
 
     /// Render a single expression to a bare `(<expr>)` source fragment.
     fn render(e: Expr) -> String {
@@ -526,7 +553,11 @@ mod tests {
             emitter.emit_program(&program).unwrap();
         }
         let s = String::from_utf8(buf).unwrap();
-        s.trim().strip_suffix(';').unwrap_or(s.trim()).trim().to_string()
+        s.trim()
+            .strip_suffix(';')
+            .unwrap_or(s.trim())
+            .trim()
+            .to_string()
     }
 
     /// A program that sinks `inner` after defining a decoder stub returning "abc".
@@ -563,7 +594,17 @@ mod tests {
     /// (rquickjs, never bare node).
     #[test]
     fn evaluates_to_value_with_decoder_anchor() {
-        let values = [0u32, 1, 2, 42, 255, 65535, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff];
+        let values = [
+            0u32,
+            1,
+            2,
+            42,
+            255,
+            65535,
+            0x7fff_ffff,
+            0x8000_0000,
+            0xffff_ffff,
+        ];
         let anchor = OpaqueAnchor::decoder("_core");
         for seed in 0..24u64 {
             let mut rng = Rng::for_pass(seed, "opaque");

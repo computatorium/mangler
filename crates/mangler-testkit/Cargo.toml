@@ -5,14 +5,15 @@ edition = "2024"
 description = "Differential harness, corpus runner, proptest VM fuzz, and expansion/throughput bands."
 
 [features]
-# proptest is on by default; turn it off to drop the dep for a lean consumer that
-# only wants eval/corpus/golden. `cross-engine` enables the optional second-engine
-# (subprocess) differential path — OFF by default (see crate rustdoc: NEVER run
-# bare `node` in tests).
+# Engine execution is controlled by explicit environment paths, not a feature
+# that CI can accidentally omit. Only property-based generation is optional.
 default = ["proptest"]
 proptest = ["dep:proptest"]
-cross-engine = []
 
 [dependencies]
 rquickjs = { workspace = true }
 proptest = { workspace = true, optional = true }
+
+tempfile = "3"
+serde_json = "1"
+libc = "0.2"

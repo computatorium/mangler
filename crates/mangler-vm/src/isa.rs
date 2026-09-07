@@ -26,17 +26,17 @@
 
 use swc_core::ecma::ast::{AssignOp, BinaryOp, UnaryOp};
 
-/// Number of top-level opcode slots in the dispatch space (canonical `0..37`).
+/// Number of top-level opcode slots in the dispatch space (canonical `0..N_OPCODES`).
 /// The opcode permutation is sized `N_OPCODES + junk`; the first `N_OPCODES`
 /// entries are the real opcodes.
-pub const N_OPCODES: usize = 37;
+pub const N_OPCODES: usize = 47;
 
 /// Number of binary-operator sub-codes (the inner `switch` under the `Bin`
 /// opcode). Permuted per file (C2).
 pub const N_BIN_OPS: usize = 20;
 
 /// Number of unary-operator sub-codes (under `Un`). Permuted per file (C2).
-pub const N_UN_OPS: usize = 7;
+pub const N_UN_OPS: usize = 10;
 
 /// Upvalue-slot sentinel meaning "the closure currently being built" — used for a
 /// named function expression's self reference. Chosen well above any real slot
@@ -218,7 +218,7 @@ opcodes! {
     BreakUnwind(u32, u32) = 28 => Binary,
     /// Push an Array of the call arguments from index `fixed` onward (`...rest`).
     LoadRest(u32) = 29 => Unary,
-    /// Pop an object, push an array of its enumerable keys (a `for-in` snapshot).
+    /// Pop an object, push a suspended native `for-in` iterator.
     EnumKeys = 30 => Nullary,
     DeleteProp = 31 => Nullary,
     /// D1 boxed-cell: `L[slot] = [L[slot]]` (box current slot value in place).
@@ -253,6 +253,26 @@ opcodes! {
         is_arrow: bool,
         up_slots: Vec<u32>,
     } = 36 => NativeClosure,
+    /// Copy enumerable own data properties from the source into the stacked target.
+    CopyProps = 37 => Nullary,
+    /// Create an uninitialized lexical cell; operand is `slot * 2 + is_const`.
+    BeginLexical(u32) = 38 => Unary,
+    /// Initialize a lexical cell from the stack top, retaining the value.
+    InitLocal(u32) = 39 => Unary,
+    /// Create the next loop iteration binding initialized from the old value.
+    CloneLexical(u32) = 40 => Unary,
+    /// Push the actual arguments object.
+    LoadArguments = 41 => Nullary,
+    /// Call the stacked receiver/function with a prepared argument array.
+    CallArray = 42 => Nullary,
+    /// Copy own enumerable properties, skipping keys in the stacked exclusion array.
+    RestProps = 43 => Nullary,
+    /// Throw for a nullish stack top, including an empty destructuring pattern.
+    RequireObject = 44 => Nullary,
+    /// Save the pending completion while a finalizer executes independently.
+    BeginFinally = 45 => Nullary,
+    /// Step an iterator without reading the result value (destructuring elision).
+    IterElide = 46 => Nullary,
 }
 
 impl Instr {
@@ -260,8 +280,9 @@ impl Instr {
     /// for the closure form, its upvalue count.
     pub fn size(&self) -> u32 {
         let n_up = match self {
-            Instr::MakeClosure { up_slots, .. }
-            | Instr::MakeNativeClosure { up_slots, .. } => up_slots.len(),
+            Instr::MakeClosure { up_slots, .. } | Instr::MakeNativeClosure { up_slots, .. } => {
+                up_slots.len()
+            }
             _ => 0,
         };
         self.layout().size_with(n_up)
@@ -305,26 +326,106 @@ struct UnRow {
 /// [`bin_expr_js`] (the JS the interpreter emits). The ordering is load-bearing
 /// (the sub-codes are baked into serialized bytecode).
 const BIN_OPS: [BinRow; N_BIN_OPS] = [
-    BinRow { op: BinaryOp::Add, js: "a+b", assign: Some(AssignOp::AddAssign) },
-    BinRow { op: BinaryOp::Sub, js: "a-b", assign: Some(AssignOp::SubAssign) },
-    BinRow { op: BinaryOp::Mul, js: "a*b", assign: Some(AssignOp::MulAssign) },
-    BinRow { op: BinaryOp::Div, js: "a/b", assign: Some(AssignOp::DivAssign) },
-    BinRow { op: BinaryOp::Mod, js: "a%b", assign: Some(AssignOp::ModAssign) },
-    BinRow { op: BinaryOp::Exp, js: "a**b", assign: Some(AssignOp::ExpAssign) },
-    BinRow { op: BinaryOp::EqEq, js: "a==b", assign: None },
-    BinRow { op: BinaryOp::EqEqEq, js: "a===b", assign: None },
-    BinRow { op: BinaryOp::NotEq, js: "a!=b", assign: None },
-    BinRow { op: BinaryOp::NotEqEq, js: "a!==b", assign: None },
-    BinRow { op: BinaryOp::Lt, js: "a<b", assign: None },
-    BinRow { op: BinaryOp::LtEq, js: "a<=b", assign: None },
-    BinRow { op: BinaryOp::Gt, js: "a>b", assign: None },
-    BinRow { op: BinaryOp::GtEq, js: "a>=b", assign: None },
-    BinRow { op: BinaryOp::BitAnd, js: "a&b", assign: Some(AssignOp::BitAndAssign) },
-    BinRow { op: BinaryOp::BitOr, js: "a|b", assign: Some(AssignOp::BitOrAssign) },
-    BinRow { op: BinaryOp::BitXor, js: "a^b", assign: Some(AssignOp::BitXorAssign) },
-    BinRow { op: BinaryOp::LShift, js: "a<<b", assign: Some(AssignOp::LShiftAssign) },
-    BinRow { op: BinaryOp::RShift, js: "a>>b", assign: Some(AssignOp::RShiftAssign) },
-    BinRow { op: BinaryOp::ZeroFillRShift, js: "a>>>b", assign: Some(AssignOp::ZeroFillRShiftAssign) },
+    BinRow {
+        op: BinaryOp::Add,
+        js: "a+b",
+        assign: Some(AssignOp::AddAssign),
+    },
+    BinRow {
+        op: BinaryOp::Sub,
+        js: "a-b",
+        assign: Some(AssignOp::SubAssign),
+    },
+    BinRow {
+        op: BinaryOp::Mul,
+        js: "a*b",
+        assign: Some(AssignOp::MulAssign),
+    },
+    BinRow {
+        op: BinaryOp::Div,
+        js: "a/b",
+        assign: Some(AssignOp::DivAssign),
+    },
+    BinRow {
+        op: BinaryOp::Mod,
+        js: "a%b",
+        assign: Some(AssignOp::ModAssign),
+    },
+    BinRow {
+        op: BinaryOp::Exp,
+        js: "a**b",
+        assign: Some(AssignOp::ExpAssign),
+    },
+    BinRow {
+        op: BinaryOp::EqEq,
+        js: "a==b",
+        assign: None,
+    },
+    BinRow {
+        op: BinaryOp::EqEqEq,
+        js: "a===b",
+        assign: None,
+    },
+    BinRow {
+        op: BinaryOp::NotEq,
+        js: "a!=b",
+        assign: None,
+    },
+    BinRow {
+        op: BinaryOp::NotEqEq,
+        js: "a!==b",
+        assign: None,
+    },
+    BinRow {
+        op: BinaryOp::Lt,
+        js: "a<b",
+        assign: None,
+    },
+    BinRow {
+        op: BinaryOp::LtEq,
+        js: "a<=b",
+        assign: None,
+    },
+    BinRow {
+        op: BinaryOp::Gt,
+        js: "a>b",
+        assign: None,
+    },
+    BinRow {
+        op: BinaryOp::GtEq,
+        js: "a>=b",
+        assign: None,
+    },
+    BinRow {
+        op: BinaryOp::BitAnd,
+        js: "a&b",
+        assign: Some(AssignOp::BitAndAssign),
+    },
+    BinRow {
+        op: BinaryOp::BitOr,
+        js: "a|b",
+        assign: Some(AssignOp::BitOrAssign),
+    },
+    BinRow {
+        op: BinaryOp::BitXor,
+        js: "a^b",
+        assign: Some(AssignOp::BitXorAssign),
+    },
+    BinRow {
+        op: BinaryOp::LShift,
+        js: "a<<b",
+        assign: Some(AssignOp::LShiftAssign),
+    },
+    BinRow {
+        op: BinaryOp::RShift,
+        js: "a>>b",
+        assign: Some(AssignOp::RShiftAssign),
+    },
+    BinRow {
+        op: BinaryOp::ZeroFillRShift,
+        js: "a>>>b",
+        assign: Some(AssignOp::ZeroFillRShiftAssign),
+    },
 ];
 
 /// The ordered unary-operator table — the canonical sub-code is the row index.
@@ -332,20 +433,56 @@ const BIN_OPS: [BinRow; N_BIN_OPS] = [
 /// it has no source `UnaryOp`, so its `op` is a placeholder never matched by
 /// [`un_op_code`] (which only maps the real `UnaryOp`s 0..=5).
 const UN_OPS: [UnRow; N_UN_OPS] = [
-    UnRow { op: UnaryOp::Minus, js: "-a" },
-    UnRow { op: UnaryOp::Bang, js: "!a" },
-    UnRow { op: UnaryOp::Tilde, js: "~a" },
-    UnRow { op: UnaryOp::TypeOf, js: "typeof a" },
-    UnRow { op: UnaryOp::Void, js: "void a" },
-    UnRow { op: UnaryOp::Plus, js: "+a" },
+    UnRow {
+        op: UnaryOp::Minus,
+        js: "-a",
+    },
+    UnRow {
+        op: UnaryOp::Bang,
+        js: "!a",
+    },
+    UnRow {
+        op: UnaryOp::Tilde,
+        js: "~a",
+    },
+    UnRow {
+        op: UnaryOp::TypeOf,
+        js: "typeof a",
+    },
+    UnRow {
+        op: UnaryOp::Void,
+        js: "void a",
+    },
+    UnRow {
+        op: UnaryOp::Plus,
+        js: "+a",
+    },
     // Sub-code 6: runtime String() coercion (template-literal interpolation). No
     // source UnaryOp maps here; `un_op_code` never returns 6. `Void` is an inert
     // placeholder for the `op` field (unused for this row).
-    UnRow { op: UnaryOp::Void, js: "String(a)" },
+    UnRow {
+        op: UnaryOp::Void,
+        js: "`${a}`",
+    },
+    UnRow {
+        op: UnaryOp::Void,
+        js: "++a",
+    },
+    UnRow {
+        op: UnaryOp::Void,
+        js: "--a",
+    },
+    UnRow {
+        op: UnaryOp::Void,
+        js: "Reflect.ownKeys({[a]:0})[0]",
+    },
 ];
 
 /// Canonical sub-code for the runtime `String(a)` coercion (template ToString).
 pub const UN_TO_STRING: u8 = 6;
+pub const UN_INCREMENT: u8 = 7;
+pub const UN_DECREMENT: u8 = 8;
+pub const UN_TO_PROPERTY_KEY: u8 = 9;
 
 /// binop → canonical sub-code stored in `Bin { op }`. `None` => caller bails
 /// (`&&`/`||`/`??`/`in`/`instanceof` are not in the table).
@@ -395,7 +532,11 @@ mod tests {
         // Discriminants are a permutation of 0..N_OPCODES (unique + dense).
         let mut discs: Vec<usize> = OPCODE_TABLE.iter().map(|(d, _)| *d).collect();
         discs.sort_unstable();
-        assert_eq!(discs, (0..N_OPCODES).collect::<Vec<_>>(), "discriminants must densely cover 0..N_OPCODES");
+        assert_eq!(
+            discs,
+            (0..N_OPCODES).collect::<Vec<_>>(),
+            "discriminants must densely cover 0..N_OPCODES"
+        );
         assert_eq!(OPCODE_TABLE.len(), N_OPCODES);
 
         // size_with agrees with the layout for each fixed form.
@@ -443,12 +584,32 @@ mod tests {
             Instr::BreakUnwind(0, 0),
             Instr::LoadRest(0),
             Instr::EnumKeys,
+            Instr::CopyProps,
+            Instr::BeginLexical(0),
+            Instr::InitLocal(0),
+            Instr::CloneLexical(0),
+            Instr::LoadArguments,
+            Instr::CallArray,
+            Instr::RestProps,
+            Instr::RequireObject,
+            Instr::BeginFinally,
+            Instr::IterElide,
             Instr::DeleteProp,
             Instr::MakeCell(0),
             Instr::LoadCell(0),
             Instr::StoreCell(0),
-            Instr::MakeClosure { child: 0, is_arrow: false, cap_start: 0, pcount: 0, up_slots: vec![1, 2] },
-            Instr::MakeNativeClosure { const_idx: 0, is_arrow: false, up_slots: vec![1, 2] },
+            Instr::MakeClosure {
+                child: 0,
+                is_arrow: false,
+                cap_start: 0,
+                pcount: 0,
+                up_slots: vec![1, 2],
+            },
+            Instr::MakeNativeClosure {
+                const_idx: 0,
+                is_arrow: false,
+                up_slots: vec![1, 2],
+            },
         ];
         assert_eq!(samples.len(), N_OPCODES, "one sample per opcode");
         // Each discriminant appears exactly once across the samples.
@@ -459,17 +620,36 @@ mod tests {
             seen[d] = true;
             // size() matches the declared layout for this instance.
             let n_up = match ins {
-                Instr::MakeClosure { up_slots, .. }
-                | Instr::MakeNativeClosure { up_slots, .. } => up_slots.len(),
+                Instr::MakeClosure { up_slots, .. } | Instr::MakeNativeClosure { up_slots, .. } => {
+                    up_slots.len()
+                }
                 _ => 0,
             };
-            assert_eq!(ins.size(), ins.layout().size_with(n_up), "size/layout mismatch for {ins:?}");
+            assert_eq!(
+                ins.size(),
+                ins.layout().size_with(n_up),
+                "size/layout mismatch for {ins:?}"
+            );
         }
         assert!(seen.iter().all(|&b| b), "every discriminant covered");
         // Spot-check the closure variable length: 5 fixed + 1 nUp + 2 slots = 8.
-        assert_eq!(samples[35].size(), 8);
+        assert_eq!(
+            samples
+                .iter()
+                .find(|i| matches!(i, Instr::MakeClosure { .. }))
+                .unwrap()
+                .size(),
+            8
+        );
         // MakeNativeClosure: 1 opcode + constIdx + isArrow + nUp + 2 slots = 6.
-        assert_eq!(samples[36].size(), 6);
+        assert_eq!(
+            samples
+                .iter()
+                .find(|i| matches!(i, Instr::MakeNativeClosure { .. }))
+                .unwrap()
+                .size(),
+            6
+        );
     }
 
     /// The Bin/Un operator tables: codes are dense, the Rust op→code maps invert
@@ -485,10 +665,16 @@ mod tests {
             assert_eq!(un_op_code(row.op), Some(i as u8), "un row {i}");
         }
         // The ToString sub-code (6) is never produced by un_op_code.
-        assert_eq!(un_expr_js(UN_TO_STRING as usize), "String(a)");
+        assert_eq!(un_expr_js(UN_TO_STRING as usize), "`${a}`");
         // Compound-assign reuses the same sub-code as the plain binary op.
-        assert_eq!(compound_op_code(AssignOp::AddAssign), bin_op_code(BinaryOp::Add));
-        assert_eq!(compound_op_code(AssignOp::BitXorAssign), bin_op_code(BinaryOp::BitXor));
+        assert_eq!(
+            compound_op_code(AssignOp::AddAssign),
+            bin_op_code(BinaryOp::Add)
+        );
+        assert_eq!(
+            compound_op_code(AssignOp::BitXorAssign),
+            bin_op_code(BinaryOp::BitXor)
+        );
         // Non-table ops bail.
         assert_eq!(bin_op_code(BinaryOp::LogicalAnd), None);
         assert_eq!(bin_op_code(BinaryOp::In), None);

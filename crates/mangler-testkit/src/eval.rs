@@ -1,249 +1,370 @@
-//! rquickjs eval-and-compare with `Object.is` (SameValue) semantics.
+//! Bounded behavioral observations from independent QuickJS runtimes.
 //!
-//! Ported and generalized from the repo's `tests/common/mod.rs` /
-//! `tests/differential.rs` harness. The core operation: run an *original* and a
-//! *transformed* JS source string, each in its own fresh QuickJS runtime, capture
-//! a comparable value from each, and compare them with `Object.is` so that `-0` is
-//! distinguished from `0` and `NaN` matches `NaN` (the blind spots a `String(...)`
-//! comparison silently collapses). Thrown errors are handled symmetrically: if both
-//! programs throw, they are equal iff the (engine-normalized) error messages match.
-//!
-//! # Capture modes
-//! Two ways to extract the comparable value (see [`CaptureMode`]):
-//! * [`CaptureMode::Completion`] — the program's last-expression completion value,
-//!   coerced through `Object.is`. Matches the `tests/differential.rs` fixtures,
-//!   which end in a trailing-expression IIFE.
-//! * [`CaptureMode::Sink`] — a designated global (default `globalThis.__out`), set
-//!   by the program as a side effect. Matches the `tests/corpus/` files, which are
-//!   IIFEs that assign their JSON result to `globalThis.__out`.
-//!
-//! # rquickjs limitations discovered
-//! * QuickJS is ES2020-ish: no top-level `await`, no DOM/`window`/`document`. Corpus
-//!   files that need DOM build a self-contained fake `document`; that is the corpus
-//!   author's responsibility, not this harness's.
-//! * Error *messages* differ across engines (and even across QuickJS versions), so
-//!   symmetric-throw equality compares the message text the same engine produces for
-//!   both programs — it is a *same-engine* differential, not a spec assertion.
-//! * The cross-value `Object.is` comparison marshals the captured value through a
-//!   third context as a string for non-primitive completion values; for the JSON-
-//!   string-returning fixtures this is exactly `===`. See [`eval_same_value`].
+//! Primitive results use an injective, type-tagged wire encoding (including -0,
+//! NaN, BigInt and lone UTF-16 surrogates). Objects/functions/symbols are not
+//! silently stringified: callers must explicitly serialize their result. Console
+//! calls and the optional `globalThis.__trace` record observable side-effect order,
+//! including effects before a throw. This is a fixture observation contract, not
+//! a claim to compare every possible JavaScript side effect.
 
-use rquickjs::{Context, Runtime};
+use rquickjs::{Context, Ctx, Function, Object, Persistent, Runtime, Value};
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
-/// Which value to capture from an evaluated program for comparison.
+/// Which value to read after all queued microtasks have settled.
 #[derive(Clone, Debug)]
 pub enum CaptureMode {
-    /// The completion value of the final expression, coerced to a string for the
-    /// cross-context `Object.is` comparison. Suits trailing-expression IIFEs.
     Completion,
-    /// A designated global set by the program as a side effect, e.g.
-    /// `globalThis.__out = JSON.stringify(result)`. The string is the global name's
-    /// JS expression (default `"globalThis.__out"`).
     Sink(String),
 }
 
 impl Default for CaptureMode {
     fn default() -> Self {
-        CaptureMode::Sink("globalThis.__out".to_string())
+        Self::Sink("globalThis.__out".into())
     }
 }
-
 impl CaptureMode {
-    /// The default sink mode reading `globalThis.__out` (the corpus convention).
     pub fn sink() -> Self {
-        CaptureMode::default()
+        Self::default()
     }
-
-    /// Completion-value mode (trailing-expression fixtures).
     pub fn completion() -> Self {
-        CaptureMode::Completion
+        Self::Completion
     }
 }
 
-/// The outcome of evaluating one program: either the captured value (as a string)
-/// or a thrown error (as the engine's normalized message).
+/// Per-program limits, applied to original and transformed code independently.
+#[derive(Clone, Copy, Debug)]
+pub struct EvalLimits {
+    pub timeout: Duration,
+    pub memory_bytes: usize,
+    pub stack_bytes: usize,
+    pub max_jobs: usize,
+}
+impl Default for EvalLimits {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(5),
+            memory_bytes: 64 * 1024 * 1024,
+            stack_bytes: 512 * 1024,
+            max_jobs: 10_000,
+        }
+    }
+}
+
+/// An incomplete run is never evidence of equivalence, even against itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Outcome {
+pub enum Failure {
+    Timeout,
+    JobLimit,
+    MemoryLimit,
+    StackLimit,
+    UnsupportedCapture,
+    Engine(String),
+}
+
+/// Values and thrown values are encoded by the same type-tagged protocol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
     Value(String),
     Threw(String),
+    Incomplete(Failure),
 }
 
-/// The result of a differential eval-and-compare between two programs.
+/// A complete observation includes effects before an exception and unhandled
+/// promise rejections. Handled rejections are removed after the job queue settles.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Evaluation {
+    pub outcome: Outcome,
+    pub trace: String,
+    pub rejections: Vec<String>,
+}
+impl Evaluation {
+    pub fn is_complete(&self) -> bool {
+        !matches!(self.outcome, Outcome::Incomplete(_))
+    }
+    fn incomplete(failure: Failure) -> Self {
+        Self {
+            outcome: Outcome::Incomplete(failure),
+            trace: String::new(),
+            rejections: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DiffResult {
-    /// True iff the two programs are behaviorally equal under the chosen capture
-    /// mode and SameValue semantics (including symmetric throw with equal message).
     pub equal: bool,
-    /// Human-readable description of *what* the original produced (a value or an
-    /// error), for diagnostics.
     pub original: String,
-    /// Same for the transformed program.
     pub transformed: String,
-    /// A one-line reason, suitable for a panic/assert message.
     pub reason: String,
 }
-
 impl DiffResult {
-    /// True when the programs diverged.
     pub fn is_divergent(&self) -> bool {
         !self.equal
     }
 }
 
-/// Evaluate one program in a fresh runtime and capture its [`Outcome`].
-///
-/// Completion mode coerces the completion value to a String inside the engine via
-/// `Object.is`-friendly marshaling: the program is wrapped so its completion value
-/// is stored, then read back as a string. Sink mode reads the designated global.
-fn run(code: &str, mode: &CaptureMode) -> Outcome {
-    let rt = match Runtime::new() {
-        Ok(rt) => rt,
-        Err(e) => return Outcome::Threw(format!("runtime init failed: {e:?}")),
-    };
-    let ctx = match Context::full(&rt) {
-        Ok(c) => c,
-        Err(e) => return Outcome::Threw(format!("context init failed: {e:?}")),
-    };
+// Shared with the real-engine harness. Keep the encoder in a closure created
+// before user code, so replacing JSON/String/Array globals cannot forge a result.
+pub const OBSERVER_SOURCE: &str = include_str!("observer.js");
 
-    // Evaluate the program first (driving any pending jobs so microtasks settle),
-    // then read the captured value. Errors at either step become `Threw`.
-    let outcome = ctx.with(|ctx| -> Outcome {
-        // Run the program. In completion mode we need the trailing value, so eval
-        // the body as an expression statement and read it; QuickJS `eval` returns
-        // the completion value, which we coerce to a string.
-        let read_expr = match mode {
-            CaptureMode::Completion => {
-                // Stash the completion value on a private global, then String() it.
-                // Wrapping in an indirect eval keeps `let`/`const` at the program's
-                // top level from leaking into our reader expression.
-                match ctx.eval::<rquickjs::Value, _>(code) {
-                    Ok(v) => {
-                        if let Err(e) = ctx.globals().set("__tk_completion", v) {
-                            return Outcome::Threw(format!("{e:?}"));
-                        }
-                        "__tk_completion"
-                    }
-                    Err(e) => return throw_message(&ctx, e),
-                }
-            }
-            CaptureMode::Sink(name) => {
-                if let Err(e) = ctx.eval::<(), _>(code) {
-                    return throw_message(&ctx, e);
-                }
-                name.as_str()
-            }
-        };
-
-        // Coerce the captured value to a string for cross-context comparison, while
-        // PRESERVING the SameValue-relevant distinctions: tag `-0` and `NaN` so they
-        // do not collapse into `"0"` / a plain number string.
-        let coercer = format!(
-            "(function(__v){{ \
-               if (typeof __v === 'number') {{ \
-                 if (__v === 0 && 1/__v === -Infinity) return '\\u0000-0'; \
-                 if (__v !== __v) return '\\u0000NaN'; \
-                 return '\\u0000n:' + String(__v); \
-               }} \
-               if (typeof __v === 'bigint') return '\\u0000b:' + String(__v); \
-               if (__v === undefined) return '\\u0000undefined'; \
-               if (__v === null) return '\\u0000null'; \
-               return String(__v); \
-             }})({read_expr})"
-        );
-        match ctx.eval::<String, _>(coercer.as_str()) {
-            Ok(s) => Outcome::Value(s),
-            Err(e) => throw_message(&ctx, e),
-        }
-    });
-
-    // Drain any still-pending jobs (defensive; corpus programs are synchronous).
-    while rt.is_job_pending() {
-        let _ = rt.execute_pending_job();
+fn engine_failure(ctx: &Ctx<'_>, err: rquickjs::Error, timed_out: bool) -> Failure {
+    if timed_out {
+        return Failure::Timeout;
     }
-    outcome
-}
-
-/// Normalize a thrown rquickjs error into a stable message string. Prefers the JS
-/// exception's `.message` (engine-portable) over the Rust-side `{:?}` (which embeds
-/// stack/format noise).
-fn throw_message(ctx: &rquickjs::Ctx, err: rquickjs::Error) -> Outcome {
-    if let rquickjs::Error::Exception = err {
+    if matches!(err, rquickjs::Error::Allocation) {
+        return Failure::MemoryLimit;
+    }
+    if matches!(err, rquickjs::Error::Exception) {
         let exc = ctx.catch();
-        // Try to read `.message`; fall back to String(exc).
-        let msg: String = exc
-            .as_object()
-            .and_then(|o| o.get::<_, String>("message").ok())
-            .or_else(|| exc.as_string().and_then(|s| s.to_string().ok()))
-            .unwrap_or_else(|| "<exception>".to_string());
-        Outcome::Threw(msg)
+        if let Some(obj) = exc.as_object() {
+            let msg = obj.get::<_, String>("message").unwrap_or_default();
+            if msg.contains("out of memory") {
+                return Failure::MemoryLimit;
+            }
+            if msg.contains("stack overflow") || msg.contains("Maximum call stack size exceeded") {
+                return Failure::StackLimit;
+            }
+            if msg.contains("testkit: unsupported capture") {
+                return Failure::UnsupportedCapture;
+            }
+            return Failure::Engine(msg);
+        }
+    }
+    Failure::Engine(format!("{err:?}"))
+}
+
+fn encode<'js>(
+    observer: &Object<'js>,
+    value: Value<'js>,
+    thrown: bool,
+) -> rquickjs::Result<String> {
+    let f: Function = observer.get(if thrown { "thrown" } else { "value" })?;
+    f.call((value,))
+}
+
+type Saved = Persistent<Value<'static>>;
+
+/// Evaluate a script with hard QuickJS time/memory/stack limits and a bounded
+/// microtask queue. The sink is read only after settlement. No process-global state
+/// is changed, so independent tests can execute concurrently.
+pub fn evaluate_with_limits(code: &str, mode: &CaptureMode, limits: EvalLimits) -> Evaluation {
+    // Reserve enough for QuickJS bootstrap and the observation machinery. In
+    // rquickjs 0.12, failing JS_NewRuntime2's initial allocation dereferences its
+    // null result before returning Error::Allocation; reject impossible budgets
+    // before crossing that FFI boundary. Zero stack size disables QuickJS's limit.
+    if limits.memory_bytes < 1024 * 1024 {
+        return Evaluation::incomplete(Failure::MemoryLimit);
+    }
+    if limits.stack_bytes < 64 * 1024 {
+        return Evaluation::incomplete(Failure::StackLimit);
+    }
+    let memory_exceeded = Rc::new(Cell::new(false));
+    let rt = match Runtime::new_with_alloc(crate::allocation::BudgetAllocator::new(
+        limits.memory_bytes,
+        memory_exceeded.clone(),
+    )) {
+        Ok(rt) => rt,
+        Err(e) => {
+            return Evaluation::incomplete(if memory_exceeded.get() {
+                Failure::MemoryLimit
+            } else {
+                Failure::Engine(format!("runtime init: {e}"))
+            });
+        }
+    };
+    rt.set_max_stack_size(limits.stack_bytes);
+    let started = Instant::now();
+    let timed_out = Rc::new(Cell::new(false));
+    let flag = timed_out.clone();
+    rt.set_interrupt_handler(Some(Box::new(move || {
+        let expired = started.elapsed() >= limits.timeout;
+        if expired {
+            flag.set(true);
+        }
+        expired
+    })));
+    let ctx = match Context::full(&rt) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            return Evaluation::incomplete(
+                if memory_exceeded.get() || matches!(e, rquickjs::Error::Allocation) {
+                    Failure::MemoryLimit
+                } else {
+                    Failure::Engine(format!("context init: {e}"))
+                },
+            );
+        }
+    };
+    let pending = Rc::new(RefCell::new(Vec::<(Saved, Saved)>::new()));
+    let tracked = pending.clone();
+    rt.set_host_promise_rejection_tracker(Some(Box::new(move |ctx, promise, reason, handled| {
+        let promise = Persistent::save(&ctx, promise);
+        let mut list = tracked.borrow_mut();
+        if handled {
+            list.retain(|(p, _)| p != &promise);
+        } else {
+            list.push((promise, Persistent::save(&ctx, reason)));
+        }
+    })));
+
+    // All persistent values are dropped and the tracker unregistered before the
+    // runtime is freed (QuickJS rejects outstanding references at runtime drop).
+    let result = (|| {
+        let observer = ctx
+            .with(|ctx| {
+                ctx.eval::<Object, _>(OBSERVER_SOURCE)
+                    .map(|v| Persistent::save(&ctx, v))
+                    .map_err(|e| engine_failure(&ctx, e, timed_out.get()))
+            })
+            .map_err(Evaluation::incomplete)?;
+        let mut failure = None;
+        let mut thrown = None;
+        let completion = ctx.with(|ctx| {
+            let mut options = rquickjs::context::EvalOptions::default();
+            options.strict = false;
+            match ctx.eval_with_options::<Value, _>(code, options) {
+                Ok(value) => Some(Persistent::save(&ctx, value)),
+                Err(rquickjs::Error::Exception) => {
+                    let value = ctx.catch();
+                    if timed_out.get() {
+                        failure = Some(Failure::Timeout);
+                    } else if let Some(obj) = value.as_object() {
+                        let msg = obj.get::<_, String>("message").unwrap_or_default();
+                        if msg.contains("out of memory") {
+                            failure = Some(Failure::MemoryLimit);
+                        } else if msg.contains("stack overflow")
+                            || msg.contains("Maximum call stack size exceeded")
+                        {
+                            failure = Some(Failure::StackLimit);
+                        } else if msg.contains("testkit: unsupported capture") {
+                            failure = Some(Failure::UnsupportedCapture);
+                        }
+                    }
+                    thrown = Some(Persistent::save(&ctx, value));
+                    None
+                }
+                Err(e) => {
+                    failure = Some(engine_failure(&ctx, e, timed_out.get()));
+                    None
+                }
+            }
+        });
+        let mut jobs = 0;
+        while failure.is_none() && rt.is_job_pending() {
+            if started.elapsed() >= limits.timeout {
+                failure = Some(Failure::Timeout);
+                break;
+            }
+            if jobs == limits.max_jobs {
+                failure = Some(Failure::JobLimit);
+                break;
+            }
+            jobs += 1;
+            if let Err(error) = rt.execute_pending_job() {
+                error.0.with(|ctx| {
+                    let value = ctx.catch();
+                    if timed_out.get() {
+                        failure = Some(Failure::Timeout);
+                    } else {
+                        thrown = Some(Persistent::save(&ctx, value));
+                    }
+                });
+            }
+        }
+        if timed_out.get() {
+            failure = Some(Failure::Timeout);
+        }
+        if let Some(failure) = failure {
+            return Err(Evaluation::incomplete(failure));
+        }
+        ctx.with(|ctx| -> Result<Evaluation, Evaluation> {
+            let capture = || -> rquickjs::Result<Evaluation> {
+                let observer = observer.restore(&ctx)?;
+                let outcome = if let Some(value) = thrown {
+                    Outcome::Threw(encode(&observer, value.restore(&ctx)?, true)?)
+                } else {
+                    let value = match mode {
+                        CaptureMode::Completion => {
+                            completion.expect("successful evaluation").restore(&ctx)?
+                        }
+                        CaptureMode::Sink(expr) => ctx.eval::<Value, _>(expr.as_str())?,
+                    };
+                    Outcome::Value(encode(&observer, value, false)?)
+                };
+                let trace: Function = observer.get("trace")?;
+                let trace = trace.call(())?;
+                let mut rejections = Vec::new();
+                for (_, reason) in pending.borrow_mut().drain(..) {
+                    rejections.push(encode(&observer, reason.restore(&ctx)?, true)?);
+                }
+                Ok(Evaluation {
+                    outcome,
+                    trace,
+                    rejections,
+                })
+            };
+            capture().map_err(|e| Evaluation::incomplete(engine_failure(&ctx, e, timed_out.get())))
+        })
+    })()
+    .unwrap_or_else(|e| e);
+    rt.set_host_promise_rejection_tracker(None);
+    pending.borrow_mut().clear();
+    if memory_exceeded.get() {
+        Evaluation::incomplete(Failure::MemoryLimit)
+    } else if result.rejections.iter().any(|value| {
+        value.starts_with("[\"error\",")
+            && (value.contains("stack overflow")
+                || value.contains("Maximum call stack size exceeded"))
+    }) {
+        Evaluation::incomplete(Failure::StackLimit)
     } else {
-        Outcome::Threw(format!("{err:?}"))
+        result
     }
 }
 
-fn describe(o: &Outcome) -> String {
-    match o {
-        Outcome::Value(v) => format!("value {v:?}"),
-        Outcome::Threw(m) => format!("threw {m:?}"),
-    }
+pub fn evaluate(code: &str, mode: &CaptureMode) -> Evaluation {
+    evaluate_with_limits(code, mode, EvalLimits::default())
 }
 
-/// Evaluate `original` and `transformed` and compare them under the default sink
-/// capture mode (`globalThis.__out`). Returns a [`DiffResult`]; never panics.
-///
-/// Equality is SameValue (`Object.is`) over the captured value, with symmetric
-/// throw: if both throw, they are equal iff the engine-normalized messages match.
-/// A value-vs-throw mismatch is always unequal.
 pub fn eval_same_value(original: &str, transformed: &str) -> DiffResult {
     eval_same_value_with(original, transformed, &CaptureMode::default())
 }
-
-/// As [`eval_same_value`] but with an explicit [`CaptureMode`].
 pub fn eval_same_value_with(original: &str, transformed: &str, mode: &CaptureMode) -> DiffResult {
-    let a = run(original, mode);
-    let b = run(transformed, mode);
-    // Because `run` already coerced values to a tagged canonical string that
-    // preserves `-0`/`NaN`/bigint distinctions, structural string equality of the
-    // two `Value` outcomes is exactly `Object.is` on the original values.
-    let equal = a == b;
-    let reason = if equal {
-        "equal".to_string()
+    eval_same_value_with_limits(original, transformed, mode, EvalLimits::default())
+}
+pub fn eval_same_value_with_limits(
+    original: &str,
+    transformed: &str,
+    mode: &CaptureMode,
+    limits: EvalLimits,
+) -> DiffResult {
+    let a = evaluate_with_limits(original, mode, limits);
+    let b = evaluate_with_limits(transformed, mode, limits);
+    let equal = a.is_complete() && b.is_complete() && a == b;
+    let reason = if !a.is_complete() || !b.is_complete() {
+        "evaluation incomplete; equivalence unproven"
+    } else if equal {
+        "equal"
     } else {
-        match (&a, &b) {
-            (Outcome::Value(_), Outcome::Threw(_)) => {
-                "original produced a value but transformed threw".to_string()
-            }
-            (Outcome::Threw(_), Outcome::Value(_)) => {
-                "original threw but transformed produced a value".to_string()
-            }
-            (Outcome::Threw(x), Outcome::Threw(y)) => {
-                format!("both threw but messages differ: {x:?} vs {y:?}")
-            }
-            (Outcome::Value(_), Outcome::Value(_)) => {
-                "values differ under Object.is (SameValue)".to_string()
-            }
-        }
+        "observed values, exceptions, rejections or side effects differ"
     };
     DiffResult {
         equal,
-        original: describe(&a),
-        transformed: describe(&b),
-        reason,
+        original: format!("{a:?}"),
+        transformed: format!("{b:?}"),
+        reason: reason.into(),
     }
 }
-
-/// Panic with a descriptive message unless `original` and `transformed` are
-/// behaviorally equal under the default sink capture mode. For use in `#[test]`s.
 pub fn assert_behaviorally_equal(original: &str, transformed: &str) {
     assert_behaviorally_equal_with(original, transformed, &CaptureMode::default())
 }
-
-/// As [`assert_behaviorally_equal`] but with an explicit [`CaptureMode`].
 pub fn assert_behaviorally_equal_with(original: &str, transformed: &str, mode: &CaptureMode) {
     let r = eval_same_value_with(original, transformed, mode);
     assert!(
         r.equal,
-        "behavioral divergence: {}\n  original:    {}\n  transformed: {}\n--- transformed source ---\n{}",
+        "behavioral divergence: {}\n  original: {}\n  transformed: {}\n--- transformed source ---\n{}",
         r.reason, r.original, r.transformed, transformed
     );
 }
@@ -330,5 +451,211 @@ mod tests {
         let a = "globalThis.__out = undefined;";
         let b = "globalThis.__out = 'undefined';";
         assert!(eval_same_value(a, b).is_divergent());
+    }
+    #[test]
+    fn type_tags_cannot_collide_with_user_strings() {
+        for (a, b) in [
+            ("true", "'true'"),
+            ("false", "'false'"),
+            ("1", "'\\u0000n:1'"),
+            ("1n", "'\\u0000b:1'"),
+            ("null", "'\\u0000null'"),
+            ("undefined", "'\\u0000undefined'"),
+            ("'\\ud800'", "'\\ufffd'"),
+        ] {
+            let r = eval_same_value(
+                &format!("globalThis.__out={a}"),
+                &format!("globalThis.__out={b}"),
+            );
+            assert!(r.is_divergent(), "{a} must differ from {b}: {r:?}");
+        }
+        assert_eq!(
+            evaluate("globalThis.__out=true", &CaptureMode::sink()).outcome,
+            Outcome::Value(r#"["boolean",true]"#.into())
+        );
+    }
+
+    #[test]
+    fn thrown_values_and_error_types_are_preserved() {
+        for (a, b) in [
+            ("1", "2"),
+            ("1", "'1'"),
+            ("null", "undefined"),
+            ("new TypeError('x')", "new RangeError('x')"),
+            ("new Error('x')", "'x'"),
+        ] {
+            assert!(eval_same_value(&format!("throw {a}"), &format!("throw {b}")).is_divergent());
+        }
+        assert_eq!(
+            evaluate("throw 1", &CaptureMode::sink()).outcome,
+            Outcome::Threw(r#"["number","1"]"#.into())
+        );
+    }
+
+    #[test]
+    fn async_results_are_read_after_settlement() {
+        let a = "globalThis.__out='PENDING'; Promise.resolve().then(()=>globalThis.__out=1)";
+        let b = "globalThis.__out='PENDING'; Promise.resolve().then(()=>globalThis.__out=2)";
+        assert_eq!(
+            evaluate(a, &CaptureMode::sink()).outcome,
+            Outcome::Value(r#"["number","1"]"#.into())
+        );
+        assert!(eval_same_value(a, b).is_divergent());
+    }
+
+    #[test]
+    fn unhandled_async_errors_are_observed_and_handled_ones_removed() {
+        let bad = "globalThis.__out=1; Promise.resolve().then(()=>{throw new TypeError('async')})";
+        let good = "globalThis.__out=1";
+        let result = evaluate(bad, &CaptureMode::sink());
+        assert_eq!(
+            result.rejections,
+            vec![r#"["error",["string","TypeError"],["string","async"]]"#]
+        );
+        assert!(eval_same_value(bad, good).is_divergent());
+        let handled = "globalThis.__out=1; let p=Promise.reject(2); Promise.resolve().then(()=>p.catch(()=>{}))";
+        assert!(eval_same_value(handled, good).equal);
+    }
+
+    #[test]
+    fn trace_and_console_order_survive_throws() {
+        let a = "globalThis.__trace=['before']; console.log(1); throw 5";
+        let b = "globalThis.__trace=['after']; console.log(1); throw 5";
+        assert!(eval_same_value(a, b).is_divergent());
+        assert!(
+            eval_same_value(
+                "console.log(1);console.log(2);throw 5",
+                "console.log(2);console.log(1);throw 5"
+            )
+            .is_divergent()
+        );
+        assert!(
+            eval_same_value("console.log(true);throw 5", "console.log('true');throw 5")
+                .is_divergent()
+        );
+        assert!(eval_same_value(a, a).equal);
+    }
+
+    #[test]
+    fn objects_are_explicitly_unsupported_not_stringified() {
+        let r = evaluate("globalThis.__out={x:1}", &CaptureMode::sink());
+        assert_eq!(r.outcome, Outcome::Incomplete(Failure::UnsupportedCapture));
+        assert!(!eval_same_value("globalThis.__out={x:1}", "globalThis.__out={x:1}").equal);
+    }
+
+    #[test]
+    fn infinite_javascript_is_interrupted_and_never_equal() {
+        let limits = EvalLimits {
+            timeout: Duration::from_millis(20),
+            ..EvalLimits::default()
+        };
+        let start = Instant::now();
+        assert_eq!(
+            evaluate_with_limits("while(true){}", &CaptureMode::sink(), limits).outcome,
+            Outcome::Incomplete(Failure::Timeout)
+        );
+        assert!(
+            !eval_same_value_with_limits(
+                "while(true){}",
+                "while(true){}",
+                &CaptureMode::sink(),
+                limits
+            )
+            .equal
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn endlessly_queued_microtasks_hit_the_job_budget() {
+        let limits = EvalLimits {
+            max_jobs: 12,
+            ..EvalLimits::default()
+        };
+        let code = "function again(){Promise.resolve().then(again)} again()";
+        assert_eq!(
+            evaluate_with_limits(code, &CaptureMode::sink(), limits).outcome,
+            Outcome::Incomplete(Failure::JobLimit)
+        );
+        assert!(!eval_same_value_with_limits(code, code, &CaptureMode::sink(), limits).equal);
+    }
+
+    #[test]
+    fn allocations_hit_the_runtime_memory_limit() {
+        let limits = EvalLimits {
+            memory_bytes: 2 * 1024 * 1024,
+            ..EvalLimits::default()
+        };
+        let code = "const a=[]; for(let i=0;i<1000000;i++)a.push({i}); globalThis.__out=a.length";
+        assert_eq!(
+            evaluate_with_limits(code, &CaptureMode::sink(), limits).outcome,
+            Outcome::Incomplete(Failure::MemoryLimit)
+        );
+    }
+
+    #[test]
+    fn user_prototype_hooks_cannot_forge_observations() {
+        let prefix = "Array.prototype.toJSON=()=>''; Array.prototype.push=()=>{}; Object.prototype.toJSON=()=>''; ";
+        assert!(
+            eval_same_value(
+                &format!("{prefix}globalThis.__out=true"),
+                &format!("{prefix}globalThis.__out=false")
+            )
+            .is_divergent()
+        );
+        assert!(
+            eval_same_value(
+                &format!("{prefix}console.log(1)"),
+                &format!("{prefix}console.log(2)")
+            )
+            .is_divergent()
+        );
+    }
+    #[test]
+    fn caught_memory_failure_still_invalidates_the_observation() {
+        let limits = EvalLimits {
+            memory_bytes: 2 * 1024 * 1024,
+            ..EvalLimits::default()
+        };
+        let code =
+            "try {const a=[]; for(let i=0;i<1000000;i++)a.push({i})}catch(e){} globalThis.__out=1";
+        assert_eq!(
+            evaluate_with_limits(code, &CaptureMode::sink(), limits).outcome,
+            Outcome::Incomplete(Failure::MemoryLimit)
+        );
+    }
+
+    #[test]
+    fn scripts_are_sloppy_unless_the_source_requests_strict_mode() {
+        let body = "function f(x){arguments[0]=7;return x} globalThis.__out=f(1)";
+        assert_eq!(
+            evaluate(body, &CaptureMode::sink()).outcome,
+            Outcome::Value(r#"["number","7"]"#.into())
+        );
+        assert_eq!(
+            evaluate(&format!("'use strict';{body}"), &CaptureMode::sink()).outcome,
+            Outcome::Value(r#"["number","1"]"#.into())
+        );
+        assert_eq!(
+            evaluate("with({x:42}){globalThis.__out=x}", &CaptureMode::sink()).outcome,
+            Outcome::Value(r#"["number","42"]"#.into())
+        );
+    }
+    #[test]
+    fn initialization_and_stack_exhaustion_are_not_javascript_results() {
+        let no_memory = EvalLimits {
+            memory_bytes: 0,
+            ..EvalLimits::default()
+        };
+        assert_eq!(
+            evaluate_with_limits("1", &CaptureMode::completion(), no_memory).outcome,
+            Outcome::Incomplete(Failure::MemoryLimit)
+        );
+        let recurse = "function recurse(){return recurse()} recurse()";
+        assert_eq!(
+            evaluate(recurse, &CaptureMode::completion()).outcome,
+            Outcome::Incomplete(Failure::StackLimit)
+        );
+        assert!(!eval_same_value(recurse, recurse).equal);
     }
 }

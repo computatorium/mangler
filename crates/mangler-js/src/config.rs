@@ -45,6 +45,7 @@ pub struct FileConfig {
     resolved: ResolvedConfig,
     eff_seed: u64,
     allocator: RefCell<NameAllocator>,
+    source_functions: Option<HashSet<(u32, String)>>,
 }
 
 impl FileConfig {
@@ -56,18 +57,25 @@ impl FileConfig {
     ///   every pass's RNG.
     /// * `reserved_idents` — every identifier symbol in the source; reserved on
     ///   the allocator so `fresh_name` never collides with a user binding.
-    pub fn new(
-        resolved: ResolvedConfig,
-        eff_seed: u64,
-        reserved_idents: HashSet<String>,
-    ) -> Self {
+    pub fn new(resolved: ResolvedConfig, eff_seed: u64, reserved_idents: HashSet<String>) -> Self {
         let mut allocator = NameAllocator::new(eff_seed);
         allocator.reserve(reserved_idents);
         FileConfig {
             resolved,
             eff_seed,
             allocator: RefCell::new(allocator),
+            source_functions: None,
         }
+    }
+
+    /// Pin protection targets to the input AST before generated helpers are inserted.
+    pub(crate) fn with_source_functions(mut self, functions: Vec<(u32, String)>) -> Self {
+        self.source_functions = Some(functions.into_iter().collect());
+        self
+    }
+
+    pub(crate) fn source_functions(&self) -> Option<&HashSet<(u32, String)>> {
+        self.source_functions.as_ref()
     }
 
     /// The validated obfuscation config. A pass reads its own tuning here, e.g.

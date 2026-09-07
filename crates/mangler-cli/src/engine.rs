@@ -39,7 +39,10 @@ pub struct Input {
 impl Input {
     /// An input from in-memory `source` (no path, no forced language).
     pub fn new(source: impl Into<String>) -> Self {
-        Input { source: source.into(), ..Default::default() }
+        Input {
+            source: source.into(),
+            ..Default::default()
+        }
     }
 
     /// An input read from stdin (no path; language must be set explicitly).
@@ -161,6 +164,11 @@ impl Engine {
     /// language-dispatch seam.
     pub fn process(&self, input: &Input) -> Result<Output> {
         let lang = self.lang_of(input)?;
+        if lang != Lang::Js && self.config.passes.virtualize.required.is_some() {
+            return Err(Error::config(
+                "--require-virtualized is supported only for JavaScript inputs",
+            ));
+        }
         let (code, notes) = match lang {
             Lang::Js => {
                 let opts = match &input.path {
@@ -172,7 +180,10 @@ impl Engine {
             Lang::Css => (mangler_css::process(&input.source)?, Notes::new()),
             Lang::Html => self.process_html(&input.source)?,
         };
-        let stats = Stats { input_bytes: input.source.len(), output_bytes: code.len() };
+        let stats = Stats {
+            input_bytes: input.source.len(),
+            output_bytes: code.len(),
+        };
         Ok(Output { code, notes, stats })
     }
 
@@ -201,7 +212,8 @@ impl Engine {
         };
         let handlers = EmbedHandlers { js: &js, css: &css };
         let mut notes = Notes::new();
-        let out = mangler_html::process(src, &SeedCfg(self.config.engine.seed), handlers, &mut notes)?;
+        let out =
+            mangler_html::process(src, &SeedCfg(self.config.engine.seed), handlers, &mut notes)?;
         Ok((out, notes))
     }
 
@@ -212,12 +224,28 @@ impl Engine {
     /// sequentially so stdout ordering stays deterministic. Each [`Output`]
     /// carries its own [`Stats`].
     pub fn process_many(&self, inputs: &[Input]) -> Vec<Result<Output>> {
-        let mut indexed: Vec<(usize, Result<Output>)> = inputs
-            .par_iter()
-            .enumerate()
-            .map(|(i, inp)| (i, self.process(inp)))
-            .collect();
-        indexed.sort_by_key(|(i, _)| *i);
-        indexed.into_iter().map(|(_, r)| r).collect()
+        parallel_map(inputs, |input| self.process(input))
     }
+
+    /// Load and process one bounded batch, dropping each source after its output
+    /// is produced. Rayon preserves slice order, including read/transform errors.
+    pub(crate) fn process_loaded<T: Sync>(
+        &self,
+        items: &[T],
+        load: impl Fn(&T) -> anyhow::Result<Input> + Sync,
+    ) -> Vec<anyhow::Result<Output>> {
+        use anyhow::Context;
+        parallel_map(items, |item| {
+            let input = load(item)?;
+            self.process(&input).with_context(|| input.name())
+        })
+    }
+}
+
+/// The single batch scheduling mechanism used by both library and CLI callers.
+fn parallel_map<T: Sync, R: Send>(
+    items: &[T],
+    operation: impl Fn(&T) -> R + Sync + Send,
+) -> Vec<R> {
+    items.par_iter().map(operation).collect()
 }

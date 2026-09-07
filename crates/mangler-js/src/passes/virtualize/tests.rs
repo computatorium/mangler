@@ -9,8 +9,8 @@
 //! guard.
 
 use super::*;
-use crate::config::FileConfig;
 use crate::artifacts::VmTableArtifact;
+use crate::config::FileConfig;
 use mangler_config::{ConfigFlags, Intensity, ResolvedConfig};
 use mangler_core::{Language, PassConfig, Rng};
 use mangler_jsast::lang::{Js, ParseOpts};
@@ -43,8 +43,17 @@ fn resolved_with_target_and_exclude(target: &str, exclude: &str, seed: u64) -> R
 
 /// Run ONLY the virtualize pass over `src` with `target` + `exclude` globs, returning
 /// the printed output and whether a [`VmTableArtifact`] was put.
-fn run_virtualize_with_exclude(src: &str, target: &str, exclude: &str, seed: u64) -> (String, bool) {
-    let cfg = FileConfig::new(resolved_with_target_and_exclude(target, exclude, seed), seed, reserved_idents(src));
+fn run_virtualize_with_exclude(
+    src: &str,
+    target: &str,
+    exclude: &str,
+    seed: u64,
+) -> (String, bool) {
+    let cfg = FileConfig::new(
+        resolved_with_target_and_exclude(target, exclude, seed),
+        seed,
+        reserved_idents(src),
+    );
     let mut ast = Js.parse(src, &ParseOpts::default()).expect("parse");
     let mut bus = ArtifactBus::new();
     let pass = VirtualizePass;
@@ -142,8 +151,12 @@ fn enabled_only_when_target_set() {
 
 #[test]
 fn arithmetic() {
-    assert_equiv("function f(a,b){ return a + b * 2 - (a % b); } globalThis.__out=JSON.stringify(f(7,3));");
-    assert_equiv("function f(a,b){ return (a & b) | (a ^ b); } globalThis.__out=JSON.stringify(f(12,10));");
+    assert_equiv(
+        "function f(a,b){ return a + b * 2 - (a % b); } globalThis.__out=JSON.stringify(f(7,3));",
+    );
+    assert_equiv(
+        "function f(a,b){ return (a & b) | (a ^ b); } globalThis.__out=JSON.stringify(f(12,10));",
+    );
     assert_equiv("function f(a,b){ return a ** b; } globalThis.__out=JSON.stringify(f(2,10));");
     assert_equiv("function f(a){ return -a + ~a + !a; } globalThis.__out=JSON.stringify(f(5));");
 }
@@ -196,8 +209,12 @@ fn try_catch_finally() {
 
 #[test]
 fn recursion_named_fn() {
-    assert_equiv("function fac(n){ return n<=1 ? 1 : n*fac(n-1); } globalThis.__out=JSON.stringify(fac(6));");
-    assert_equiv("function fib(n){ return n<2 ? n : fib(n-1)+fib(n-2); } globalThis.__out=JSON.stringify(fib(10));");
+    assert_equiv(
+        "function fac(n){ return n<=1 ? 1 : n*fac(n-1); } globalThis.__out=JSON.stringify(fac(6));",
+    );
+    assert_equiv(
+        "function fib(n){ return n<2 ? n : fib(n-1)+fib(n-2); } globalThis.__out=JSON.stringify(fib(10));",
+    );
 }
 
 #[test]
@@ -233,8 +250,12 @@ fn arrays_objects_destructure() {
 
 #[test]
 fn template_and_strings() {
-    assert_equiv("function f(a,b){ return 'sum=' + (a+b); } globalThis.__out=JSON.stringify(f(2,3));");
-    assert_equiv("function f(a){ return `val:${a}:${a*2}`; } globalThis.__out=JSON.stringify(f(5));");
+    assert_equiv(
+        "function f(a,b){ return 'sum=' + (a+b); } globalThis.__out=JSON.stringify(f(2,3));",
+    );
+    assert_equiv(
+        "function f(a){ return `val:${a}:${a*2}`; } globalThis.__out=JSON.stringify(f(5));",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +269,10 @@ fn glob_selects_only_matching_names() {
     assert!(put, "a function matched, so VmTable must be put");
     // The matched function's body was virtualized (it no longer contains `a*2`); the
     // unmatched one is untouched (still contains `a+1`).
-    assert!(out.contains("a+1") || out.contains("a + 1"), "coldPath left intact: {out}");
+    assert!(
+        out.contains("a+1") || out.contains("a + 1"),
+        "coldPath left intact: {out}"
+    );
     mangler_testkit::eval::assert_behaviorally_equal(src, &out);
 }
 
@@ -286,11 +310,15 @@ fn generator_and_async_bail() {
 /// behavior — including the plain-call `this === undefined` — is preserved.
 #[test]
 fn own_use_strict_function_virtualizes() {
-    let src = "function f(){ 'use strict'; return typeof this; } globalThis.__out=JSON.stringify(f());";
+    let src =
+        "function f(){ 'use strict'; return typeof this; } globalThis.__out=JSON.stringify(f());";
     for seed in [1u64, 7, 42] {
         let (out, put) = run_virtualize(src, "*", seed);
         assert!(put, "strict function now virtualizes (no bail)");
-        assert!(out.contains("use strict"), "the strict variant carries the directive:\n{out}");
+        assert!(
+            out.contains("use strict"),
+            "the strict variant carries the directive:\n{out}"
+        );
         mangler_testkit::eval::assert_behaviorally_equal(src, &out);
     }
 }
@@ -346,7 +374,11 @@ fn no_match_produces_no_artifact() {
     let src = "function f(a){ return a*2; } globalThis.__out=JSON.stringify(f(3));";
     let (out, put) = run_virtualize(src, "nomatch", 7);
     assert!(!put, "glob matches nothing → no artifact");
-    assert_eq!(out, Js.print(&Js.parse(src, &ParseOpts::default()).unwrap()), "program unchanged");
+    assert_eq!(
+        out,
+        Js.print(&Js.parse(src, &ParseOpts::default()).unwrap()),
+        "program unchanged"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -363,18 +395,26 @@ fn vm_table_artifact_is_put_with_names() {
     bus.enter_pass(pass.id(), pass.reads(), pass.writes());
     let mut rng = Rng::for_pass(cfg.seed(), pass.id());
     let mut notes = mangler_core::Notes::default();
-    pass.run(&mut ast, &cfg, &mut rng, &mut bus, &mut notes).unwrap();
+    pass.run(&mut ast, &cfg, &mut rng, &mut bus, &mut notes)
+        .unwrap();
 
     // Re-enter as a declared READER to inspect the produced artifact (the bus
     // enforces reads()/writes() declarations).
     bus.enter_pass("reader", &[Resource::vm_table()], &[]);
     let art = bus.get::<VmTableArtifact>().unwrap().expect("VmTable put");
-    assert!(!art.interp_name.is_empty());
+    assert!(!art.interpreter_names.is_empty());
     assert!(!art.program_table_name.is_empty());
-    assert_ne!(art.interp_name, art.program_table_name);
+    assert!(
+        art.interpreter_names
+            .iter()
+            .all(|name| name != &art.program_table_name)
+    );
     // The output references both spliced names.
     let out = Js.print(&ast);
-    assert!(out.contains(&art.program_table_name), "table name in output: {out}");
+    assert!(
+        out.contains(&art.program_table_name),
+        "table name in output: {out}"
+    );
 }
 
 #[test]
@@ -434,7 +474,10 @@ fn exclude_keeps_matched_function_native() {
     let (out, put) = run_virtualize_with_exclude(src, "*", "render*", 7);
 
     // At least `compute` was virtualized → artifact present.
-    assert!(put, "compute should have been virtualized → artifact must be put");
+    assert!(
+        put,
+        "compute should have been virtualized → artifact must be put"
+    );
 
     // `render` body must NOT be a VM thunk: it must still contain the original
     // multiplication (the thunk never contains arithmetic source).
@@ -470,10 +513,23 @@ fn exclude_emits_notes_listing_kept_native_functions() {
     pass.run(&mut ast, &cfg, &mut rng, &mut bus, &mut notes)
         .expect("run ok");
 
-    let text: String = notes.iter().map(|n| n.to_string()).collect::<Vec<_>>().join("\n");
-    assert!(text.contains("render"), "exclude note must name `render`: {text}");
-    assert!(text.contains("render*"), "exclude note must echo the glob: {text}");
-    assert!(!text.contains("compute"), "virtualized fn must NOT be in the note: {text}");
+    let text: String = notes
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("render"),
+        "exclude note must name `render`: {text}"
+    );
+    assert!(
+        text.contains("render*"),
+        "exclude note must echo the glob: {text}"
+    );
+    assert!(
+        text.contains("compute: virtualized"),
+        "coverage must report protected functions: {text}"
+    );
 }
 
 /// Exclude with exact name stops only the exact match.
@@ -500,7 +556,10 @@ fn exclude_exact_name_stops_only_match() {
 fn exclude_star_keeps_all_native() {
     let src = "function f(a){ return a+1; } globalThis.__out = JSON.stringify(f(3));";
     let (out, put) = run_virtualize_with_exclude(src, "*", "*", 7);
-    assert!(!put, "exclude '*' with target '*' → nothing virtualized → no artifact");
+    assert!(
+        !put,
+        "exclude '*' with target '*' → nothing virtualized → no artifact"
+    );
     // Output must be behaviourally correct.
     mangler_testkit::eval::assert_behaviorally_equal(src, &out);
 }
@@ -538,7 +597,10 @@ fn binding_name_own_ident_fn_decl() {
     // The printer removes spaces around operators, so check for "x*2" not "x * 2".
     check_exclude_native(
         "function render(x){ return x * 2; } globalThis.__out=JSON.stringify(render(3));",
-        "*", "render", "x*2", 7,
+        "*",
+        "render",
+        "x*2",
+        7,
     );
 }
 
@@ -548,7 +610,10 @@ fn binding_name_own_ident_fn_expr() {
     // Named FnExpr: own ident "render" wins → excluded by "render*".
     check_exclude_native(
         "var f = function render(x){ return x * 3; }; globalThis.__out=JSON.stringify(f(3));",
-        "*", "render*", "x*3", 7,
+        "*",
+        "render*",
+        "x*3",
+        7,
     );
 }
 
@@ -558,12 +623,19 @@ fn binding_name_own_ident_fn_expr() {
 fn binding_name_var_declarator_fn_expr() {
     // The anonymous function expression gets the binding name "compute" from the
     // declarator. With exclude "compute*" it must stay native.
-    let src = "var compute = function(x){ return x + 99; }; globalThis.__out=JSON.stringify(compute(1));";
+    let src =
+        "var compute = function(x){ return x + 99; }; globalThis.__out=JSON.stringify(compute(1));";
     check_exclude_native(src, "*", "compute*", "x+99", 7);
     // Without exclude: the function IS virtualized (body replaced by thunk).
     let (out_no_excl, put) = run_virtualize(src, "*", 7);
-    assert!(put, "anonymous fn via binding name should be virtualized with target '*'");
-    assert!(!out_no_excl.contains("x+99"), "body replaced by thunk when not excluded: {out_no_excl}");
+    assert!(
+        put,
+        "anonymous fn via binding name should be virtualized with target '*'"
+    );
+    assert!(
+        !out_no_excl.contains("x+99"),
+        "body replaced by thunk when not excluded: {out_no_excl}"
+    );
     mangler_testkit::eval::assert_behaviorally_equal(src, &out_no_excl);
 }
 
@@ -575,9 +647,13 @@ fn binding_name_var_declarator_fn_expr() {
 fn binding_name_var_declarator_arrow_stays_native() {
     // Arrows are not top-level virtualization targets: with target="*", no artifact
     // is produced (there are no eligible named functions), and the source is unchanged.
-    let src = "var process = (x) => { return x * 5; }; globalThis.__out=JSON.stringify(process(4));";
+    let src =
+        "var process = (x) => { return x * 5; }; globalThis.__out=JSON.stringify(process(4));";
     let (out, put) = run_virtualize(src, "*", 7);
-    assert!(!put, "arrow-only program → no VmTable artifact (arrows not top-level targets)");
+    assert!(
+        !put,
+        "arrow-only program → no VmTable artifact (arrows not top-level targets)"
+    );
     mangler_testkit::eval::assert_behaviorally_equal(src, &out);
 }
 
@@ -653,15 +729,27 @@ fn exclude_absent_stays_none() {
     };
     let r = ResolvedConfig::try_from(flags).expect("valid config");
     assert_eq!(r.passes.virtualize.target.as_deref(), Some("*"));
-    assert!(r.passes.virtualize.exclude.is_none(), "no exclude flag → None");
+    assert!(
+        r.passes.virtualize.exclude.is_none(),
+        "no exclude flag → None"
+    );
 }
 
 #[test]
 fn for_preset_keeps_exclude_none() {
     use mangler_config::{Intensity, PassConfigs};
-    for level in [Intensity::Minify, Intensity::Low, Intensity::Medium, Intensity::High, Intensity::Max] {
+    for level in [
+        Intensity::Minify,
+        Intensity::Low,
+        Intensity::Medium,
+        Intensity::High,
+        Intensity::Max,
+    ] {
         let p = PassConfigs::for_preset(level);
-        assert!(p.virtualize.exclude.is_none(), "{level}: exclude must be None in every preset");
+        assert!(
+            p.virtualize.exclude.is_none(),
+            "{level}: exclude must be None in every preset"
+        );
     }
 }
 
@@ -670,7 +758,9 @@ fn for_preset_keeps_exclude_none() {
 // ---------------------------------------------------------------------------
 
 fn parse_prog(src: &str) -> Program {
-    Js.parse(src, &ParseOpts::default()).expect("parse").into_program()
+    Js.parse(src, &ParseOpts::default())
+        .expect("parse")
+        .into_program()
 }
 
 #[test]
@@ -678,7 +768,9 @@ fn program_top_strictness_attribute() {
     // Sloppy Script: not strict at top.
     assert!(!program_top_is_strict(&parse_prog("function f(){}")));
     // Script opening with a directive: strict at top.
-    assert!(program_top_is_strict(&parse_prog("'use strict'; function f(){}")));
+    assert!(program_top_is_strict(&parse_prog(
+        "'use strict'; function f(){}"
+    )));
     // ES Module is implicitly strict.
     let module = Js
         .parse("import x from 'm'; function f(){}", &ParseOpts::default())
@@ -690,7 +782,11 @@ fn program_top_strictness_attribute() {
 #[test]
 fn strict_candidate_pre_scan_is_precise_for_sloppy() {
     // No strict anywhere → no strict candidate (so NO extra names drawn → byte-identity).
-    assert!(!program_has_strict_candidate(&parse_prog("function f(a){ return a*2; }"), "*", None));
+    assert!(!program_has_strict_candidate(
+        &parse_prog("function f(a){ return a*2; }"),
+        "*",
+        None
+    ));
     assert!(!program_has_strict_candidate(
         &parse_prog("var f = function(){ return 1; }; obj.g = function(){ return 2; };"),
         "*",
@@ -759,7 +855,10 @@ fn run_whole_program(src: &str, seed: u64) -> (String, bool) {
 #[test]
 fn whole_program_enabled_without_target() {
     let cfg = FileConfig::new(resolved_whole_program(1), 1, HashSet::new());
-    assert!(VirtualizePass.enabled(&cfg), "whole_program → enabled even with no target");
+    assert!(
+        VirtualizePass.enabled(&cfg),
+        "whole_program → enabled even with no target"
+    );
 }
 
 /// The one-top-level-IIFE WebGL shape: with `--virtualize-program` the interpreter is
@@ -774,11 +873,20 @@ fn whole_program_one_iife_virtualizes_and_runs() {
     // The original IIFE's distinctive literals (the accumulator init / loop) are gone
     // from source — they now live only as XOR'd bytecode in the program table. (We
     // cannot grep for `for(` because the interpreter body itself loops.)
-    assert!(!out.contains("s+=i*i"), "loop body must be in the VM, not native:\n{out}");
-    assert!(!out.contains("for(var i=0;i<10"), "top-level loop gone from native source:\n{out}");
+    assert!(
+        !out.contains("s+=i*i"),
+        "loop body must be in the VM, not native:\n{out}"
+    );
+    assert!(
+        !out.contains("for(var i=0;i<10"),
+        "top-level loop gone from native source:\n{out}"
+    );
     // The top level ends in an interpreter call (the §2.1 re-entry thunk): the last
     // top-level statement is a bare call whose first arg indexes the program table.
-    assert!(out.contains("[1][0],"), "top level re-enters the interpreter over a table entry:\n{out}");
+    assert!(
+        out.contains("[1][0],"),
+        "top level re-enters the interpreter over a table entry:\n{out}"
+    );
     // Behavioral equivalence (rquickjs SameValue) — the load-bearing guard.
     mangler_testkit::eval::assert_behaviorally_equal(src, &out);
 }
@@ -791,9 +899,15 @@ fn whole_program_sloppy_threads_globalthis_receiver() {
     let (out, put) = run_whole_program(src, 3);
     assert!(put, "virtualized");
     // No strict interpreter variant (sloppy program).
-    assert!(!out.contains("\"use strict\""), "sloppy program: no strict variant:\n{out}");
+    assert!(
+        !out.contains("\"use strict\""),
+        "sloppy program: no strict variant:\n{out}"
+    );
     // The §2.1 re-entry call passes `globalThis` (sloppy receiver), not `undefined`.
-    assert!(out.contains(",globalThis)"), "sloppy top-level receiver is globalThis:\n{out}");
+    assert!(
+        out.contains(",this,true)"),
+        "sloppy top-level receiver is globalThis:\n{out}"
+    );
     mangler_testkit::eval::assert_behaviorally_equal(src, &out);
 }
 
@@ -809,8 +923,14 @@ fn whole_program_strict_emits_strict_variant_and_throws() {
     let (out, put) = run_whole_program(src, 5);
     assert!(put, "virtualized");
     // A strict interpreter variant was emitted, and the §2.1 call threads undefined.
-    assert!(out.contains("\"use strict\""), "strict interpreter variant present:\n{out}");
-    assert!(out.contains(",undefined)"), "strict top-level receiver is undefined:\n{out}");
+    assert!(
+        out.contains("\"use strict\""),
+        "strict interpreter variant present:\n{out}"
+    );
+    assert!(
+        out.contains(",this,true)"),
+        "strict top-level receiver is undefined:\n{out}"
+    );
     mangler_testkit::eval::assert_behaviorally_equal(src, &out);
 }
 
@@ -822,11 +942,17 @@ fn whole_program_strict_emits_strict_variant_and_throws() {
 fn whole_program_module_export_partitions() {
     let src = "export const x = 1; globalThis.__out = JSON.stringify(x);";
     let (out, put) = run_whole_program(src, 9);
-    assert!(put, "Phase 2: the read-run virtualizes around the export → VM table");
+    assert!(
+        put,
+        "Phase 2: the read-run virtualizes around the export → VM table"
+    );
     // The `export const x = 1` boundary stays native.
     assert!(out.contains("export"), "export kept native:\n{out}");
     // The reader run is now an interpreter call (its distinctive native form is gone).
-    assert!(out.contains("[0],"), "reader run re-enters the interpreter:\n{out}");
+    assert!(
+        out.contains("[0],"),
+        "reader run re-enters the interpreter:\n{out}"
+    );
     // The VM program table is spliced (a `[[` numeric literal table).
     assert!(out.contains("[["), "VM program table spliced:\n{out}");
 }
@@ -869,9 +995,7 @@ fn strip_module_decls(src: &str) -> String {
                 ModuleItem::Stmt(s) => kept.push(ModuleItem::Stmt(s)),
                 ModuleItem::ModuleDecl(d) => match d {
                     // `export const/var/function/class …` → keep the bare declaration.
-                    ModuleDecl::ExportDecl(ed) => {
-                        kept.push(ModuleItem::Stmt(Stmt::Decl(ed.decl)))
-                    }
+                    ModuleDecl::ExportDecl(ed) => kept.push(ModuleItem::Stmt(Stmt::Decl(ed.decl))),
                     // `export default <expr>;` → keep as an expression statement.
                     ModuleDecl::ExportDefaultExpr(e) => {
                         kept.push(ModuleItem::Stmt(Stmt::Expr(ExprStmt {
@@ -915,7 +1039,10 @@ fn whole_program_module_import_boundary_partitions() {
     assert!(out.contains("import"), "the import stays native:\n{out}");
     // Two re-entry calls (one per run) → the table has at least two chunks.
     let calls = out.matches("[0],").count();
-    assert!(calls >= 2, "two runs → at least two re-entry calls, saw {calls}:\n{out}");
+    assert!(
+        calls >= 2,
+        "two runs → at least two re-entry calls, saw {calls}:\n{out}"
+    );
     // Behavioral parity via the script-equivalent (import stripped).
     let stripped = strip_module_decls(src);
     mangler_testkit::eval::assert_behaviorally_equal(&stripped, &strip_module_decls(&out));
@@ -966,11 +1093,17 @@ fn whole_program_export_bound_name_kept_native() {
     assert!(put, "the reader run virtualizes around the native export");
     // `export const k = 21` is emitted verbatim (native binding for the export).
     assert!(
-        out.contains("export const k") || out.contains("export const k=21") || out.contains("k = 21") || out.contains("k=21"),
+        out.contains("export const k")
+            || out.contains("export const k=21")
+            || out.contains("k = 21")
+            || out.contains("k=21"),
         "export-bound `k` declaration stays native:\n{out}"
     );
     // Behavioral parity via the script-equivalent.
-    mangler_testkit::eval::assert_behaviorally_equal(&strip_module_decls(src), &strip_module_decls(&out));
+    mangler_testkit::eval::assert_behaviorally_equal(
+        &strip_module_decls(src),
+        &strip_module_decls(&out),
+    );
 }
 
 /// §3.3 adaptive bisection: an UNSUPPORTED construct (a `with` statement — a permanent
@@ -988,10 +1121,16 @@ fn whole_program_bisection_isolates_offender() {
     let (out, put) = run_whole_program(src, 8);
     assert!(put, "the eligible neighbors virtualize");
     // The offending `with` stays native (the VM never emits `with`).
-    assert!(out.contains("with"), "the `with` offender stays native:\n{out}");
+    assert!(
+        out.contains("with"),
+        "the `with` offender stays native:\n{out}"
+    );
     // At least two re-entry calls (the two eligible neighbors).
     let calls = out.matches("[0],").count();
-    assert!(calls >= 2, "neighbors virtualize as separate chunks, saw {calls}:\n{out}");
+    assert!(
+        calls >= 2,
+        "neighbors virtualize as separate chunks, saw {calls}:\n{out}"
+    );
     mangler_testkit::eval::assert_behaviorally_equal(src, &out);
 }
 
@@ -1003,9 +1142,16 @@ fn whole_program_single_iife_one_chunk_no_cells() {
     let (out, put) = run_whole_program(src, 7);
     assert!(put, "virtualized");
     // No cell hoisting (no cross-run bindings).
-    assert!(!out.contains("[undefined]"), "no needless cell hoisting for one chunk:\n{out}");
+    assert!(
+        !out.contains("[undefined]"),
+        "no needless cell hoisting for one chunk:\n{out}"
+    );
     // Exactly one re-entry call (one chunk).
-    assert_eq!(out.matches("[1][0],").count() + out.matches("[0][0],").count(), 1, "single chunk → one re-entry call:\n{out}");
+    assert_eq!(
+        out.matches("[1][0],").count() + out.matches("[0][0],").count(),
+        1,
+        "single chunk → one re-entry call:\n{out}"
+    );
     mangler_testkit::eval::assert_behaviorally_equal(src, &out);
 }
 
@@ -1019,5 +1165,214 @@ fn whole_program_partition_deterministic_same_seed() {
         globalThis.__out = JSON.stringify(globalThis.__a + globalThis.__b + globalThis.__c);";
     let (a, _) = run_whole_program(src, 0xABCDEF);
     let (b, _) = run_whole_program(src, 0xABCDEF);
-    assert_eq!(a, b, "same seed → byte-identical partition + bisection output");
+    assert_eq!(
+        a, b,
+        "same seed → byte-identical partition + bisection output"
+    );
+}
+
+#[test]
+fn native_parameter_initialization_and_live_bindings_regressions() {
+    for src in [
+        "var count=0;function init(){return ++count}function pay(x=init()){return x}globalThis.__out=JSON.stringify([pay(),count,pay.length]);",
+        "var count=0;var input={get x(){count++;return 7}};function pay({x}){return x}globalThis.__out=JSON.stringify([pay(input),count,pay.length]);",
+        "var x=0;function change(){x=1}function pay(){change();return x}globalThis.__out=pay();",
+        "function pay(){if(false)return missing;return 7}globalThis.__out=pay();",
+        "function pay(x=1,get=()=>x){x=2;return get()}globalThis.__out=pay();",
+        "function pay(x,...rest){return [x,rest.length]}globalThis.__out=JSON.stringify([pay(1,2,3),pay.length]);",
+        "var x=1;function pay(){x=2;return x}globalThis.__out=JSON.stringify([pay(),x]);",
+        "function pay(x){function read(){return x}x=3;return read()}globalThis.__out=pay(1);",
+        "var x=1;function pay(){function read(){return x}x=3;return read()}globalThis.__out=pay();",
+        "function pay(x){arguments[0]=7;return [x,Array.isArray(arguments)]}globalThis.__out=JSON.stringify(pay(1));",
+        "function pay(x){\"use strict\";return [arguments[0],Array.isArray(arguments)]}globalThis.__out=JSON.stringify(pay(1));",
+    ] {
+        let (out, protected) = run_virtualize(src, "pay", 919);
+        assert!(protected, "expected VM coverage: {src}");
+        mangler_testkit::eval::assert_behaviorally_equal(src, &out);
+    }
+}
+
+fn required_outcome(
+    src: &str,
+    target: Option<&str>,
+    required: &str,
+    exclude: Option<&str>,
+    whole: bool,
+) -> std::result::Result<mangler_core::Notes, String> {
+    let flags = ConfigFlags {
+        preset: Some(Intensity::Minify),
+        seed: Some(17),
+        virtualize: target.map(str::to_string),
+        require_virtualized: Some(required.to_string()),
+        virtualize_exclude: exclude.map(str::to_string),
+        virtualize_program: whole,
+        ..Default::default()
+    };
+    let cfg = FileConfig::new(
+        ResolvedConfig::try_from(flags).unwrap(),
+        17,
+        reserved_idents(src),
+    );
+    let mut ast = Js.parse(src, &ParseOpts::default()).unwrap();
+    let mut bus = ArtifactBus::new();
+    let pass = VirtualizePass;
+    bus.enter_pass(pass.id(), pass.reads(), pass.writes());
+    let mut rng = Rng::for_pass(cfg.seed(), pass.id());
+    let mut notes = mangler_core::Notes::default();
+    pass.run(&mut ast, &cfg, &mut rng, &mut bus, &mut notes)
+        .map_err(|e| e.to_string())?;
+    Ok(notes)
+}
+
+#[test]
+fn required_virtualization_fails_for_native_and_unmatched_functions() {
+    for (src, target, excluded, whole, reason) in [
+        ("async function pay(){return 1}", None, None, false, "async"),
+        (
+            "function other(){return 1}",
+            None,
+            None,
+            false,
+            "matched no",
+        ),
+        (
+            "function pay(){return 1}",
+            None,
+            Some("pay"),
+            false,
+            "excluded",
+        ),
+        ("const pay=()=>1", None, None, false, "arrow"),
+        (
+            "function pay(){return typeof missing}",
+            None,
+            None,
+            false,
+            "native",
+        ),
+        ("async function pay(){return 1}", None, None, true, "async"),
+        (
+            "let Object={};function pay(x){return x+1}",
+            None,
+            None,
+            false,
+            "runtime_intrinsic_shadow",
+        ),
+        (
+            "function outer(){async function native(){function pay(){return 1}return pay()}return native()}",
+            None,
+            Some("other"),
+            true,
+            "async",
+        ),
+        (
+            "function outer(){function native(){function pay(){return 7}return pay()}return native()}",
+            Some("outer"),
+            Some("native"),
+            false,
+            "excluded",
+        ),
+        (
+            "function outer(){function native(){function pay(){return 7}return pay()}return native()}",
+            None,
+            Some("native"),
+            true,
+            "excluded",
+        ),
+    ] {
+        let error = required_outcome(src, target, "pay", excluded, whole).unwrap_err();
+        assert!(
+            error.contains(reason),
+            "{error} should explain {reason}: {src}"
+        );
+    }
+    required_outcome("function pay(x=1){return x+1}", None, "pay", None, false).unwrap();
+    required_outcome(
+        "function outer(){function pay(){return 1}return pay()}",
+        Some("outer"),
+        "pay",
+        None,
+        false,
+    )
+    .unwrap();
+}
+
+#[test]
+fn whole_program_keeps_strict_script_receiver_and_native_directives() {
+    let src = "'use strict'; globalThis.__out = this === globalThis;";
+    let (out, protected) = run_whole_program(src, 83);
+    assert!(protected);
+    assert!(
+        out.starts_with("\"use strict\""),
+        "directive stays first: {out}"
+    );
+    mangler_testkit::eval::assert_behaviorally_equal(src, &out);
+}
+
+#[test]
+fn native_escape_keeps_live_parameter_and_callee_bindings() {
+    for src in [
+        "function pay(x){function native(){x+=2;return x}x=5;return native()}globalThis.__out=pay(1);",
+        "var fn=function(){'use strict';return this===undefined};function pay(){function native(){return fn()}return native()}globalThis.__out=pay();",
+        "function pay(x){function native(){if(true){let x=2;}return x}return native()}globalThis.__out=pay(7);",
+        "function pay(x){function native(){try{throw 3}catch(x){}return x}return native()}globalThis.__out=pay(7);",
+        "function pay(x){function native(y=x){return y}return native()}globalThis.__out=pay(7);",
+        "function pay(x){function native(){var $u0=3;return x+$u0}return native()}globalThis.__out=pay(7);",
+    ] {
+        let (out, protected) = run_virtualize_with_exclude(src, "pay", "native", 109);
+        assert!(protected);
+        mangler_testkit::eval::assert_behaviorally_equal(src, &out);
+    }
+}
+
+#[test]
+fn required_wildcard_counts_only_source_functions_before_helpers() {
+    let cfg = ResolvedConfig::try_from(ConfigFlags {
+        preset: Some(Intensity::High),
+        seed: Some(1),
+        require_virtualized: Some("*".into()),
+        verify: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let (_, notes) = crate::runner::process(
+        "function pay(x){return 'paid:'+x}console.log(pay(3));",
+        &ParseOpts::default(),
+        &cfg,
+    )
+    .unwrap();
+    let report = notes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(report.contains("pay: virtualized"), "{report}");
+    assert!(
+        !report.contains("utf8Decode:"),
+        "generated helper is not a source target: {report}"
+    );
+}
+
+#[test]
+fn dynamic_parameter_and_native_factory_scopes_fail_required_protection() {
+    for (src, excluded, reason) in [
+        (
+            "function pay(x=eval('1')){return x}",
+            None,
+            "parameter_direct_eval",
+        ),
+        (
+            "function pay(x){function keep(){return eval('x')}return keep()}",
+            Some("keep"),
+            "native_direct_eval",
+        ),
+        (
+            "function pay(x){function keep(){function deeper(){return eval('x')}return deeper()}return keep()}",
+            Some("keep"),
+            "native_direct_eval",
+        ),
+    ] {
+        let error = required_outcome(src, None, "pay", excluded, false).unwrap_err();
+        assert!(error.contains(reason), "{error} should explain {reason}");
+    }
 }

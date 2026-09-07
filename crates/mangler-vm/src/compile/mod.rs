@@ -63,6 +63,10 @@ pub struct CompileOptions<'a> {
     /// closure instead of bailing the whole parent (coverage maximization, §4.1).
     /// When false (the default), such a nested fn bails the parent as before.
     pub divert_ineligible: bool,
+    /// Captures are live property descriptors supplied by the calling thunk.
+    pub live_captures: bool,
+    /// The native wrapper already initialized parameters and owns arguments.
+    pub native_parameters: bool,
 }
 
 pub(crate) mod destructure;
@@ -124,6 +128,8 @@ pub(crate) struct Cx<'a> {
     /// emission looks the slot up by span when it enters the binding's block and
     /// populates the new frame — so the two passes never disagree on a slot.
     pub(crate) decl_slots: HashMap<u32, u32>,
+    pub(crate) lexical_slots: HashMap<u32, bool>,
+    pub(crate) initializing: bool,
     /// Names declared by a body `let`/`const`/`catch` (block-scoped) binding,
     /// collected during the `DeclCollector` pass. Used only by the default-param
     /// scope-soundness check (`default_scope_ok`) to keep its conservative bail when
@@ -194,16 +200,6 @@ pub(crate) struct Cx<'a> {
     /// whether a nested function stays native. Inherited unchanged by every child
     /// chunk compiled while emitting this body.
     pub(crate) opts: CompileOptions<'a>,
-    /// Phase 3 capture-liveness guard: the names guaranteed already-initialized when
-    /// the fn-decl hoist prologue runs (params + destructuring-param leaves). A
-    /// native closure built during hoisting that captures a NON-celled binding NOT in
-    /// this set would snapshot it BEFORE its body initializer ran (reading
-    /// `undefined`), diverging from JS's live-binding semantics — so it bails (§4.4),
-    /// keeping the enclosing subtree native via §3.3 bisection.
-    pub(crate) param_names: std::collections::HashSet<String>,
-    /// True while emitting the fn-decl hoist prologue (closures built before any body
-    /// statement / `var`/`let`/`const` initializer). Drives the capture-liveness bail.
-    pub(crate) in_fndecl_hoist: bool,
 }
 
 /// Phase 3: glob match for the `--virtualize-exclude` name test. An invalid glob
@@ -332,7 +328,11 @@ impl<'a> Cx<'a> {
     /// threaded to the child by `MakeClosure`. Only meaningful for a name that
     /// resolves to a local of this frame (not a free capture / upvalue).
     pub(crate) fn is_boxed_local(&self, name: &str) -> bool {
-        self.boxed_locals.contains(name) && self.is_param_or_local(name)
+        self.boxed_locals.contains(name)
+            && self.is_param_or_local(name)
+            && !self
+                .lookup(name)
+                .is_some_and(|slot| self.lexical_slots.contains_key(&slot))
     }
 
     /// D1+D5: true if a read/write of `name` must go through a cell — either an
@@ -420,11 +420,7 @@ pub(crate) fn new_spread_charge(n: &NewExpr) -> u32 {
         .args
         .as_ref()
         .is_some_and(|a| a.iter().any(|x| x.spread.is_some()));
-    if has {
-        3
-    } else {
-        0
-    }
+    if has { 3 } else { 0 }
 }
 
 /// Max simultaneously-live spread temps in an expression subtree (the scratch the
@@ -589,7 +585,7 @@ impl<'a, 'b> DeclCollector<'a, 'b> {
 /// param path uses the latter to detect a duplicate param name.
 /// True if `body` references the identifier `arguments` (a free reference to the
 /// implicit arguments object). Used by the D2 prologue to decide whether to
-/// materialize a snapshot array. A non-computed member property (`o.arguments`)
+/// materialize the actual arguments object. A non-computed member property (`o.arguments`)
 /// is an `IdentName`, not an `Ident`, so it does not trip this — only genuine
 /// identifier references do.
 pub(crate) fn uses_arguments(body: &BlockStmt) -> bool {
@@ -801,6 +797,9 @@ pub(crate) fn bind_lows_in_scope(cx: &mut Cx<'_>, lows: &[(String, u32)]) {
     for (name, lo) in lows {
         if let Some(&slot) = cx.decl_slots.get(lo) {
             cx.bind_in_scope(name.clone(), slot);
+            if let Some(&constant) = cx.lexical_slots.get(&slot) {
+                cx.emit(Instr::BeginLexical(slot * 2 + u32::from(constant)));
+            }
         }
     }
 }
@@ -864,6 +863,15 @@ impl Visit for DeclCollector<'_, '_> {
         for d in &v.decls {
             if block_scoped {
                 slot_pat_leaves_block(self.cx, &d.name);
+                let mut lows = Vec::new();
+                collect_pat_binding_lows(&d.name, &mut lows);
+                for (_, lo) in lows {
+                    if let Some(&slot) = self.cx.decl_slots.get(&lo) {
+                        self.cx
+                            .lexical_slots
+                            .insert(slot, v.kind == VarDeclKind::Const);
+                    }
+                }
             } else {
                 slot_pat_leaves_func(self.cx, &d.name);
             }
@@ -882,6 +890,15 @@ impl Visit for DeclCollector<'_, '_> {
             }
             Some(p @ (Pat::Array(_) | Pat::Object(_))) => slot_pat_leaves_block(self.cx, p),
             _ => {}
+        }
+        if let Some(p) = &c.param {
+            let mut lows = Vec::new();
+            collect_pat_binding_lows(p, &mut lows);
+            for (_, lo) in lows {
+                if let Some(&slot) = self.cx.decl_slots.get(&lo) {
+                    self.cx.lexical_slots.insert(slot, false);
+                }
+            }
         }
         c.visit_children_with(self);
     }
@@ -946,7 +963,10 @@ pub(crate) fn check_no_nested_block_fn_decls(stmts: &[Stmt]) -> Result<(), &'sta
         fn visit_function(&mut self, _: &Function) {}
         fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
     }
-    let mut v = V { depth: 0, bad: false };
+    let mut v = V {
+        depth: 0,
+        bad: false,
+    };
     for s in stmts {
         s.visit_with(&mut v);
     }
@@ -987,11 +1007,6 @@ impl Visit for RefNameCollector {
 /// Compile a function body to bytecode, or `None` to skip anything we can't
 /// prove safe.
 ///
-/// v1 limitation: the VM does not model the `let`/`const` Temporal Dead Zone.
-/// A use-before-declaration that real JS would reject with a ReferenceError
-/// instead reads `undefined` here. This is acceptable because the differential
-/// corpus exercises only well-formed functions; TDZ-violating code is rare and
-/// already meaningless.
 /// Compile `body` with no boxed captures (the common, no-capture-mutation path).
 /// Equivalent to `compile_body_boxed` with an empty boxed set; kept as the public
 /// entry point used by tests and the non-D1 call sites.
@@ -1009,13 +1024,7 @@ pub fn compile_body_with_opts(
     body: &BlockStmt,
     opts: CompileOptions<'_>,
 ) -> Result<Compiled, &'static str> {
-    compile_body_inner_opts(
-        params,
-        body,
-        &std::collections::HashSet::new(),
-        None,
-        opts,
-    )
+    compile_body_inner_opts(params, body, &std::collections::HashSet::new(), None, opts)
 }
 
 /// Compile `body`, treating every free name in `boxed` as a BOXED mutable capture
@@ -1074,6 +1083,8 @@ pub(crate) fn compile_body_inner_opts<'a>(
         // their bodies during emission (D3).
         scopes: vec![HashMap::new()],
         decl_slots: HashMap::new(),
+        lexical_slots: HashMap::new(),
+        initializing: false,
         block_local_names: std::collections::HashSet::new(),
         captures: Vec::new(),
         boxed_caps: boxed.clone(),
@@ -1094,8 +1105,6 @@ pub(crate) fn compile_body_inner_opts<'a>(
         children: Vec::new(),
         box_plan: plan,
         opts,
-        param_names: std::collections::HashSet::new(),
-        in_fndecl_hoist: false,
     };
 
     // 1. Params first. Record default-value params so their init prologue can
@@ -1196,13 +1205,6 @@ pub(crate) fn compile_body_inner_opts<'a>(
     if let Some(r) = cx.bail_reason {
         return Err(r);
     }
-    // Phase 3 capture-liveness: the names already bound (params + destructuring-param
-    // leaves) are exactly those guaranteed initialized before the fn-decl hoist
-    // prologue runs. Body `var`/`let`/`const`/fn-decl names are added later, so they
-    // are NOT in this set and a hoisted native closure capturing one (non-celled)
-    // bails (§4.4).
-    cx.param_names = cx.scopes[0].keys().cloned().collect();
-
     // 2. Body-declared locals (and, in the same walk, the count_temps pre-pass).
     //    The reserved temp pool must cover both the body's needs and the (separate,
     //    prologue-only) destructuring-param destructure — they never overlap, so
@@ -1231,17 +1233,17 @@ pub(crate) fn compile_body_inner_opts<'a>(
     // 2a'. D2 `arguments` materialization. If the body references `arguments` and it
     //      is NOT shadowed by an explicit param/`var` binding of that name (which the
     //      steps above would have slotted into the function frame), allocate a fresh
-    //      function-frame slot for it and remember to emit the snapshot prologue.
+    //      function-frame slot for it and remember to load the arguments object.
     //      Binding the name `"arguments"` here (a local slot, < cap_floor) makes every
     //      `arguments` read resolve via `lookup` to this slot — never a capture. The
     //      sloppy-aliasing soundness bail lives in `eligibility::classify_body`; by the
     //      time we get here the function is known not to observe aliasing.
-    let arg_slot: Option<u32> = if uses_arguments(body) {
+    let arg_slot: Option<u32> = if !opts.native_parameters && uses_arguments(body) {
         if cx.scopes[0].contains_key("arguments") {
             // An explicit `arguments` binding shadows the implicit object. A PARAM
             // named `arguments` is a genuine, soundly-modeled shadow (its slot is
             // filled by the interpreter's positional copy), so references resolve
-            // to it and we emit no snapshot. A `var`/`let`/`const arguments` shadow,
+            // to it and we emit no implicit arguments binding. A `var`/`let`/`const arguments` shadow,
             // by contrast, has a sloppy-mode initial value (the arguments object)
             // that the flat-slot model can't reproduce — bail rather than diverge.
             if declares_arguments(body) {
@@ -1355,12 +1357,9 @@ pub(crate) fn compile_body_inner_opts<'a>(
         cx.emit(Instr::Pop);
     }
 
-    // 3c. `arguments` snapshot prologue (D2): `L[argSlot] = Array.prototype.slice.
-    //     call(args, 0)` — a genuine Array mirroring the actual call arguments
-    //     (length + indices). Reuses the rest machinery (`LoadRest(0)` already emits
-    //     the slice). Runs before the body so any `arguments` read sees the snapshot.
+    // The actual arguments object retains its identity and property descriptors.
     if let Some(aslot) = arg_slot {
-        cx.emit(Instr::LoadRest(0));
+        cx.emit(Instr::LoadArguments);
         cx.emit(Instr::StoreLocal(aslot));
         cx.emit(Instr::Pop);
     }
@@ -1379,7 +1378,9 @@ pub(crate) fn compile_body_inner_opts<'a>(
     let mut fn_decl_slots: Vec<(u32, &FnDecl)> = Vec::new();
     for stmt in &body.stmts {
         if let Stmt::Decl(Decl::Fn(fd)) = stmt {
-            let slot = *cx.scopes[0].get(fd.ident.sym.as_ref()).expect("fn-decl slotted");
+            let slot = *cx.scopes[0]
+                .get(fd.ident.sym.as_ref())
+                .expect("fn-decl slotted");
             fn_decl_slots.push((slot, fd));
         }
     }
@@ -1410,6 +1411,7 @@ pub(crate) fn compile_body_inner_opts<'a>(
             .iter()
             .filter_map(|name| {
                 cx.lookup(name)
+                    .filter(|slot| !cx.lexical_slots.contains_key(slot))
                     .map(|slot| (slot, param_slots.contains_key(name)))
             })
             .collect();
@@ -1427,10 +1429,7 @@ pub(crate) fn compile_body_inner_opts<'a>(
     }
 
     // Hoisted fn-decl closures: build each closure and store it into its slot before
-    // the body runs (function declarations are fully hoisted in JS). Phase 3: mark
-    // that we are in the hoist prologue so a native-closure divert can guard against
-    // snapshotting a not-yet-initialized body local.
-    cx.in_fndecl_hoist = true;
+    // the body runs. Live descriptors preserve reads after later initialization.
     for (slot, fd) in &fn_decl_slots {
         let Some(fbody) = &fd.function.body else {
             return Err("fn_decl_no_body");
@@ -1459,7 +1458,6 @@ pub(crate) fn compile_body_inner_opts<'a>(
             return Err(r);
         }
     }
-    cx.in_fndecl_hoist = false;
 
     for stmt in &body.stmts {
         emit_stmt(&mut cx, stmt);
@@ -1520,7 +1518,9 @@ pub(crate) fn find_break_target(cx: &Cx<'_>, label: &Option<String>) -> Option<u
         // Labeled break may target any labeled construct (loop/switch/block).
         Some(_) => find_target(cx, label, |_| true),
         // Unlabeled break: nearest loop or switch.
-        None => find_target(cx, label, |k| matches!(k, FrameKind::Loop | FrameKind::Switch)),
+        None => find_target(cx, label, |k| {
+            matches!(k, FrameKind::Loop | FrameKind::Switch)
+        }),
     }
 }
 
@@ -1536,8 +1536,7 @@ pub(crate) fn find_continue_target(cx: &Cx<'_>, label: &Option<String>) -> Optio
 /// their `DeclCollector`-allocated slots), emit each statement, then pop the frame —
 /// restoring any outer binding the block shadowed. The bindings are hoisted into
 /// the frame up front (not at each decl point) so a reference earlier in the block
-/// resolves to the inner slot, matching the lexical scope (the VM reads `undefined`
-/// for a pre-init access, the documented TDZ-as-undefined behavior).
+/// resolves to the inner slot; its accessor throws until declaration initialization.
 /// The block-scoped (`let`/`const`) bindings introduced by a `for`/`for-in`/
 /// `for-of` head, as `(name, span_lo)` pairs — empty for a `var`/expression head
 /// (those are function-scoped or pre-existing). The loop arms push a scope frame
@@ -1600,7 +1599,11 @@ mod tests {
         let prog = compile_body(&params, &body).expect("shadowing must now compile (D3)");
         // The outer and inner `x` occupy DISTINCT slots (no reuse in v1), so the
         // function frame holds at least two locals.
-        assert!(prog.slots >= 2, "shadow must allocate a distinct slot, got {}", prog.slots);
+        assert!(
+            prog.slots >= 2,
+            "shadow must allocate a distinct slot, got {}",
+            prog.slots
+        );
     }
 
     #[test]
@@ -1741,28 +1744,39 @@ mod tests {
         // the parameter scope). Our flat slot model would wrongly read the local
         // slot, so we must bail rather than miscompile to a silent wrong value.
         let (p, b) = parse_fn_with_params("function(a, b = c){ var c = 5; return b; }");
-        assert!(matches!(compile_body(&p, &b), Err("default_refs_body_local")));
+        assert!(matches!(
+            compile_body(&p, &b),
+            Err("default_refs_body_local")
+        ));
         // `let`-declared body local is the same divergence.
         let (p2, b2) = parse_fn_with_params("function(a, b = c){ let c = 5; return b; }");
-        assert!(matches!(compile_body(&p2, &b2), Err("default_refs_body_local")));
+        assert!(matches!(
+            compile_body(&p2, &b2),
+            Err("default_refs_body_local")
+        ));
     }
 
     #[test]
     fn rejects_default_referencing_self_or_later_param() {
         // self-reference (TDZ in real JS).
         let (p, b) = parse_fn_with_params("function(a = a){ return a; }");
-        assert!(matches!(compile_body(&p, &b), Err("default_refs_later_param")));
+        assert!(matches!(
+            compile_body(&p, &b),
+            Err("default_refs_later_param")
+        ));
         // later-param reference (TDZ in real JS); could return a wrong value.
         let (p2, b2) = parse_fn_with_params("function(a = b, b){ return a; }");
-        assert!(matches!(compile_body(&p2, &b2), Err("default_refs_later_param")));
+        assert!(matches!(
+            compile_body(&p2, &b2),
+            Err("default_refs_later_param")
+        ));
     }
 
     #[test]
     fn default_using_body_local_name_only_as_property_is_fine() {
         // `c` here is a property key, not a binding read, so it must NOT trigger
         // the body-local bail even though a body local named `c` exists.
-        let (p, b) =
-            parse_fn_with_params("function(o, b = o.c){ var c = 5; return b + c; }");
+        let (p, b) = parse_fn_with_params("function(o, b = o.c){ var c = 5; return b + c; }");
         assert!(compile_body(&p, &b).is_ok());
     }
 
@@ -1771,9 +1785,7 @@ mod tests {
         // Compile a fn with several free vars and assert it compiles + captures
         // are recorded correctly. This is the behavioral guard for the cap_floor
         // O(1) refactor: the result must be identical to the old linear scan.
-        let (p, b) = parse_fn_with_params(
-            "function(a){ return a + x + y + z + w + v; }",
-        );
+        let (p, b) = parse_fn_with_params("function(a){ return a + x + y + z + w + v; }");
         let prog = compile_body(&p, &b).expect("should compile");
         // x, y, z, w, v are free vars → 5 captures
         assert_eq!(prog.captures.len(), 5);
@@ -1781,7 +1793,10 @@ mod tests {
         assert!(!prog.captures.contains(&"a".to_string()));
         // All capture names present
         for name in &["x", "y", "z", "w", "v"] {
-            assert!(prog.captures.contains(&name.to_string()), "missing capture {name}");
+            assert!(
+                prog.captures.contains(&name.to_string()),
+                "missing capture {name}"
+            );
         }
     }
 
@@ -1836,8 +1851,9 @@ mod tests {
         // Empty switch and default-only switch must compile gracefully.
         let (p2, b2) = parse_fn_with_params("function(x){ switch (x) {} return x; }");
         assert!(compile_body(&p2, &b2).is_ok());
-        let (p3, b3) =
-            parse_fn_with_params("function(x){ var r = 0; switch (x) { default: r = 9; } return r; }");
+        let (p3, b3) = parse_fn_with_params(
+            "function(x){ var r = 0; switch (x) { default: r = 9; } return r; }",
+        );
         assert!(compile_body(&p3, &b3).is_ok());
         // A `break` inside a switch nested in a loop must target the switch (the
         // loop keeps iterating); a `continue` must skip the switch and reach the
@@ -1969,8 +1985,7 @@ mod tests {
         assert!(matches!(compile_body(&p2, &b2), Err("mutable_capture")));
         // A destructuring head (each key string is itself destructured) now lowers
         // in both the `var`-decl and bare assignment-target forms.
-        let (p3, b3) =
-            parse_fn_with_params("function(o){ for (var [a] in o) { } return a; }");
+        let (p3, b3) = parse_fn_with_params("function(o){ for (var [a] in o) { } return a; }");
         assert!(compile_body(&p3, &b3).is_ok());
         let (p4, b4) = parse_fn_with_params("function(o){ var a; for ([a] in o) { } return a; }");
         assert!(compile_body(&p4, &b4).is_ok());
@@ -1986,7 +2001,9 @@ mod tests {
         );
         let prog = compile_body(&p, &b).expect("try/catch must compile");
         assert!(
-            prog.code.iter().any(|i| matches!(i, Instr::PushHandler(_, _))),
+            prog.code
+                .iter()
+                .any(|i| matches!(i, Instr::PushHandler(_, _))),
             "try must emit a PushHandler"
         );
         assert!(
@@ -1995,8 +2012,9 @@ mod tests {
         );
         // try/finally and try/catch/finally compile, emitting a finally
         // (EndFinally) terminal.
-        let (p2, b2) =
-            parse_fn_with_params("function(){ var r; try { r = 1; } finally { r = 2; } return r; }");
+        let (p2, b2) = parse_fn_with_params(
+            "function(){ var r; try { r = 1; } finally { r = 2; } return r; }",
+        );
         let prog2 = compile_body(&p2, &b2).expect("try/finally must compile");
         assert!(
             prog2.code.iter().any(|i| matches!(i, Instr::EndFinally)),
@@ -2005,12 +2023,14 @@ mod tests {
         let (pf, bf) = parse_fn_with_params(
             "function(x){ var o=\"\"; try { o+=\"t\"; } catch(e){ o+=\"c\"; } finally { o+=\"f\"; } return o; }",
         );
-        assert!(compile_body(&pf, &bf).is_ok(), "try/catch/finally must compile");
+        assert!(
+            compile_body(&pf, &bf).is_ok(),
+            "try/catch/finally must compile"
+        );
         // D3: a catch binding shadowing an outer param `e` is now eligible — the
         // catch param gets its own block-scoped slot, distinct from the param's, so
         // the shadow is sound (was previously bailed `catch_shadow`).
-        let (p3, b3) =
-            parse_fn_with_params("function(e){ try { f(); } catch (e) { return e; } }");
+        let (p3, b3) = parse_fn_with_params("function(e){ try { f(); } catch (e) { return e; } }");
         let prog3 = compile_body(&p3, &b3).expect("catch shadowing must now compile (D3)");
         assert!(
             prog3.slots >= 2,
@@ -2040,7 +2060,9 @@ mod tests {
         );
         // A `break` inside for-of crosses the close handler -> BreakUnwind.
         assert!(
-            prog.code.iter().any(|i| matches!(i, Instr::BreakUnwind(_, _))),
+            prog.code
+                .iter()
+                .any(|i| matches!(i, Instr::BreakUnwind(_, _))),
             "break inside for-of must unwind the close handler"
         );
         // A destructuring loop head binds each value via the array destructure.
@@ -2058,15 +2080,9 @@ mod tests {
              return a + bb + e + x + rest.d; }",
         );
         let prog = compile_body(&p, &b).expect("object destructuring must compile");
-        // The rest copy captures the global `Object` (for Object.assign).
         assert!(
-            prog.captures.iter().any(|c| c == "Object"),
-            "object-rest must capture the global Object"
-        );
-        // DeleteProp drops the taken keys (a, b, e) from the rest copy.
-        assert!(
-            prog.code.iter().any(|i| matches!(i, Instr::DeleteProp)),
-            "object-rest must DeleteProp the taken keys"
+            prog.code.iter().any(|i| matches!(i, Instr::RestProps)),
+            "object-rest must exclude taken keys before reading getters"
         );
         // A computed pattern key is out of scope (read-once temp not reserved).
         let (p2, b2) = parse_fn_with_params("function(s, k){ var { [k]: v } = s; return v; }");
@@ -2096,7 +2112,10 @@ mod tests {
         // A destructuring PARAM lowers from its positional slot.
         let (p2, b2) = parse_fn_with_params("function([a, b]){ return a + b; }");
         let prog2 = compile_body(&p2, &b2).expect("destructuring param must compile");
-        assert_eq!(prog2.pcount, 1, "the array param occupies one positional slot");
+        assert_eq!(
+            prog2.pcount, 1,
+            "the array param occupies one positional slot"
+        );
     }
 
     #[test]
@@ -2120,8 +2139,8 @@ mod tests {
         let (p3, b3) = parse_fn_with_params("function(o){ return { a: 1, ...o, b: 2 }; }");
         let prog3 = compile_body(&p3, &b3).expect("object-spread must compile");
         assert!(
-            prog3.captures.iter().any(|c| c == "Object"),
-            "object-spread must capture the global Object"
+            prog3.code.iter().any(|i| matches!(i, Instr::CopyProps)),
+            "object-spread must copy own data properties"
         );
     }
 
@@ -2192,7 +2211,11 @@ mod tests {
             let (p, b) = parse_fn_with_params(src);
             let prog = compile_body_boxed(&p, &b, &boxed)
                 .unwrap_or_else(|e| panic!("boxed `{src}` must compile, got {e}"));
-            assert_eq!(prog.captures, vec!["c".to_string()], "`c` is the capture: {src}");
+            assert_eq!(
+                prog.captures,
+                vec!["c".to_string()],
+                "`c` is the capture: {src}"
+            );
             assert!(
                 prog.code.iter().any(|i| matches!(i, Instr::StoreCell(_))),
                 "boxed write must emit StoreCell: {src}"
@@ -2204,7 +2227,9 @@ mod tests {
             // No plain LoadLocal/StoreLocal of the capture slot (it's the last slot).
             let cap_slot = prog.slots - 1;
             assert!(
-                !prog.code.iter().any(|i| matches!(i, Instr::LoadLocal(s) | Instr::StoreLocal(s) if *s == cap_slot)),
+                !prog.code.iter().any(
+                    |i| matches!(i, Instr::LoadLocal(s) | Instr::StoreLocal(s) if *s == cap_slot)
+                ),
                 "boxed capture slot must never use plain Load/StoreLocal: {src}"
             );
         }
@@ -2221,7 +2246,10 @@ mod tests {
         let prog = compile_body_boxed(&p, &b, &boxed).expect("local-c must compile");
         assert!(prog.captures.is_empty(), "`c` is a local, not a capture");
         assert!(
-            !prog.code.iter().any(|i| matches!(i, Instr::StoreCell(_) | Instr::LoadCell(_))),
+            !prog
+                .code
+                .iter()
+                .any(|i| matches!(i, Instr::StoreCell(_) | Instr::LoadCell(_))),
             "a boxed name that is a local must not use cell ops"
         );
     }

@@ -71,6 +71,10 @@ pub struct ConfigFlags {
     #[arg(long)]
     pub virtualize: Option<String>,
 
+    /// Require every function matching GLOB to be virtualized; fail on native or unmatched targets.
+    #[arg(long, value_name = "GLOB")]
+    pub require_virtualized: Option<String>,
+
     /// Virtualize the ENTIRE top-level program as one synthetic VM chunk
     /// (all-or-nothing: if it compiles the whole top level is virtualized, else the
     /// program is left native). Opt-in; bail-to-safe. When set, `--virtualize`
@@ -84,18 +88,13 @@ pub struct ConfigFlags {
     #[arg(long, value_name = "GLOB")]
     pub virtualize_exclude: Option<String>,
 
-    /// (Phase 4, opt-in) Opportunistically lower a top-level `class C extends B {…}`
-    /// to function/prototype form BEFORE classification, so it becomes a wrappable
-    /// construct and gets virtualized. Only fires for classes with no unsupported
-    /// member shapes (private `#x`, `static{}`, decorators, computed keys); anything
-    /// else stays a native class (bail-to-safe). Only has effect together with
-    /// `--virtualize-program`. Default OFF.
+    /// Protect eligible class method bodies while retaining native constructors,
+    /// fields, and inheritance. Use with --virtualize-program. Default OFF.
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub virtualize_desugar_class: bool,
 
-    /// (Phase 4, opt-in) Lower a regex literal `/re/g` to `new RegExp("re","g")` so it
-    /// leaves the VM compiler's regex-literal bail and becomes a normal call. Only has
-    /// effect together with `--virtualize-program`. Default OFF.
+    /// Legacy compatibility flag; regex literals remain native to preserve intrinsic
+    /// constructor semantics, including shadowed or modified RegExp bindings.
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub virtualize_desugar_regex: bool,
 
@@ -227,7 +226,14 @@ mod tests {
 
     #[test]
     fn clap_parses_enum_flags() {
-        let f = parse(&["--preset", "max", "--strings", "encrypt", "--identifier-naming", "soup"]);
+        let f = parse(&[
+            "--preset",
+            "max",
+            "--strings",
+            "encrypt",
+            "--identifier-naming",
+            "soup",
+        ]);
         assert_eq!(f.preset, Some(Intensity::Max));
         assert_eq!(f.strings, Some(StringMode::Encrypt));
         assert_eq!(f.identifier_naming, Some(IdNaming::Soup));
@@ -254,7 +260,10 @@ mod tests {
     #[test]
     fn remote_key_bare_defaults_slot() {
         let f = parse(&["--remote-key"]);
-        assert_eq!(f.remote_key.as_deref(), Some("globalThis.__MANGLER_SESSION_KEY"));
+        assert_eq!(
+            f.remote_key.as_deref(),
+            Some("globalThis.__MANGLER_SESSION_KEY")
+        );
     }
 
     #[test]

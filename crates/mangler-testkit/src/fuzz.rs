@@ -21,7 +21,7 @@
 //! `K`, frozen counter); only deterministic ops (no `Date`/`Math.random`); every
 //! variable reference is to an in-scope, source-order-preceding name.
 
-use crate::eval::{eval_same_value_with, CaptureMode, DiffResult};
+use crate::eval::{CaptureMode, DiffResult, eval_same_value_with};
 
 // ---------------------------------------------------------------------------
 // Deterministic PRNG (splitmix64). Self-contained, byte-reproducible from a u64.
@@ -287,7 +287,9 @@ impl Gen {
                 let nn = self.fresh();
                 let em = self.expr(depth.min(2));
                 let en = self.expr(depth.min(2));
-                self.line(&format!("var {{ m: {m}, n: {nn} }} = {{ m: {em}, n: {en} }};"));
+                self.line(&format!(
+                    "var {{ m: {m}, n: {nn} }} = {{ m: {em}, n: {en} }};"
+                ));
                 self.locals.push(m);
                 self.locals.push(nn);
                 false
@@ -440,12 +442,8 @@ pub fn build_class_program(seed: u64) -> String {
         "class C {{ a = {a_field0}; b = this.a + 1; m() {{ return this.a + this.b; }} }}\n",
     ));
     // Drive them.
-    p.push_str(&format!(
-        "var a = new A({});\n", rng.below(50) as i64 - 10
-    ));
-    p.push_str(&format!(
-        "var b = new B({});\n", rng.below(50) as i64 - 10
-    ));
+    p.push_str(&format!("var a = new A({});\n", rng.below(50) as i64 - 10));
+    p.push_str(&format!("var b = new B({});\n", rng.below(50) as i64 - 10));
     p.push_str("var c = new C();\n");
     p.push_str("var o = '';\n");
     p.push_str("o += String(a.sum());\n");
@@ -455,7 +453,9 @@ pub fn build_class_program(seed: u64) -> String {
     p.push_str("o += '|' + String(c.m());\n");
     p.push_str("o += '|' + Object.keys(b).join(',');\n");
     p.push_str("o += '|' + String(Object.getPrototypeOf(b) === B.prototype);\n");
-    p.push_str("o += '|' + String(Object.getOwnPropertyDescriptor(A.prototype, 'sum').enumerable);\n");
+    p.push_str(
+        "o += '|' + String(Object.getOwnPropertyDescriptor(A.prototype, 'sum').enumerable);\n",
+    );
     if has_static_method {
         p.push_str("o += '|' + String(A.make(7).sum());\n");
     }
@@ -694,9 +694,7 @@ mod tests {
     #[test]
     fn fuzz_detects_a_corrupting_transform() {
         // A transform that overwrites the sink must diverge on (essentially) all.
-        let failures = fuzz_transform(20, 0xABCD, |s| {
-            format!("{s}\nglobalThis.__out = 'WRONG';")
-        });
+        let failures = fuzz_transform(20, 0xABCD, |s| format!("{s}\nglobalThis.__out = 'WRONG';"));
         assert!(!failures.is_empty(), "corrupting transform must be caught");
     }
 

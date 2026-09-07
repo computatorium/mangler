@@ -25,7 +25,8 @@
 //! ANY unsupported construct leaves the body un-flattened — never miscompiled. The
 //! gate is the fused [`eligibility::scan_gates`] (rejecting try/switch/do-while/
 //! for-in/for-of/labeled/with/eval/break/continue and unmodellable TDZ shapes)
-//! plus the closure-capture scan [`tdz::loop_let_captured`].
+//! plus the closure-capture scan [`tdz::loop_let_captured`]. Generated decoder
+//! initialization and VM runtimes remain intact; only user bodies are flattened.
 
 pub mod cfg;
 pub mod eligibility;
@@ -38,10 +39,10 @@ pub(crate) mod test_support;
 #[cfg(test)]
 pub(crate) use test_support::test_support_cfg;
 
-use crate::artifacts::DecoderAnchorArtifact;
+use crate::artifacts::{DecoderAnchorArtifact, VmTableArtifact};
 use crate::config::FileConfig;
-use crate::opaque::{anchor_from_bus_or_inject, OpaqueAnchor};
-use eligibility::{scan_gates, Eligibility};
+use crate::opaque::{OpaqueAnchor, anchor_from_bus_or_inject};
+use eligibility::{Eligibility, scan_gates};
 use helpers::TdzHelpers;
 use mangler_core::{Language, Note, Notes, PassConfig, Result, Rng};
 use mangler_jsast::Js;
@@ -62,7 +63,11 @@ impl Pass<Js, FileConfig> for CfFlattenPass {
     /// the resolver marks (REQUIRED — lands the pass post-resolver for the TDZ
     /// disambiguation).
     fn reads(&self) -> &[Resource] {
-        const R: &[Resource] = &[Resource::decoder_anchor(), Resource::resolved_scopes()];
+        const R: &[Resource] = &[
+            Resource::decoder_anchor(),
+            Resource::resolved_scopes(),
+            Resource::vm_table(),
+        ];
         R
     }
 
@@ -97,10 +102,8 @@ impl Pass<Js, FileConfig> for CfFlattenPass {
             ));
         }
 
-        // The declarator whose initializer must NOT emit an `anchor(0)` transition:
-        // the decoder `core` if present (calling it before it is assigned would
-        // throw / recurse), else the injected fallback anchor name (whose body
-        // returns a string — nothing to flatten, but skip uniformly for clarity).
+        // Protect generated decoder initialization (including its VM runtime)
+        // and the fallback anchor from recursively depending on themselves.
         let core_name: Option<String> = match bus.get::<DecoderAnchorArtifact>() {
             Ok(Some(d)) => Some(d.core_name.clone()),
             _ => None,
@@ -119,11 +122,14 @@ impl Pass<Js, FileConfig> for CfFlattenPass {
             let mut v = Flattener {
                 cfg,
                 rng,
+                runtime: bus
+                    .get::<VmTableArtifact>()
+                    .map_err(|e| mangler_core::Error::transform(self.id(), e.to_string()))?
+                    .cloned(),
                 helpers: &helpers,
                 used_tdz: false,
                 anchor: &anchor,
                 protect_name: &protect_name,
-                inside_core_init: false,
                 state_vars,
                 dead_state_rate,
                 data_dep_rate,
@@ -139,6 +145,7 @@ impl Pass<Js, FileConfig> for CfFlattenPass {
 }
 
 struct Flattener<'a> {
+    runtime: Option<VmTableArtifact>,
     cfg: &'a FileConfig,
     rng: &'a mut Rng,
     helpers: &'a TdzHelpers,
@@ -149,11 +156,6 @@ struct Flattener<'a> {
     /// The anchor function's binding name; its initializer subtree must not emit an
     /// `anchor(0)`-coupled transition (the anchor is not assigned yet there).
     protect_name: &'a str,
-    /// True while traversing inside the anchor's own initializer (`var <core> =
-    /// …`). Inside that scope opaque transitions MUST NOT be emitted — they would
-    /// call an uninitialized value and throw / recurse. Bodies flattened here fall
-    /// back to bare numeric literals.
-    inside_core_init: bool,
     state_vars: u8,
     dead_state_rate: f32,
     data_dep_rate: f32,
@@ -215,7 +217,11 @@ impl Flattener<'_> {
         // hoisting the CFG cannot model; the gate scan rejects such bodies, so
         // only direct-body declarations reach here.)
         let original = std::mem::take(&mut body.stmts);
-        let (fn_decls, original) = hoist_fn_decls(original);
+        let directive_count = mangler_jsast::directives::leading_directive_count(&original);
+        let mut original = original;
+        let statements = original.split_off(directive_count);
+        let directives = original;
+        let (fn_decls, original) = hoist_fn_decls(statements);
 
         // Hoist `var` declarations to the top with `undefined` initializers,
         // rewriting their initializers into in-place assignments.
@@ -238,20 +244,14 @@ impl Flattener<'_> {
             let name2 = self.cfg.fresh_name();
             emit::Dispatch::Two { name1, name2, k }
         } else {
-            emit::Dispatch::Single { name: self.cfg.fresh_name() }
-        };
-        // `None` while inside the anchor's own initializer (bare-literal fallback),
-        // else `Some`. `self.anchor` is a `&'a OpaqueAnchor`, so copying the ref out
-        // does not borrow `self` for the renderer call below.
-        let anchor: Option<&OpaqueAnchor> = if self.inside_core_init {
-            None
-        } else {
-            Some(self.anchor)
+            emit::Dispatch::Single {
+                name: self.cfg.fresh_name(),
+            }
         };
         let opts = emit::RenderOpts {
             labels: &labels,
             dispatch,
-            anchor,
+            anchor: Some(self.anchor),
             inscope_vars: &inscope_idents,
             data_dep_rate: self.data_dep_rate,
         };
@@ -260,7 +260,8 @@ impl Flattener<'_> {
         // New body: hoisted function declarations (matching JS hoisting, before
         // any other statement runs), then hoisted var decls, then the rendered
         // machine's statements.
-        let mut new_stmts = fn_decls;
+        let mut new_stmts = directives;
+        new_stmts.extend(fn_decls);
         new_stmts.extend(hoisted);
         new_stmts.extend(machine.stmts);
         body.stmts = new_stmts;
@@ -269,6 +270,19 @@ impl Flattener<'_> {
 }
 
 impl VisitMut for Flattener<'_> {
+    fn visit_mut_fn_decl(&mut self, n: &mut FnDecl) {
+        if n.ident.sym.as_ref() == self.protect_name
+            || self.runtime.as_ref().is_some_and(|vm| {
+                vm.interpreter_names
+                    .iter()
+                    .any(|name| name == n.ident.sym.as_ref())
+            })
+        {
+            return;
+        }
+        n.visit_mut_children_with(self);
+    }
+
     fn visit_mut_function(&mut self, n: &mut Function) {
         // Descend first so nested functions are flattened independently.
         n.visit_mut_children_with(self);
@@ -288,19 +302,17 @@ impl VisitMut for Flattener<'_> {
     }
 
     fn visit_mut_var_declarator(&mut self, n: &mut VarDeclarator) {
-        // Detect the anchor's own declarator (`var <core> = ...`). The anchor is not
-        // yet assigned while its initializer evaluates, so any function flattened
-        // within the initializer must not reference it.
-        let is_core_decl =
-            matches!(&n.name, Pat::Ident(bi) if bi.id.sym.as_ref() == self.protect_name);
-        if is_core_decl {
-            let prev = self.inside_core_init;
-            self.inside_core_init = true;
-            n.visit_mut_children_with(self);
-            self.inside_core_init = prev;
-        } else {
-            n.visit_mut_children_with(self);
+        if self.runtime.as_ref().is_some_and(
+            |vm| matches!(&n.name, Pat::Ident(b) if b.id.sym.as_ref() == vm.program_table_name),
+        ) {
+            return;
         }
+        // Generated decoder initialization (including its optional VM runtime)
+        // must stay intact: flattening it can add work before the anchor exists.
+        if matches!(&n.name, Pat::Ident(bi) if bi.id.sym.as_ref() == self.protect_name) {
+            return;
+        }
+        n.visit_mut_children_with(self);
     }
 }
 
@@ -404,7 +416,10 @@ fn hoist_vars(stmts: Vec<Stmt>) -> (Vec<Stmt>, Vec<Stmt>, Vec<Ident>) {
                                     span: DUMMY_SP,
                                     op: AssignOp::Assign,
                                     left: AssignTarget::Simple(SimpleAssignTarget::Ident(
-                                        BindingIdent { id: bi.id.clone(), type_ann: None },
+                                        BindingIdent {
+                                            id: bi.id.clone(),
+                                            type_ann: None,
+                                        },
                                     )),
                                     right: init,
                                 })),

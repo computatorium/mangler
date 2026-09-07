@@ -55,8 +55,8 @@
 use crate::artifacts::{MangleControlArtifact, ResolvedScopesArtifact};
 use crate::config::FileConfig;
 use mangler_core::{Error, Notes, Result, Rng};
-use mangler_jsast::analysis::{is_direct_eval_callee, is_local};
 use mangler_jsast::Js;
+use mangler_jsast::analysis::{is_direct_eval_callee, is_local};
 use mangler_passgraph::{ArtifactBus, Pass, Resource};
 use std::collections::{HashMap, HashSet};
 use swc_core::common::Mark;
@@ -121,6 +121,15 @@ impl Pass<Js, FileConfig> for IdNamesPass {
         // fallback path swc's mangle reserves them too).
         let keep_globs = cfg.resolved().passes.mangle.keep_names.clone();
 
+        let keep = KeepSet::new(&keep_globs);
+        let mut reserved = ReservedNames {
+            keep: &keep,
+            names: HashSet::new(),
+        };
+        ast.program().visit_with(&mut reserved);
+        let mut reserved: Vec<String> = reserved.names.into_iter().collect();
+        reserved.sort();
+
         let suppress = rename(
             ast.program_mut(),
             cfg,
@@ -134,7 +143,7 @@ impl Pass<Js, FileConfig> for IdNamesPass {
         // names to reserve on the fallback path.
         bus.put(MangleControlArtifact {
             suppress_builtin_mangle: suppress,
-            reserved: keep_globs,
+            reserved,
         })
         .map_err(|e| Error::transform(self.id(), e.to_string()))?;
         Ok(())
@@ -244,6 +253,21 @@ impl KeepSet {
     /// True iff `name` matches any keep glob.
     fn matches(&self, name: &str) -> bool {
         self.globs.iter().any(|g| glob_match(g, name))
+    }
+}
+
+/// SWC reserves concrete symbols, not glob expressions. Collect before custom
+/// renaming so the fallback and short naming paths share the same keep contract.
+struct ReservedNames<'a> {
+    keep: &'a KeepSet,
+    names: HashSet<String>,
+}
+
+impl Visit for ReservedNames<'_> {
+    fn visit_ident(&mut self, ident: &Ident) {
+        if self.keep.matches(ident.sym.as_ref()) {
+            self.names.insert(ident.sym.to_string());
+        }
     }
 }
 
@@ -443,7 +467,10 @@ impl VisitMut for Renamer {
                 let mut renamed = ident.clone();
                 renamed.sym = new_sym;
                 *n = Prop::KeyValue(KeyValueProp {
-                    key: PropName::Ident(IdentName { span, sym: orig_sym }),
+                    key: PropName::Ident(IdentName {
+                        span,
+                        sym: orig_sym,
+                    }),
                     value: Box::new(Expr::Ident(renamed)),
                 });
             }
@@ -492,7 +519,10 @@ impl VisitMut for Renamer {
                 None => Pat::Ident(renamed.into()),
             };
             *n = ObjectPatProp::KeyValue(KeyValuePatProp {
-                key: PropName::Ident(IdentName { span, sym: orig_sym }),
+                key: PropName::Ident(IdentName {
+                    span,
+                    sym: orig_sym,
+                }),
                 value: Box::new(value_pat),
             });
         }

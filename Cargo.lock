@@ -1250,7 +1250,7 @@ name = "mangler-config"
 version = "0.2.0"
 dependencies = [
  "clap",
- "mangler-core",
+ "glob",
  "rand 0.10.1",
  "serde",
  "thiserror",
@@ -1317,8 +1317,11 @@ dependencies = [
 name = "mangler-testkit"
 version = "0.2.0"
 dependencies = [
+ "libc",
  "proptest",
  "rquickjs",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

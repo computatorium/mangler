@@ -15,7 +15,7 @@
 //! `tests/corpus/` relative to this crate's manifest, so the runner works from any
 //! crate's test without hard-coding an absolute path.
 
-use crate::eval::{eval_same_value_with, CaptureMode, DiffResult};
+use crate::eval::{CaptureMode, DiffResult, eval_same_value_with};
 use std::path::{Path, PathBuf};
 
 /// The repo's default behavioral corpus directory: `<repo>/tests/corpus/`.
@@ -46,7 +46,9 @@ pub struct CorpusOutcome {
 /// Enumerate the `.js` files in `dir`, sorted by name for determinism.
 pub fn enumerate(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
+        .map(|e| e.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
         .filter(|p| p.extension().map(|e| e == "js").unwrap_or(false))
         .collect();
     files.sort();
@@ -122,7 +124,10 @@ where
     let outcomes = run_dir(&default_corpus_dir(), transform)
         .unwrap_or_else(|e| panic!("corpus runner I/O error: {e}"));
     let total = outcomes.len();
-    let failures: Vec<CorpusOutcome> = outcomes.into_iter().filter(|o| o.diff.is_divergent()).collect();
+    let failures: Vec<CorpusOutcome> = outcomes
+        .into_iter()
+        .filter(|o| o.diff.is_divergent())
+        .collect();
     if failures.is_empty() {
         Ok(total)
     } else {
@@ -137,7 +142,11 @@ mod tests {
     #[test]
     fn default_corpus_dir_exists_and_is_populated() {
         let dir = default_corpus_dir();
-        assert!(dir.is_dir(), "default corpus dir not found: {}", dir.display());
+        assert!(
+            dir.is_dir(),
+            "default corpus dir not found: {}",
+            dir.display()
+        );
         let files = enumerate(&dir).unwrap();
         assert!(
             files.len() >= 20,
@@ -148,9 +157,18 @@ mod tests {
 
     #[test]
     fn identity_transform_passes_whole_corpus() {
-        // The identity transform must be behaviorally equal to every corpus file —
-        // this proves the sink-capture harness evaluates every corpus file cleanly
-        // in QuickJS (no DOM/engine gaps tripping it).
+        // Identity equality alone would also accept a fixture that always throws.
+        // Require each original to complete successfully with no async rejections.
+        for path in enumerate(&default_corpus_dir()).unwrap() {
+            let source = std::fs::read_to_string(&path).unwrap();
+            let observed = crate::eval::evaluate(&source, &CaptureMode::sink());
+            assert!(
+                matches!(observed.outcome, crate::eval::Outcome::Value(_))
+                    && observed.rejections.is_empty(),
+                "{} did not execute cleanly: {observed:?}",
+                path.display()
+            );
+        }
         let n = assert_all(|src| src.to_string());
         assert!(n >= 20, "checked only {n} corpus files");
     }
@@ -163,6 +181,22 @@ mod tests {
         match res {
             Ok(_) => panic!("corrupting transform must not pass the corpus"),
             Err(failures) => assert!(!failures.is_empty()),
+        }
+    }
+    #[test]
+    fn asynchronous_fixtures_reach_their_expected_results() {
+        for (name, expected) in [
+            (
+                "async_await_promise.js",
+                r#"globalThis.__out=JSON.stringify({a:10,all:[1,4,3],chained:16,racey:'first'})"#,
+            ),
+            (
+                "async_for_await.js",
+                r#"globalThis.__out=JSON.stringify({total:6,seen:[1,2,3],cleanup:'body-fin'})"#,
+            ),
+        ] {
+            let source = std::fs::read_to_string(default_corpus_dir().join(name)).unwrap();
+            crate::eval::assert_behaviorally_equal(&source, expected);
         }
     }
 }

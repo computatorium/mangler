@@ -60,7 +60,11 @@ impl PassPreset for MangleConfig {
             _ => IdNaming::Short,
         };
         // Every preset mangles; `--mangle false` is an override, not a default.
-        MangleConfig { enabled: true, naming, keep_names: Vec::new() }
+        MangleConfig {
+            enabled: true,
+            naming,
+            keep_names: Vec::new(),
+        }
     }
 }
 
@@ -132,7 +136,12 @@ impl PassPreset for CfFlattenConfig {
             Intensity::High => (true, 2, 0.25, 0.12),
             Intensity::Max => (true, 2, 0.5, 0.2),
         };
-        CfFlattenConfig { enabled, state_vars, dead_state_rate, dead_code_rate }
+        CfFlattenConfig {
+            enabled,
+            state_vars,
+            dead_state_rate,
+            dead_code_rate,
+        }
     }
 }
 
@@ -150,8 +159,12 @@ pub struct ExprConfig {
 impl PassPreset for ExprConfig {
     fn for_preset(level: Intensity) -> Self {
         let member_access = !matches!(level, Intensity::Minify);
-        let expr_obfuscation = matches!(level, Intensity::Medium | Intensity::High | Intensity::Max);
-        ExprConfig { expr_obfuscation, member_access }
+        let expr_obfuscation =
+            matches!(level, Intensity::Medium | Intensity::High | Intensity::Max);
+        ExprConfig {
+            expr_obfuscation,
+            member_access,
+        }
     }
 }
 
@@ -171,7 +184,10 @@ impl PassPreset for GlobalIndirectConfig {
             Intensity::Minify | Intensity::Low => GlobalIndirect::Off,
             _ => GlobalIndirect::Safe,
         };
-        GlobalIndirectConfig { mode, harden_anchor: false }
+        GlobalIndirectConfig {
+            mode,
+            harden_anchor: false,
+        }
     }
 }
 
@@ -188,7 +204,10 @@ pub struct AntiTamperConfig {
 impl PassPreset for AntiTamperConfig {
     fn for_preset(level: Intensity) -> Self {
         let on = matches!(level, Intensity::High | Intensity::Max);
-        AntiTamperConfig { self_defending: on, debug_protection: on }
+        AntiTamperConfig {
+            self_defending: on,
+            debug_protection: on,
+        }
     }
 }
 
@@ -199,6 +218,8 @@ pub struct VirtualizeConfig {
     /// `whole_program` is set). Ignored when `whole_program` is true (§1 matrix:
     /// whole-program wins).
     pub target: Option<String>,
+    /// Protection gate: every matching source function must be virtualized.
+    pub required: Option<String>,
     /// NEW (Phase 1): wrap the ENTIRE top-level program body as one synthetic VM
     /// chunk (all-or-nothing — if it compiles the whole top level is virtualized,
     /// else the program is left native). Opt-in; never a preset default. When set,
@@ -210,15 +231,12 @@ pub struct VirtualizeConfig {
     /// `target` AND NOT match `exclude` to be virtualized. Bail-to-safe: exclude
     /// only ever keeps a function native; it never miscompiles.
     pub exclude: Option<String>,
-    /// NEW (Phase 4, opt-in): lower a sound top-level `class C extends B {…}` to
-    /// function/prototype form before classification, so it becomes wrappable. Only
-    /// has effect when `whole_program` is set. Unsupported class shapes stay native
-    /// (bail-to-safe). Default false; never a preset default.
+    /// Protect eligible ordinary class methods while retaining native class
+    /// constructors, fields, heritage, and lexical bindings. Only has effect with
+    /// `whole_program`; named targets can select methods directly. Default false.
     pub desugar_class: bool,
-    /// NEW (Phase 4, opt-in): lower a regex literal `/re/g` to `new RegExp("re","g")`
-    /// before classification. Only has effect when `whole_program` is set. Default
-    /// false; never a preset default. (Left OFF by default pending fuzz sign-off —
-    /// see the virtualize pass `desugar` module.)
+    /// Legacy compatibility flag. Regex literals remain native because replacing
+    /// them with `new RegExp` observes shadowed or modified constructor bindings.
     pub desugar_regex: bool,
 }
 
@@ -226,6 +244,7 @@ impl PassPreset for VirtualizeConfig {
     fn for_preset(_level: Intensity) -> Self {
         VirtualizeConfig {
             target: None,
+            required: None,
             whole_program: false,
             exclude: None,
             desugar_class: false,
@@ -277,9 +296,13 @@ impl PassConfigs {
     /// fragment cannot satisfy. All other tuning is preserved.
     pub fn for_fragment(&self) -> Self {
         let mut f = self.clone();
-        f.anti_tamper = AntiTamperConfig { self_defending: false, debug_protection: false };
+        f.anti_tamper = AntiTamperConfig {
+            self_defending: false,
+            debug_protection: false,
+        };
         f.virtualize = VirtualizeConfig {
             target: None,
+            required: None,
             whole_program: false,
             exclude: None,
             desugar_class: false,
@@ -338,8 +361,16 @@ mod tests {
     #[test]
     fn expr_member_access_gated_at_low_plus() {
         assert!(!ExprConfig::for_preset(Intensity::Minify).member_access);
-        for l in [Intensity::Low, Intensity::Medium, Intensity::High, Intensity::Max] {
-            assert!(ExprConfig::for_preset(l).member_access, "{l} must enable member_access");
+        for l in [
+            Intensity::Low,
+            Intensity::Medium,
+            Intensity::High,
+            Intensity::Max,
+        ] {
+            assert!(
+                ExprConfig::for_preset(l).member_access,
+                "{l} must enable member_access"
+            );
         }
     }
 
@@ -355,18 +386,51 @@ mod tests {
 
     #[test]
     fn opt_in_fields_off_in_every_preset() {
-        for l in [Intensity::Minify, Intensity::Low, Intensity::Medium, Intensity::High, Intensity::Max] {
+        for l in [
+            Intensity::Minify,
+            Intensity::Low,
+            Intensity::Medium,
+            Intensity::High,
+            Intensity::Max,
+        ] {
             let p = PassConfigs::for_preset(l);
             assert!(!p.strings.in_vm, "{l}: strings.in_vm must be opt-in");
-            assert!(!p.strings.self_coupled_key, "{l}: self_coupled_key must be opt-in");
-            assert!(!p.strings.exec_trace_key, "{l}: exec_trace_key must be opt-in");
-            assert!(p.strings.dynamic_key.is_none(), "{l}: dynamic_key must be opt-in");
-            assert!(!p.global_indirect.harden_anchor, "{l}: harden_anchor must be opt-in");
-            assert!(p.virtualize.target.is_none(), "{l}: virtualize.target must be opt-in");
-            assert!(!p.virtualize.whole_program, "{l}: virtualize.whole_program must be opt-in");
-            assert!(p.virtualize.exclude.is_none(), "{l}: virtualize.exclude must be opt-in");
-            assert!(!p.virtualize.desugar_class, "{l}: virtualize.desugar_class must be opt-in");
-            assert!(!p.virtualize.desugar_regex, "{l}: virtualize.desugar_regex must be opt-in");
+            assert!(
+                !p.strings.self_coupled_key,
+                "{l}: self_coupled_key must be opt-in"
+            );
+            assert!(
+                !p.strings.exec_trace_key,
+                "{l}: exec_trace_key must be opt-in"
+            );
+            assert!(
+                p.strings.dynamic_key.is_none(),
+                "{l}: dynamic_key must be opt-in"
+            );
+            assert!(
+                !p.global_indirect.harden_anchor,
+                "{l}: harden_anchor must be opt-in"
+            );
+            assert!(
+                p.virtualize.target.is_none(),
+                "{l}: virtualize.target must be opt-in"
+            );
+            assert!(
+                !p.virtualize.whole_program,
+                "{l}: virtualize.whole_program must be opt-in"
+            );
+            assert!(
+                p.virtualize.exclude.is_none(),
+                "{l}: virtualize.exclude must be opt-in"
+            );
+            assert!(
+                !p.virtualize.desugar_class,
+                "{l}: virtualize.desugar_class must be opt-in"
+            );
+            assert!(
+                !p.virtualize.desugar_regex,
+                "{l}: virtualize.desugar_regex must be opt-in"
+            );
             // Aggressive / Soup never preset defaults.
             assert_ne!(p.global_indirect.mode, GlobalIndirect::Aggressive);
             assert_ne!(p.mangle.naming, IdNaming::Soup);
@@ -388,10 +452,22 @@ mod tests {
         assert!(!f.anti_tamper.self_defending);
         assert!(!f.anti_tamper.debug_protection);
         assert!(f.virtualize.target.is_none());
-        assert!(!f.virtualize.whole_program, "fragment strips whole_program too");
-        assert!(f.virtualize.exclude.is_none(), "fragment strips exclude too");
-        assert!(!f.virtualize.desugar_class, "fragment strips desugar_class too");
-        assert!(!f.virtualize.desugar_regex, "fragment strips desugar_regex too");
+        assert!(
+            !f.virtualize.whole_program,
+            "fragment strips whole_program too"
+        );
+        assert!(
+            f.virtualize.exclude.is_none(),
+            "fragment strips exclude too"
+        );
+        assert!(
+            !f.virtualize.desugar_class,
+            "fragment strips desugar_class too"
+        );
+        assert!(
+            !f.virtualize.desugar_regex,
+            "fragment strips desugar_regex too"
+        );
         assert!(!f.strings.in_vm);
         assert!(!f.strings.self_coupled_key);
         assert!(!f.strings.exec_trace_key);

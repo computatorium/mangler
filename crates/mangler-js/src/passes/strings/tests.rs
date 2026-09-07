@@ -26,7 +26,8 @@ fn run_strings(src: &str, level: Intensity, seed: u64) -> (String, Option<String
         let pass = StringsPass;
 
         bus.enter_pass(pass.id(), pass.reads(), pass.writes());
-        pass.run(&mut ast, &cfg, &mut rng, &mut bus, &mut notes).expect("run");
+        pass.run(&mut ast, &cfg, &mut rng, &mut bus, &mut notes)
+            .expect("run");
 
         // Read the anchor back under a reader scope.
         bus.enter_pass("reader", &[Resource::decoder_anchor()], &[]);
@@ -70,7 +71,10 @@ fn each_mode_round_trips_behaviorally() {
         let (out, anchor) = run_strings(PROG, level, 1234);
         assert!(anchor.is_some(), "decoder anchor must be put at {level:?}");
         // The literal text must be gone (encoded) — at least the obvious one.
-        assert!(!out.contains("hello world"), "literal must be encoded at {level:?}: {out}");
+        assert!(
+            !out.contains("hello world"),
+            "literal must be encoded at {level:?}: {out}"
+        );
         mangler_testkit::eval::assert_behaviorally_equal(PROG, &out);
     }
 }
@@ -84,8 +88,14 @@ globalThis.__out = x + o.method();
 "#;
     let (out, _) = run_strings(src, Intensity::Medium, 7);
     // The directive must survive verbatim as the first statement.
-    assert!(out.trim_start().starts_with("\"use strict\""), "directive preserved: {out}");
-    assert!(!out.contains("encode me please"), "body literal encoded: {out}");
+    assert!(
+        out.trim_start().starts_with("\"use strict\""),
+        "directive preserved: {out}"
+    );
+    assert!(
+        !out.contains("encode me please"),
+        "body literal encoded: {out}"
+    );
     mangler_testkit::eval::assert_behaviorally_equal(src, &out);
 }
 
@@ -134,7 +144,9 @@ fn dynamic_key_round_trips_when_host_matches() {
         let mut rng = Rng::for_pass(3, "strings");
         let mut notes = Notes::new();
         bus.enter_pass("strings", StringsPass.reads(), StringsPass.writes());
-        StringsPass.run(&mut ast, &cfg, &mut rng, &mut bus, &mut notes).unwrap();
+        StringsPass
+            .run(&mut ast, &cfg, &mut rng, &mut bus, &mut notes)
+            .unwrap();
         Js::resolve(&mut ast);
         Js.print(&ast)
     });
@@ -172,7 +184,10 @@ fn pass_shape_is_correct() {
     assert_eq!(p.id(), "strings");
     assert_eq!(
         p.reads(),
-        &[Resource::property_literals(), Resource::global_name_literals()]
+        &[
+            Resource::property_literals(),
+            Resource::global_name_literals()
+        ]
     );
     assert_eq!(p.writes(), &[Resource::decoder_anchor()]);
 
@@ -228,7 +243,10 @@ globalThis.__out = greeting + "|" + obj["key name"] + "|" + f("Z") + "|" + tpl +
     fn strings_in_vm_round_trips_behaviorally() {
         let c = cfg(Intensity::High, 4242, |c| c.passes.strings.in_vm = true);
         let out = run(VM_PROG, &c);
-        assert!(!out.contains("hello world"), "literal must be encoded: {out}");
+        assert!(
+            !out.contains("hello world"),
+            "literal must be encoded: {out}"
+        );
         mangler_testkit::eval::assert_behaviorally_equal(VM_PROG, &out);
     }
 
@@ -239,10 +257,19 @@ globalThis.__out = greeting + "|" + obj["key name"] + "|" + f("Z") + "|" + tpl +
             c.passes.strings.self_coupled_key = true;
         });
         let out = run(VM_PROG, &c);
-        assert!(!out.contains("hello world"), "literal must be encoded: {out}");
+        assert!(
+            !out.contains("hello world"),
+            "literal must be encoded: {out}"
+        );
         // The sentinel must have been patched to a real (non-sentinel) value.
-        assert!(!out.contains("SCK9999999999"), "sentinel must be patched: {out}");
-        assert!(out.contains("SCK"), "patched sentinel token must remain: {out}");
+        assert!(
+            !out.contains("SCK9999999999"),
+            "sentinel must be patched: {out}"
+        );
+        assert!(
+            out.contains("SCK"),
+            "patched sentinel token must remain: {out}"
+        );
         mangler_testkit::eval::assert_behaviorally_equal(VM_PROG, &out);
     }
 
@@ -253,7 +280,10 @@ globalThis.__out = greeting + "|" + obj["key name"] + "|" + f("Z") + "|" + tpl +
             c.passes.strings.exec_trace_key = true;
         });
         let out = run(VM_PROG, &c);
-        assert!(!out.contains("hello world"), "literal must be encoded: {out}");
+        assert!(
+            !out.contains("hello world"),
+            "literal must be encoded: {out}"
+        );
         mangler_testkit::eval::assert_behaviorally_equal(VM_PROG, &out);
     }
 
@@ -283,27 +313,46 @@ globalThis.__out = greeting + "|" + obj["key name"] + "|" + f("Z") + "|" + tpl +
         // knew about them (the hard invariant).
         let c = cfg(Intensity::High, 5150, |_| {});
         let a = run(VM_PROG, &c);
-        let b = run(VM_PROG, &cfg(Intensity::High, 5150, |c| {
-            // Explicitly leave flags at their defaults (off).
-            c.passes.strings.in_vm = false;
-            c.passes.strings.self_coupled_key = false;
-            c.passes.strings.exec_trace_key = false;
-        }));
+        let b = run(
+            VM_PROG,
+            &cfg(Intensity::High, 5150, |c| {
+                // Explicitly leave flags at their defaults (off).
+                c.passes.strings.in_vm = false;
+                c.passes.strings.self_coupled_key = false;
+                c.passes.strings.exec_trace_key = false;
+            }),
+        );
         assert_eq!(a, b, "flags-off output must be byte-identical");
     }
 
     #[test]
-    fn self_coupled_patch_skipped_under_verify_and_reparses() {
+    fn verification_preserves_string_protection() {
         let c = cfg(Intensity::High, 2024, |c| {
             c.passes.strings.in_vm = true;
             c.passes.strings.self_coupled_key = true;
+            c.passes.strings.exec_trace_key = true;
             c.engine.verify = true;
         });
         let out = run(VM_PROG, &c);
-        // Under verify the self-coupled wrapper is gated off entirely, so no sentinel
-        // is present and the certified output re-parses + runs.
-        assert!(!out.contains("SCK9999999999"), "no unpatched sentinel under verify: {out}");
-        assert!(Js::reparse(&out, &ParseOpts::default()).is_ok(), "verify output reparses");
+        let mut unchecked = c.clone();
+        unchecked.engine.verify = false;
+        assert_eq!(
+            out,
+            run(VM_PROG, &unchecked),
+            "verify must not weaken protection"
+        );
+        assert!(
+            out.contains("SCK"),
+            "self-coupled protection remains active"
+        );
+        assert!(
+            !out.contains("SCK9999999999"),
+            "no unpatched sentinel under verify: {out}"
+        );
+        assert!(
+            Js::reparse(&out, &ParseOpts::default()).is_ok(),
+            "verify output reparses"
+        );
         mangler_testkit::eval::assert_behaviorally_equal(VM_PROG, &out);
     }
 
@@ -321,10 +370,15 @@ globalThis.__out = greeting + "|" + obj["key name"] + "|" + f("Z") + "|" + tpl +
         // body: this changes `("" + interp)` → the runtime self-hash mismatches → every
         // key byte is poisoned. The interpreter is the `function …(…){…}` declaration
         // emitted immediately after the hoisted `var <rc>=Reflect.construct;` alias.
-        let alias = out.find("=Reflect.construct;function ").expect("rc alias + interpreter");
+        let alias = out
+            .find("=Reflect.construct;function ")
+            .expect("rc alias + interpreter");
         // Advance to the interpreter body's opening brace (skip its param list).
         let after_alias = alias + "=Reflect.construct;function ".len();
-        let brace = out[after_alias..].find('{').expect("interpreter body brace") + after_alias;
+        let brace = out[after_alias..]
+            .find('{')
+            .expect("interpreter body brace")
+            + after_alias;
         let mut tampered = String::with_capacity(out.len() + 8);
         tampered.push_str(&out[..=brace]);
         tampered.push_str("void 0;");
@@ -337,5 +391,32 @@ globalThis.__out = greeting + "|" + obj["key name"] + "|" + f("Z") + "|" + tpl +
         // The tampered program must NOT reproduce the original observable output.
         let r = mangler_testkit::eval::eval_same_value(VM_PROG, &tampered);
         assert!(!r.equal, "tampering the decode wrapper must break decode");
+    }
+}
+
+#[test]
+fn arrow_directives_preserve_inherited_strictness() {
+    let src = "var f=()=>{'use strict';return (function(){return this===undefined})();};globalThis.__out=String(f());";
+    let (out, _) = run_strings(src, Intensity::Low, 1);
+    mangler_testkit::eval::assert_behaviorally_equal(src, &out);
+}
+
+#[test]
+fn static_import_and_reexport_attributes_remain_literals() {
+    for src in [
+        "import data from './data.json' with {type:'json'};globalThis.__out='encoded';",
+        "export {default as data} from './data.json' with {type:'json'};globalThis.__out='encoded';",
+        "export * from './data.json' with {type:'json'};globalThis.__out='encoded';",
+    ] {
+        let (out, _) = run_strings(src, Intensity::Low, 1);
+        assert!(
+            out.contains("type:\"json\""),
+            "attribute must remain literal: {out}"
+        );
+        Js::reparse(&out, &ParseOpts::default()).expect("static attributes must parse");
+        assert!(
+            !out.contains("encoded"),
+            "ordinary strings must still encode"
+        );
     }
 }

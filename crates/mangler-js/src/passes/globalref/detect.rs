@@ -41,11 +41,9 @@ pub struct Detection {
     /// operand (`++X` / `X--`), a bare `delete X`, or a non-`VarDecl` for-in /
     /// for-of head target (`for (X of a)` / `for (X in o)`).
     ///
-    /// Per the **whole-name write-exclusion** rule, a free
-    /// global is indirectable only if EVERY occurrence is a read; if a name
-    /// lands in this set the ENTIRE name is excluded from indirection (the
-    /// hoisted `_Ga = _G["X"]` alias is a load-time snapshot, so indirecting
-    /// reads of a name that is also written would desync from the live global).
+    /// Names with any direct write remain native as a conservative whole-name
+    /// policy. Accessors model reads, not assignment/delete references. Property
+    /// writes need no exclusion: accessor bodies perform a fresh lexical read.
     pub written: HashSet<String>,
     /// Set if the file contains a direct `eval(...)` call or a `with` statement;
     /// when true the pass must bail entirely (dynamic bindings break the

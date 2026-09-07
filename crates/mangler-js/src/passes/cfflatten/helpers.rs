@@ -31,7 +31,7 @@
 use swc_core::common::sync::Lrc;
 use swc_core::common::{FileName, SourceMap};
 use swc_core::ecma::ast::*;
-use swc_core::ecma::parser::{lexer::Lexer, EsSyntax, Parser, StringInput, Syntax};
+use swc_core::ecma::parser::{EsSyntax, Parser, StringInput, Syntax, lexer::Lexer};
 
 use crate::config::FileConfig;
 use mangler_core::Rng;
@@ -67,7 +67,13 @@ impl TdzHelpers {
         // array equal to the plaintext code points, reintroducing readable bytes.
         let msg_key = (rng.pick(255) + 1) as u8;
         let const_first = rng.pick(2) == 1;
-        TdzHelpers { throw_tdz, throw_const, msg_style, msg_key, const_first }
+        TdzHelpers {
+            throw_tdz,
+            throw_const,
+            msg_style,
+            msg_key,
+            const_first,
+        }
     }
 }
 
@@ -87,9 +93,9 @@ fn assemble_message(text: &str, style: usize, key: u8, param: &str) -> String {
     // A non-foldable `0` derived from the (always-string) param.
     let zero = format!("({param}+\"\").slice(({param}+\"\").length).length");
     match style % MSG_STYLE_COUNT {
-        0 => format!(
-            "String.fromCharCode.apply(null,[{codes}].map(function(c){{return c^{key};}}))"
-        ),
+        0 => {
+            format!("String.fromCharCode.apply(null,[{codes}].map(function(c){{return c^{key};}}))")
+        }
         1 => format!(
             "(function(a){{var s=\"\",k=0;for(;k<a.length;k++)s+=String.fromCharCode(a[k]^{key});return s;}})([{codes}])"
         ),
@@ -153,26 +159,14 @@ fn parse_helper_decls(helpers: &TdzHelpers) -> Vec<Stmt> {
 /// Prepends the guard helpers to the top of `program`. Call once per file, only
 /// when at least one `let`/`const` was actually rewritten.
 pub fn inject(program: &mut Program, helpers: &TdzHelpers) {
-    let decls = parse_helper_decls(helpers);
-    match program {
-        Program::Module(m) => {
-            let mut items: Vec<ModuleItem> = decls.into_iter().map(ModuleItem::Stmt).collect();
-            items.append(&mut m.body);
-            m.body = items;
-        }
-        Program::Script(s) => {
-            let mut body = decls;
-            body.append(&mut s.body);
-            s.body = body;
-        }
-    }
+    mangler_jsast::directives::insert_program_statements(program, parse_helper_decls(helpers));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::passes::cfflatten::test_support::emit_block;
-    use swc_core::common::{SyntaxContext, DUMMY_SP};
+    use swc_core::common::{DUMMY_SP, SyntaxContext};
 
     /// Render the injected helper declarations as a single source string.
     fn render_helpers(helpers: &TdzHelpers) -> String {
@@ -198,9 +192,18 @@ mod tests {
     fn assembled_messages_are_encoded_but_correct() {
         use mangler_testkit::eval::assert_behaviorally_equal;
         const FRAGMENTS: &[&str] = &[
-            "Cannot acce", "annot acce", "ss '", "before in", " before in",
-            "nitializ", "tialization", "Assignment to co", "nstant var",
-            "nstant varia", "ble.", "ariable",
+            "Cannot acce",
+            "annot acce",
+            "ss '",
+            "before in",
+            " before in",
+            "nitializ",
+            "tialization",
+            "Assignment to co",
+            "nstant var",
+            "nstant varia",
+            "ble.",
+            "ariable",
         ];
         for style in 0..MSG_STYLE_COUNT {
             for &key in &[1u8, 7, 42, 200, 255] {
@@ -232,7 +235,10 @@ mod tests {
     /// Same seed ⇒ byte-identical helper output (determinism contract).
     #[test]
     fn helpers_deterministic_per_seed() {
-        assert_eq!(render_helpers(&helpers_for(42)), render_helpers(&helpers_for(42)));
+        assert_eq!(
+            render_helpers(&helpers_for(42)),
+            render_helpers(&helpers_for(42))
+        );
     }
 
     /// Across seeds the surface form must actually vary.
@@ -242,6 +248,10 @@ mod tests {
         for seed in 0..64u64 {
             shapes.insert(render_helpers(&helpers_for(seed)));
         }
-        assert!(shapes.len() >= 2, "expected diverse helper skeletons, got {}", shapes.len());
+        assert!(
+            shapes.len() >= 2,
+            "expected diverse helper skeletons, got {}",
+            shapes.len()
+        );
     }
 }

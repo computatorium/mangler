@@ -25,12 +25,12 @@
 //!   and only obfuscate within statement bodies; user `switch` labels are rare and
 //!   left intact via the leaf range policy (`opaque_lit` only rewrites `>= 2`).
 
-use crate::artifacts::DecoderAnchorArtifact;
+use crate::artifacts::{DecoderAnchorArtifact, VmTableArtifact};
 use crate::config::FileConfig;
-use crate::opaque::{anchor_from_bus_or_inject, opaque_lit, OpaqueAnchor};
+use crate::opaque::{OpaqueAnchor, anchor_from_bus_or_inject, opaque_lit};
 use mangler_core::{Language, Notes, PassConfig, Result, Rng};
-use mangler_jsast::rewrite::{SubtreeMark, Walk};
 use mangler_jsast::Js;
+use mangler_jsast::rewrite::{SubtreeMark, Walk};
 use mangler_passgraph::{ArtifactBus, Pass, Resource};
 use swc_core::ecma::ast::{Expr, Pat};
 
@@ -47,7 +47,7 @@ impl Pass<Js, FileConfig> for ExprObfuscationPass {
     /// `get::<DecoderAnchorArtifact>()` and orders this pass after strings when
     /// strings is enabled.
     fn reads(&self) -> &[Resource] {
-        const R: &[Resource] = &[Resource::decoder_anchor()];
+        const R: &[Resource] = &[Resource::decoder_anchor(), Resource::vm_table()];
         R
     }
 
@@ -67,13 +67,9 @@ impl Pass<Js, FileConfig> for ExprObfuscationPass {
         // The fresh anchor name (when injected) is also the declarator to protect
         // from self-`core(0)`.
         let seed_word = format!("a{:x}", cfg.seed() & 0xffff);
-        let (anchor, injected) = anchor_from_bus_or_inject(
-            ast.program_mut(),
-            bus,
-            || cfg.fresh_name(),
-            &seed_word,
-        )
-        .map_err(|e| mangler_core::Error::transform(self.id(), e.to_string()))?;
+        let (anchor, injected) =
+            anchor_from_bus_or_inject(ast.program_mut(), bus, || cfg.fresh_name(), &seed_word)
+                .map_err(|e| mangler_core::Error::transform(self.id(), e.to_string()))?;
 
         if injected {
             notes.push(mangler_core::Note::from(
@@ -91,7 +87,10 @@ impl Pass<Js, FileConfig> for ExprObfuscationPass {
             _ => None,
         };
 
-        rewrite_literals(ast.program_mut(), rng, &anchor, protect_name.as_deref());
+        let vm = bus
+            .get::<VmTableArtifact>()
+            .map_err(|error| mangler_core::Error::transform(self.id(), error.to_string()))?;
+        rewrite_literals(ast.program_mut(), rng, &anchor, protect_name.as_deref(), vm);
         Ok(())
     }
 }
@@ -119,6 +118,7 @@ fn rewrite_literals(
     rng: &mut Rng,
     anchor: &OpaqueAnchor,
     protect_name: Option<&str>,
+    vm: Option<&VmTableArtifact>,
 ) {
     let protect = protect_name.map(|s| s.to_string());
     Walk::new()
@@ -136,7 +136,9 @@ fn rewrite_literals(
             SubtreeMark::VarDeclaratorInit { name } => {
                 matches!((&protect, name),
                     (Some(p), Pat::Ident(bi)) if bi.id.sym.as_ref() == p.as_str())
+                || matches!((vm, name), (Some(vm), Pat::Ident(bi)) if bi.id.sym.as_ref() == vm.program_table_name)
             }
+            SubtreeMark::FnDecl { ident } => vm.is_some_and(|vm| vm.interpreter_names.iter().any(|name| ident.sym.as_ref() == name)),
             _ => false,
         })
         .run(program);
@@ -168,5 +170,19 @@ mod tests {
             mangler_jsast::Js::reparse(&out, &mangler_jsast::ParseOpts::default()).is_ok(),
             "obfuscated output must reparse: {out}"
         );
+    }
+
+    #[test]
+    fn virtualized_runtime_initializes_before_opaque_decoder_calls() {
+        let src = "function pay(x){'use strict';return this===undefined ? x+2 : -1;}globalThis.__out=pay(40);";
+        for level in [Intensity::Medium, Intensity::High, Intensity::Max] {
+            let mut config = crate::test_support::resolved(level, 1);
+            config.passes.virtualize.target = Some("pay".into());
+            config.engine.verify = true;
+            let out = crate::process(src, &mangler_jsast::ParseOpts::default(), &config)
+                .unwrap()
+                .0;
+            mangler_testkit::assert_behaviorally_equal(src, &out);
+        }
     }
 }

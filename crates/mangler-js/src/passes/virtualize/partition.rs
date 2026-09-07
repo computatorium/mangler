@@ -305,7 +305,9 @@ fn collect_refs_stmt(s: &Stmt, out: &mut HashSet<String>) {
 pub(crate) fn export_bound_names(items: &[ModuleItem]) -> HashSet<String> {
     let mut out = HashSet::new();
     for it in items {
-        let ModuleItem::ModuleDecl(d) = it else { continue };
+        let ModuleItem::ModuleDecl(d) = it else {
+            continue;
+        };
         match d {
             ModuleDecl::ExportNamed(named) => {
                 // `export { local as exported }` — the LOCAL name is what a run must
@@ -313,10 +315,10 @@ pub(crate) fn export_bound_names(items: &[ModuleItem]) -> HashSet<String> {
                 // binding; their `src` is Some, so skip those.)
                 if named.src.is_none() {
                     for spec in &named.specifiers {
-                        if let ExportSpecifier::Named(n) = spec {
-                            if let ModuleExportName::Ident(id) = &n.orig {
-                                out.insert(id.sym.to_string());
-                            }
+                        if let ExportSpecifier::Named(n) = spec
+                            && let ModuleExportName::Ident(id) = &n.orig
+                        {
+                            out.insert(id.sym.to_string());
                         }
                     }
                 }
@@ -501,25 +503,24 @@ impl CellRewriter<'_> {
 impl VisitMut for CellRewriter<'_> {
     // Assignment / compound target `x …= v` → `x[0] …= v`.
     fn visit_mut_assign_expr(&mut self, n: &mut AssignExpr) {
-        if let AssignTarget::Simple(SimpleAssignTarget::Ident(bi)) = &n.left {
-            if self.cells.contains(bi.id.sym.as_ref()) {
-                n.left = AssignTarget::Simple(SimpleAssignTarget::Member(cell_member(
-                    bi.id.sym.as_ref(),
-                )));
-                n.right.visit_mut_with(self);
-                return;
-            }
+        if let AssignTarget::Simple(SimpleAssignTarget::Ident(bi)) = &n.left
+            && self.cells.contains(bi.id.sym.as_ref())
+        {
+            n.left =
+                AssignTarget::Simple(SimpleAssignTarget::Member(cell_member(bi.id.sym.as_ref())));
+            n.right.visit_mut_with(self);
+            return;
         }
         n.left.visit_mut_with(self);
         n.right.visit_mut_with(self);
     }
 
     fn visit_mut_update_expr(&mut self, n: &mut UpdateExpr) {
-        if let Expr::Ident(id) = &*n.arg {
-            if self.cells.contains(id.sym.as_ref()) {
-                *n.arg = Self::cellify_ident(id);
-                return;
-            }
+        if let Expr::Ident(id) = &*n.arg
+            && self.cells.contains(id.sym.as_ref())
+        {
+            *n.arg = Self::cellify_ident(id);
+            return;
         }
         n.arg.visit_mut_with(self);
     }
@@ -546,14 +547,14 @@ impl VisitMut for CellRewriter<'_> {
     }
 
     fn visit_mut_prop(&mut self, p: &mut Prop) {
-        if let Prop::Shorthand(id) = p {
-            if self.cells.contains(id.sym.as_ref()) {
-                *p = Prop::KeyValue(KeyValueProp {
-                    key: PropName::Ident(IdentName::new(id.sym.clone(), id.span)),
-                    value: Box::new(Self::cellify_ident(id)),
-                });
-                return;
-            }
+        if let Prop::Shorthand(id) = p
+            && self.cells.contains(id.sym.as_ref())
+        {
+            *p = Prop::KeyValue(KeyValueProp {
+                key: PropName::Ident(IdentName::new(id.sym.clone(), id.span)),
+                value: Box::new(Self::cellify_ident(id)),
+            });
+            return;
         }
         p.visit_mut_children_with(self);
     }
@@ -561,15 +562,14 @@ impl VisitMut for CellRewriter<'_> {
 
 impl CellRewriter<'_> {
     fn cellify_for_head(&mut self, head: &mut ForHead) {
-        if let ForHead::Pat(p) = head {
-            if let Pat::Ident(bi) = &**p {
-                if self.cells.contains(bi.id.sym.as_ref()) {
-                    *head = ForHead::Pat(Box::new(Pat::Expr(Box::new(Expr::Member(cell_member(
-                        bi.id.sym.as_ref(),
-                    ))))));
-                    return;
-                }
-            }
+        if let ForHead::Pat(p) = head
+            && let Pat::Ident(bi) = &**p
+            && self.cells.contains(bi.id.sym.as_ref())
+        {
+            *head = ForHead::Pat(Box::new(Pat::Expr(Box::new(Expr::Member(cell_member(
+                bi.id.sym.as_ref(),
+            ))))));
+            return;
         }
         head.visit_mut_with(self);
     }
@@ -709,12 +709,11 @@ pub(crate) fn restrict_to_safe(
             _ => continue 'cand, // declared by 0 or >1 runs → ambiguous/unsafe.
         }
         // Function-decl forward-reference hazard: a read before the in-place store.
-        if is_fn_decl.contains(name) {
-            if let (Some(&di), Some(&ri)) = (decl_index.get(name), first_ref.get(name)) {
-                if ri < di {
-                    continue 'cand;
-                }
-            }
+        if is_fn_decl.contains(name)
+            && let (Some(&di), Some(&ri)) = (decl_index.get(name), first_ref.get(name))
+            && ri < di
+        {
+            continue 'cand;
         }
         safe.insert(name.clone());
     }
@@ -795,8 +794,14 @@ mod tests {
     #[test]
     fn classify_top_level_await_is_native() {
         let cs = classify(items("await p; async function f(){ await q; }"));
-        assert!(matches!(cs[0], Class::Native(_)), "top-level await → native");
-        assert!(matches!(cs[1], Class::Wrappable(_)), "await-in-async-fn → wrappable");
+        assert!(
+            matches!(cs[0], Class::Native(_)),
+            "top-level await → native"
+        );
+        assert!(
+            matches!(cs[1], Class::Wrappable(_)),
+            "await-in-async-fn → wrappable"
+        );
     }
 
     /// §3.1: maximal contiguous wrappable runs separated by native boundaries.
@@ -821,8 +826,14 @@ mod tests {
             "var x=1; var local=9; import 'm'; globalThis.o = x;",
         )));
         let cross = analyze_cross_run(&segs, &HashSet::new());
-        assert!(cross.cells.contains("x"), "x is read across the import → cell");
-        assert!(!cross.cells.contains("local"), "local is run-local → not a cell");
+        assert!(
+            cross.cells.contains("x"),
+            "x is read across the import → cell"
+        );
+        assert!(
+            !cross.cells.contains("local"),
+            "local is run-local → not a cell"
+        );
     }
 
     /// §5: export-bound names are treated as cross-run (read by the export boundary).
@@ -864,11 +875,16 @@ mod tests {
     /// A name declared in TWO runs is ambiguous → not safe to cell.
     #[test]
     fn restrict_to_safe_rejects_multi_run_decl() {
-        let segs = segment(classify(items("var x=1; import 'm'; var x=2; import 'n'; x;")));
+        let segs = segment(classify(items(
+            "var x=1; import 'm'; var x=2; import 'n'; x;",
+        )));
         let mut cand = HashSet::new();
         cand.insert("x".to_string());
         let safe = restrict_to_safe(&segs, &cand, &HashSet::new());
-        assert!(!safe.contains("x"), "declared in two runs → ambiguous → unsafe");
+        assert!(
+            !safe.contains("x"),
+            "declared in two runs → ambiguous → unsafe"
+        );
     }
 
     /// Bug B: a cross-run `let`/`const` is UNSAFE to cell — a `var x=[undefined]` cell
@@ -881,7 +897,10 @@ mod tests {
             let mut cand = HashSet::new();
             cand.insert("x".to_string());
             let safe = restrict_to_safe(&segs, &cand, &HashSet::new());
-            assert!(!safe.contains("x"), "{kw} cross-run binding must not cell (TDZ)");
+            assert!(
+                !safe.contains("x"),
+                "{kw} cross-run binding must not cell (TDZ)"
+            );
         }
         // `var` of the same shape stays safe (semantics preserved by the cell).
         let segs = segment(classify(items("var x=1; import 'm'; globalThis.o = x;")));
@@ -900,7 +919,10 @@ mod tests {
         let mut cand = HashSet::new();
         cand.insert("x".to_string());
         let safe = restrict_to_safe(&segs, &cand, &HashSet::new());
-        assert!(!safe.contains("x"), "name read by a native stmt must stay native");
+        assert!(
+            !safe.contains("x"),
+            "name read by a native stmt must stay native"
+        );
     }
 
     /// Bug A: an export-bound name is UNSAFE — `export { x }` cannot become
@@ -913,7 +935,10 @@ mod tests {
         let mut cand = HashSet::new();
         cand.insert("x".to_string());
         let safe = restrict_to_safe(&segs, &cand, &exports);
-        assert!(!safe.contains("x"), "exported name must stay a native binding");
+        assert!(
+            !safe.contains("x"),
+            "exported name must stay a native binding"
+        );
     }
 
     /// Cell hoist decls are deterministic (sorted) and one-element `[undefined]` cells.

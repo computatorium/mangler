@@ -59,20 +59,20 @@ pub mod stub;
 
 use crate::artifacts::DecoderAnchorArtifact;
 use crate::config::FileConfig;
-use crate::opaque::{opaque_u32, OpaqueAnchor};
+use crate::opaque::{OpaqueAnchor, opaque_u32};
 use collect::{DispatchPlan, PendingCall, RewriteFinalizer, StringCollector};
-use encode::{derive_runtime_key, encode_entries, mask_base_key, EncodingParams};
+use encode::{EncodingParams, derive_runtime_key, encode_entries, mask_base_key};
 use mangler_config::StringMode;
 use mangler_core::{Error, Language, Notes, Result, Rng};
 use mangler_jsast::{Js, ParseOpts};
 use mangler_passgraph::{ArtifactBus, Pass, Resource};
-use stub::{render_stub, StubParams, VmDecodeParams};
-use swc_core::common::{SyntaxContext, DUMMY_SP};
+use stub::{StubParams, VmDecodeParams, render_stub};
+use swc_core::common::{DUMMY_SP, SyntaxContext};
 use swc_core::ecma::ast::*;
 use swc_core::ecma::visit::VisitMutWith;
 
 use crate::artifacts::SelfCoupledKeyArtifact;
-use mangler_vm::{compile_body, TableBuilder, VmDiversity, VmNames};
+use mangler_vm::{TableBuilder, VmDiversity, VmNames, compile_body};
 
 /// Encodes string literals and emits the runtime decoder; provides the
 /// `DecoderAnchor` artifact the opaque-value passes anchor on.
@@ -86,8 +86,10 @@ impl Pass<Js, FileConfig> for StringsPass {
     /// Reads the property-name + global-name literal markers so the scheduler runs
     /// this pass AFTER memberaccess + globalref, encoding the literals they produced.
     fn reads(&self) -> &[Resource] {
-        const R: &[Resource] =
-            &[Resource::property_literals(), Resource::global_name_literals()];
+        const R: &[Resource] = &[
+            Resource::property_literals(),
+            Resource::global_name_literals(),
+        ];
         R
     }
 
@@ -243,7 +245,6 @@ fn run_strings(
     // build (the hard invariant). Stage 5 (`exec_trace_key`) appends two trailing
     // params + the accumulator block to the primitive under its own gate; Stage 4
     // (`self_coupled_key`) only affects the wrapper + the post-codegen patch.
-    let verify = cfg.resolved().engine.verify;
     let mut vm_decode: Option<VmDecodeParams> = None;
     let mut vm_prologue: Vec<Stmt> = Vec::new();
     let mut self_coupled_interp: Option<String> = None;
@@ -253,9 +254,9 @@ fn run_strings(
 
     if s.in_vm {
         // Stage 5: embed the trace-augmented primitive only when the flag is active
-        // (on + not verify). Otherwise embed the base primitive verbatim so the arity
+        // Otherwise embed the base primitive verbatim so the arity
         // matches the (un-augmented) thunk arg list.
-        let want_exec_trace = s.exec_trace_key && !verify;
+        let want_exec_trace = s.exec_trace_key;
         let primitive: std::borrow::Cow<'static, str> = if want_exec_trace {
             std::borrow::Cow::Owned(stub::vm_decode_primitive_with_trace())
         } else {
@@ -265,7 +266,7 @@ fn run_strings(
             Some((params, prologue)) => {
                 vm_prologue = prologue;
                 // Stage 4: self-coupled key — drawn first so the off-path RNG is stable.
-                if s.self_coupled_key && !verify {
+                if s.self_coupled_key {
                     self_coupled_byte = (rng.random_u32() as u8) | 1;
                     self_coupled_interp = Some(params.interp_name.clone());
                 }
@@ -355,10 +356,8 @@ fn run_strings(
     // Stage 4: hand the interpreter name to the runner so its post-codegen finalizer
     // can compute the build-time expected source hash and patch the `SCK<digits>`
     // sentinel. Only when the self-coupled key is actually active (flag on, VM chunk
-    // produced, not verify).
-    if self_coupled_active
-        && let Some(interp_name) = self_coupled_interp
-    {
+    // produced).
+    if self_coupled_active && let Some(interp_name) = self_coupled_interp {
         bus.put(SelfCoupledKeyArtifact { interp_name })
             .map_err(|e| Error::transform("strings", e.to_string()))?;
     }
@@ -469,21 +468,7 @@ fn parse_stub_stmts(stub_src: &str) -> Result<Vec<Stmt>> {
 /// Splice `stmts` into `program` just after any leading directive prologue, so a
 /// `"use strict"` stays first.
 fn splice_at_prologue(program: &mut Program, stmts: Vec<Stmt>) {
-    match program {
-        Program::Script(sc) => {
-            let at = leading_directive_count(&sc.body);
-            sc.body.splice(at..at, stmts);
-        }
-        Program::Module(md) => {
-            let at = md
-                .body
-                .iter()
-                .take_while(|it| matches!(it, ModuleItem::Stmt(s) if is_directive_stmt(s)))
-                .count();
-            let items: Vec<ModuleItem> = stmts.into_iter().map(ModuleItem::Stmt).collect();
-            md.body.splice(at..at, items);
-        }
-    }
+    mangler_jsast::directives::insert_program_statements(program, stmts);
 }
 
 /// Prepend `prologue` into the body of the `var <core> = (function(){…})()` IIFE so
@@ -495,7 +480,9 @@ fn splice_at_prologue(program: &mut Program, stmts: Vec<Stmt>) {
 /// (fail-safe — but `render_core` always emits this shape).
 fn inject_into_core_iife(core_name: &str, stub_stmts: &mut [Stmt], prologue: Vec<Stmt>) {
     for stmt in stub_stmts.iter_mut() {
-        let Stmt::Decl(Decl::Var(var)) = stmt else { continue };
+        let Stmt::Decl(Decl::Var(var)) = stmt else {
+            continue;
+        };
         for decl in var.decls.iter_mut() {
             let Pat::Ident(bi) = &decl.name else { continue };
             if bi.id.sym.as_ref() != core_name {
@@ -503,9 +490,12 @@ fn inject_into_core_iife(core_name: &str, stub_stmts: &mut [Stmt], prologue: Vec
             }
             // `var <core> = (function(){…})()` — the init is a CallExpr whose callee
             // is (optionally parenthesized) a function expression.
-            let Some(init) = decl.init.as_deref_mut() else { return };
+            let Some(init) = decl.init.as_deref_mut() else {
+                return;
+            };
             if let Some(body) = iife_body_mut(init) {
-                body.stmts.splice(0..0, prologue);
+                let at = mangler_jsast::directives::leading_directive_count(&body.stmts);
+                body.stmts.splice(at..at, prologue);
             }
             return;
         }
@@ -528,14 +518,6 @@ fn iife_body_mut(expr: &mut Expr) -> Option<&mut BlockStmt> {
         Expr::Fn(fe) => fe.function.body.as_mut(),
         _ => None,
     }
-}
-
-fn is_directive_stmt(stmt: &Stmt) -> bool {
-    matches!(stmt, Stmt::Expr(ExprStmt { expr, .. }) if matches!(&**expr, Expr::Lit(Lit::Str(_))))
-}
-
-fn leading_directive_count(stmts: &[Stmt]) -> usize {
-    stmts.iter().take_while(|s| is_directive_stmt(s)).count()
 }
 
 /// Build an involution permutation of `[0, n)` (its own inverse) via random pair
@@ -608,7 +590,10 @@ fn build_dispatch_plan(
         call_index.push(index_expr(rng, anchor, transformed));
     }
 
-    DispatchPlan { call_callees, call_index }
+    DispatchPlan {
+        call_callees,
+        call_index,
+    }
 }
 
 /// A bare identifier callee expression (`name`).
@@ -643,7 +628,11 @@ fn index_expr(rng: &mut Rng, anchor: &OpaqueAnchor, value: u32) -> Expr {
     if value >= 2 {
         opaque_u32(rng, anchor, value)
     } else {
-        Expr::Lit(Lit::Num(Number { span: DUMMY_SP, value: value as f64, raw: None }))
+        Expr::Lit(Lit::Num(Number {
+            span: DUMMY_SP,
+            value: value as f64,
+            raw: None,
+        }))
     }
 }
 

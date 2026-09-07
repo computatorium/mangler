@@ -1,7 +1,7 @@
 //! Engine façade integration tests: per-language round-trips, HTML embed-handler
 //! wiring, `process_many` ordering/parallelism, stats, and determinism.
 
-use mangler_cli::{config::builder, Engine, Input};
+use mangler_cli::{Engine, Input, config::builder};
 use mangler_config::{Intensity, Lang};
 
 fn engine(level: Intensity, seed: u64) -> Engine {
@@ -15,7 +15,11 @@ fn js_round_trips_and_obfuscates() {
     let out = eng.process(&Input::new(src).with_lang(Lang::Js)).unwrap();
     assert!(!out.code.is_empty());
     // High preset mangles locals: the source-level name should be gone.
-    assert!(!out.code.contains("total"), "locals not mangled: {}", out.code);
+    assert!(
+        !out.code.contains("total"),
+        "locals not mangled: {}",
+        out.code
+    );
     assert_eq!(out.stats.input_bytes, src.len());
     assert_eq!(out.stats.output_bytes, out.code.len());
 }
@@ -35,7 +39,11 @@ fn html_round_trips() {
     let out = eng
         .process(&Input::new("<!-- x --><div>  a   b  </div>").with_lang(Lang::Html))
         .unwrap();
-    assert!(!out.code.contains("x"), "comment not stripped: {}", out.code);
+    assert!(
+        !out.code.contains("x"),
+        "comment not stripped: {}",
+        out.code
+    );
     assert!(out.code.contains("<div>"));
 }
 
@@ -47,7 +55,11 @@ fn html_inline_script_is_obfuscated_via_wired_handlers() {
     // The embedded JS went through mangler_js (fragment config): the local
     // `message` must be mangled away, proving the handler is actually wired.
     assert!(out.code.contains("<script>"), "script tag missing");
-    assert!(!out.code.contains("message"), "embedded JS not obfuscated: {}", out.code);
+    assert!(
+        !out.code.contains("message"),
+        "embedded JS not obfuscated: {}",
+        out.code
+    );
 }
 
 #[test]
@@ -56,14 +68,20 @@ fn html_inline_style_is_minified_via_wired_handlers() {
     let src = "<div style=\"color: #ffffff;  margin: 0px;\">x</div>";
     let out = eng.process(&Input::new(src).with_lang(Lang::Html)).unwrap();
     // Inline style routed through mangler_css::process_inline → shortened.
-    assert!(out.code.contains("#fff"), "inline style not minified: {}", out.code);
+    assert!(
+        out.code.contains("#fff"),
+        "inline style not minified: {}",
+        out.code
+    );
 }
 
 #[test]
 fn lang_detected_from_path_extension() {
     let eng = engine(Intensity::Minify, 1);
     // No explicit lang; `.css` extension drives dispatch.
-    let out = eng.process(&Input::new(".a{color:red}").with_path("x.css")).unwrap();
+    let out = eng
+        .process(&Input::new(".a{color:red}").with_path("x.css"))
+        .unwrap();
     assert!(out.code.contains(".a"));
 }
 
@@ -85,7 +103,11 @@ fn process_many_preserves_input_order() {
     assert_eq!(results.len(), inputs.len());
     for (i, r) in results.iter().enumerate() {
         let out = r.as_ref().unwrap();
-        assert!(out.code.contains(&format!(".c{i}")), "result {i} out of order: {}", out.code);
+        assert!(
+            out.code.contains(&format!(".c{i}")),
+            "result {i} out of order: {}",
+            out.code
+        );
     }
 }
 
@@ -120,8 +142,12 @@ fn different_seeds_can_diverge() {
     // Not a hard guarantee for every input, but at High the seed should move
     // the output for a non-trivial program.
     let src = "function f(x){let y = x*2 + 1; return y;} f(3);";
-    let a = engine(Intensity::High, 1).process(&Input::new(src).with_lang(Lang::Js)).unwrap();
-    let b = engine(Intensity::High, 999).process(&Input::new(src).with_lang(Lang::Js)).unwrap();
+    let a = engine(Intensity::High, 1)
+        .process(&Input::new(src).with_lang(Lang::Js))
+        .unwrap();
+    let b = engine(Intensity::High, 999)
+        .process(&Input::new(src).with_lang(Lang::Js))
+        .unwrap();
     assert_ne!(a.code, b.code);
 }
 
@@ -133,5 +159,24 @@ fn stats_report_byte_sizes() {
     assert_eq!(out.stats.input_bytes, src.len());
     assert_eq!(out.stats.output_bytes, out.code.len());
     // Minified CSS is smaller → ratio < 1.
-    assert!(out.stats.ratio() < 1.0, "ratio {} unexpected", out.stats.ratio());
+    assert!(
+        out.stats.ratio() < 1.0,
+        "ratio {} unexpected",
+        out.stats.ratio()
+    );
+}
+
+#[test]
+fn required_virtualization_rejects_non_javascript_inputs() {
+    let flags = mangler_config::ConfigFlags {
+        require_virtualized: Some("payment*".into()),
+        ..Default::default()
+    };
+    let engine = Engine::new(flags.try_into().unwrap());
+    for lang in [Lang::Html, Lang::Css] {
+        let error = engine
+            .process(&Input::new("<script>function payment(){}</script>").with_lang(lang))
+            .unwrap_err();
+        assert!(error.to_string().contains("only for JavaScript"), "{error}");
+    }
 }

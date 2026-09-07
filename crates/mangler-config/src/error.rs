@@ -43,6 +43,14 @@ pub enum ConfigError {
         b: &'static str,
     },
 
+    /// A target pattern is not a valid glob.
+    #[error("invalid {flag} glob {value:?}: {reason}")]
+    InvalidGlob {
+        flag: &'static str,
+        value: String,
+        reason: String,
+    },
+
     /// Parsing the `--config` TOML failed (I/O or syntax/unknown-key).
     #[error("config file: {0}")]
     File(String),

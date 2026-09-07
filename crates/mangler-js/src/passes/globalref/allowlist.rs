@@ -1,28 +1,6 @@
-//! Curated allowlist of standard globals that are safe to indirect (`Safe` mode).
-//!
-//! Membership criteria (both must hold):
-//!
-//! 1. **Existence.** The name names a standard global that *exists* in its
-//!    intended runtime (ECMAScript intrinsic, a Web/DOM API, or a Node global).
-//!    This matters because the indirection turns a `ReferenceError` on a missing
-//!    global into a silent `undefined` read; restricting to known-present globals
-//!    keeps that exposure to programs that were already broken.
-//! 2. **Safe receiver semantics.** Reading the name and calling it bare must be
-//!    equivalent to reading it from the global object and calling it bare. This
-//!    holds for plain functions/constructors/namespaces: `_Ga = globalThis["X"]`
-//!    then `_Ga(args)` is an unqualified call of the same value as `X(args)`, so
-//!    `this` is identical (undefined strict / global sloppy). Methods that must
-//!    be called *with the global object as receiver* (none of the entries below
-//!    require this — they are all global values, not methods of a host object
-//!    whose `this` is observed) are excluded.
-//!
-//! `globalThis` itself is intentionally **NOT** on the list: it is the anchor
-//! (`var _G = globalThis;`), so indirecting it would be circular.
-//!
-//! Lookup is an O(log n) binary search over a `&'static [&str]` kept in sorted
-//! order (verified by a unit test). No external dependency is needed — `phf` is
-//! not in `Cargo.toml`, and a sorted-slice binary search is allocation-free and
-//! avoids a `OnceLock`/`HashSet` init.
+//! Standard names selected for lexical accessor indirection in Safe mode.
+//! Selection does not assume existence or global-object membership: accessors
+//! perform the original lookup lazily. CommonJS wrapper bindings stay native.
 
 /// Sorted list of allowlisted global names. MUST stay sorted (a unit test
 /// enforces this so `binary_search` stays correct).
@@ -217,8 +195,6 @@ static ALLOWLIST: &[&str] = &[
     "XMLSerializer",
     "XPathEvaluator",
     "XPathResult",
-    "__dirname",
-    "__filename",
     "alert",
     "atob",
     "btoa",
@@ -241,7 +217,6 @@ static ALLOWLIST: &[&str] = &[
     "encodeURI",
     "encodeURIComponent",
     "escape",
-    "exports",
     "fetch",
     "focus",
     "frames",
@@ -254,7 +229,6 @@ static ALLOWLIST: &[&str] = &[
     "localStorage",
     "location",
     "matchMedia",
-    "module",
     "navigator",
     "open",
     "parent",
@@ -268,7 +242,6 @@ static ALLOWLIST: &[&str] = &[
     "queueMicrotask",
     "requestAnimationFrame",
     "requestIdleCallback",
-    "require",
     "screen",
     "scroll",
     "scrollBy",
@@ -284,6 +257,14 @@ static ALLOWLIST: &[&str] = &[
     "unescape",
     "window",
 ];
+
+/// These bindings belong to a CommonJS wrapper, not the global environment.
+pub fn is_commonjs_binding(name: &str) -> bool {
+    matches!(
+        name,
+        "require" | "module" | "exports" | "__filename" | "__dirname"
+    )
+}
 
 /// Returns whether `name` is an allowlisted standard global safe to indirect.
 ///
@@ -332,9 +313,21 @@ mod tests {
     #[test]
     fn known_globals_are_allowlisted() {
         for name in [
-            "Object", "Array", "Math", "JSON", "Promise", "parseInt", "isNaN",
-            "document", "window", "fetch", "console", "setTimeout", "WebSocket",
-            "process", "Buffer", "require",
+            "Object",
+            "Array",
+            "Math",
+            "JSON",
+            "Promise",
+            "parseInt",
+            "isNaN",
+            "document",
+            "window",
+            "fetch",
+            "console",
+            "setTimeout",
+            "WebSocket",
+            "process",
+            "Buffer",
         ] {
             assert!(is_allowlisted(name), "{name} should be allowlisted");
         }

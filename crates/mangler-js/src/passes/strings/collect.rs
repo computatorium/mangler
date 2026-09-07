@@ -7,8 +7,9 @@
 //! prologues, import/export sources, property keys, JSX, TS types) so directives
 //! like `"use strict"` are never encoded.
 
+use mangler_jsast::directives::is_directive;
 use std::collections::HashMap;
-use swc_core::common::{SyntaxContext, DUMMY_SP};
+use swc_core::common::{DUMMY_SP, SyntaxContext};
 use swc_core::ecma::ast::*;
 use swc_core::ecma::visit::{VisitMut, VisitMutWith};
 
@@ -153,7 +154,11 @@ impl StringCollector {
             }
         }
         let quasis = empty_quasis(subs.len() + 1);
-        *expr = Expr::Tpl(Tpl { span: DUMMY_SP, exprs: subs, quasis });
+        *expr = Expr::Tpl(Tpl {
+            span: DUMMY_SP,
+            exprs: subs,
+            quasis,
+        });
     }
 }
 
@@ -228,6 +233,22 @@ impl VisitMut for StringCollector {
         }
     }
 
+    fn visit_mut_arrow_expr(&mut self, n: &mut ArrowExpr) {
+        n.params.visit_mut_with(self);
+        match &mut *n.body {
+            BlockStmtOrExpr::BlockStmt(body) => {
+                let previous = self.ctx_stack.in_directive;
+                let count = mangler_jsast::directives::leading_directive_count(&body.stmts);
+                for (idx, stmt) in body.stmts.iter_mut().enumerate() {
+                    self.ctx_stack.in_directive = idx < count;
+                    stmt.visit_mut_with(self);
+                }
+                self.ctx_stack.in_directive = previous;
+            }
+            BlockStmtOrExpr::Expr(expr) => expr.visit_mut_with(self),
+        }
+    }
+
     fn visit_mut_import_decl(&mut self, n: &mut ImportDecl) {
         for s in &mut n.specifiers {
             s.visit_mut_with(self);
@@ -236,9 +257,7 @@ impl VisitMut for StringCollector {
         self.ctx_stack.in_import_src = true;
         n.src.visit_mut_with(self);
         self.ctx_stack.in_import_src = prev;
-        if let Some(asserts) = n.with.as_mut() {
-            asserts.visit_mut_with(self);
-        }
+        // Static import attributes require literal values, never decoder calls.
     }
 
     fn visit_mut_named_export(&mut self, n: &mut NamedExport) {
@@ -251,9 +270,7 @@ impl VisitMut for StringCollector {
             src.visit_mut_with(self);
             self.ctx_stack.in_export_src = prev;
         }
-        if let Some(asserts) = n.with.as_mut() {
-            asserts.visit_mut_with(self);
-        }
+        // Static import attributes require literal values, never decoder calls.
     }
 
     fn visit_mut_export_all(&mut self, n: &mut ExportAll) {
@@ -261,9 +278,7 @@ impl VisitMut for StringCollector {
         self.ctx_stack.in_export_src = true;
         n.src.visit_mut_with(self);
         self.ctx_stack.in_export_src = prev;
-        if let Some(asserts) = n.with.as_mut() {
-            asserts.visit_mut_with(self);
-        }
+        // Static import attributes require literal values, never decoder calls.
     }
 
     fn visit_mut_prop_name(&mut self, n: &mut PropName) {
@@ -310,7 +325,11 @@ pub struct RewriteFinalizer<'a> {
 
 impl<'a> RewriteFinalizer<'a> {
     pub fn new(core_name: &'a str, plan: &'a DispatchPlan) -> Self {
-        RewriteFinalizer { core_name, plan, cursor: 0 }
+        RewriteFinalizer {
+            core_name,
+            plan,
+            cursor: 0,
+        }
     }
 }
 
@@ -341,22 +360,21 @@ impl VisitMut for RewriteFinalizer<'_> {
             span: DUMMY_SP,
             ctxt: SyntaxContext::empty(),
             callee: Callee::Expr(Box::new(callee)),
-            args: vec![ExprOrSpread { spread: None, expr: Box::new(arg_expr) }],
+            args: vec![ExprOrSpread {
+                spread: None,
+                expr: Box::new(arg_expr),
+            }],
             type_args: None,
         });
     }
 }
 
-fn is_directive_stmt(stmt: &Stmt) -> bool {
-    matches!(stmt, Stmt::Expr(ExprStmt { expr, .. }) if matches!(&**expr, Expr::Lit(Lit::Str(_))))
-}
-
 fn leading_directive_count_script(stmts: &[Stmt]) -> usize {
-    stmts.iter().take_while(|s| is_directive_stmt(s)).count()
+    mangler_jsast::directives::leading_directive_count(stmts)
 }
 
 fn leading_directive_count_module(body: &[ModuleItem]) -> usize {
     body.iter()
-        .take_while(|it| matches!(it, ModuleItem::Stmt(s) if is_directive_stmt(s)))
+        .take_while(|it| matches!(it, ModuleItem::Stmt(s) if is_directive(s)))
         .count()
 }

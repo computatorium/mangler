@@ -42,8 +42,13 @@ fn corpus_behavior_preserved_at_medium() {
 fn corpus_behavior_preserved_across_levels_and_seeds() {
     for (level, seed) in [
         (Intensity::Minify, 1),
+        (Intensity::Low, 1),
         (Intensity::Medium, 7),
         (Intensity::Medium, 99),
+        (Intensity::High, 1),
+        (Intensity::High, 42),
+        (Intensity::Max, 1),
+        (Intensity::Max, 42),
     ] {
         let n = corpus::assert_all(|src| mangle(src, level, seed));
         assert!(n >= 20, "checked only {n} at {level:?}/{seed}");
@@ -76,7 +81,8 @@ fn determinism_byte_identical() {
 fn idempotent_at_minify() {
     // At Minify only mangle/minify runs (no literal/member rewriting), so the
     // transform is a clean fixpoint.
-    let src = "function f(){ var localName = 1; return localName + 2; } globalThis.__out = String(f());";
+    let src =
+        "function f(){ var localName = 1; return localName + 2; } globalThis.__out = String(f());";
     golden::assert_idempotent(|s| mangle(s, Intensity::Minify, 1), src);
 }
 
@@ -122,8 +128,14 @@ fn whole_program_webgl_fixture_virtualizes_and_renders() {
     let src = include_str!("../../../tests/corpus/webgl_render_loop.js");
     let out = mangle_whole_program(src, Intensity::Medium, 7);
     // The distinctive native loop body is gone — it now lives as VM bytecode.
-    assert!(!out.contains("renderFrame(frame)"), "render loop pulled into the VM:\n{out}");
-    assert!(!out.contains("__gl.push"), "GL recorder calls are in the VM, not native");
+    assert!(
+        !out.contains("renderFrame(frame)"),
+        "render loop pulled into the VM:\n{out}"
+    );
+    assert!(
+        !out.contains("__gl.push"),
+        "GL recorder calls are in the VM, not native"
+    );
     // It still renders identically (same GL call sequence into __out).
     eval::assert_behaviorally_equal(src, &out);
 }
@@ -135,7 +147,10 @@ fn whole_program_deterministic_through_pipeline() {
     let src = include_str!("../../../tests/corpus/webgl_render_loop.js");
     let a = mangle_whole_program(src, Intensity::Medium, 42);
     let b = mangle_whole_program(src, Intensity::Medium, 42);
-    assert_eq!(a, b, "same source+seed must be byte-identical under whole-program");
+    assert_eq!(
+        a, b,
+        "same source+seed must be byte-identical under whole-program"
+    );
 }
 
 /// Resolve a whole-program config that ALSO excludes a name-glob (Phase 3).
@@ -185,7 +200,10 @@ fn whole_program_excluded_render_loop_stays_native_and_renders() {
         "excluded renderFrame must stay native (its GL body intact):\n{out}"
     );
     // The rest still virtualizes: a VM program table was spliced.
-    assert!(out.contains("[["), "VM program table spliced (IIFE virtualized):\n{out}");
+    assert!(
+        out.contains("[["),
+        "VM program table spliced (IIFE virtualized):\n{out}"
+    );
     // (c) It renders identically (same GL call sequence into __out).
     eval::assert_behaviorally_equal(src, &out);
 }
@@ -220,7 +238,10 @@ fn whole_program_generator_diverts_to_native_through_pipeline() {
     let out = mangle_whole_program_exclude(src, Intensity::Minify, 5, "__none__");
     assert!(out.contains("function*"), "generator stays native:\n{out}");
     // It still virtualizes the surrounding run (a VM program table was spliced).
-    assert!(out.contains("[["), "VM table spliced (run virtualized around the native generator):\n{out}");
+    assert!(
+        out.contains("[["),
+        "VM table spliced (run virtualized around the native generator):\n{out}"
+    );
     eval::assert_behaviorally_equal(src, &out);
 }
 
@@ -232,9 +253,15 @@ fn whole_program_module_export_partitions_through_pipeline() {
     let src = "export const k = 21; globalThis.__out = String(k * 2);";
     let out = mangle_whole_program(src, Intensity::Minify, 3);
     // The export boundary is preserved (still a module export).
-    assert!(out.contains("export"), "export boundary kept native:\n{out}");
+    assert!(
+        out.contains("export"),
+        "export boundary kept native:\n{out}"
+    );
     // The reader run pulled into the VM (a program table was spliced).
-    assert!(out.contains("[["), "VM program table spliced (reader run virtualized):\n{out}");
+    assert!(
+        out.contains("[["),
+        "VM program table spliced (reader run virtualized):\n{out}"
+    );
 }
 
 /// Regression (review CRITICALs): a cross-run `let` that is ALSO exported must NOT be
@@ -245,7 +272,10 @@ fn whole_program_module_export_partitions_through_pipeline() {
 fn whole_program_cross_run_exported_let_stays_native() {
     let src = "let k = 21; export { k }; globalThis.__out = String(k * 2);";
     let out = mangle_whole_program(src, Intensity::Minify, 3);
-    assert!(out.contains("export"), "export boundary kept native:\n{out}");
+    assert!(
+        out.contains("export"),
+        "export boundary kept native:\n{out}"
+    );
     // `k`'s declaration is NOT rewritten into a `[undefined]` cell array (the unsafe
     // lowering the review caught); it remains a real lexical/native binding.
     assert!(
@@ -255,7 +285,7 @@ fn whole_program_cross_run_exported_let_stays_native() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 4: opportunistic desugaring (class→function, regex→RegExp)
+// Native class envelopes and regex literals under whole-program protection
 // ---------------------------------------------------------------------------
 
 /// Resolve a whole-program config that also enables the Phase-4 desugar flags.
@@ -292,8 +322,8 @@ fn mangle_wp_desugar(src: &str, level: Intensity, seed: u64, class: bool, regex:
 
 /// A program exercising the full supported class surface: ctor + method + instance
 /// field + `extends` + `super()` + a `static` method and `static` field. With
-/// `--virtualize-desugar-class` ON it is lowered to function/prototype form, the class
-/// keyword is gone, AND it behaves identically (run through the in-process harness).
+/// `--virtualize-desugar-class`, eligible methods are protected inside a native class
+/// envelope; constructors, fields, and heritage retain JavaScript semantics.
 const CLASS_PROGRAM: &str = "\
     class Animal { \
       constructor(name) { this.name = name; this.legs = 4; } \
@@ -313,13 +343,15 @@ const CLASS_PROGRAM: &str = "\
     out += '|' + String(Object.getOwnPropertyDescriptor(Dog.prototype, 'speak').enumerable); \
     globalThis.__out = out;";
 
-/// §9.2 / TESTS: with desugar-class ON, a class (ctor+method+field+extends+super+static)
-/// is desugared (class keyword gone) and behaves identically.
+/// Eligible methods can be virtualized without replacing the native class envelope.
 #[test]
 fn whole_program_desugar_class_virtualizes_and_behaves() {
     let src = format!("(function(){{ {CLASS_PROGRAM} }})();");
     let out = mangle_wp_desugar(&src, Intensity::Minify, 7, true, false);
-    assert!(!out.contains("class"), "class lowered to function form:\n{out}");
+    assert!(
+        out.contains("class"),
+        "native class envelope retained:\n{out}"
+    );
     eval::assert_behaviorally_equal(&src, &out);
 }
 
@@ -329,7 +361,10 @@ fn whole_program_desugar_class_virtualizes_and_behaves() {
 fn whole_program_desugar_class_off_keeps_class_native() {
     let src = format!("(function(){{ {CLASS_PROGRAM} }})();");
     let out = mangle_wp_desugar(&src, Intensity::Minify, 7, false, false);
-    assert!(out.contains("class"), "class stays native when flag OFF:\n{out}");
+    assert!(
+        out.contains("class"),
+        "class stays native when flag OFF:\n{out}"
+    );
     eval::assert_behaviorally_equal(&src, &out);
 }
 
@@ -360,7 +395,10 @@ fn whole_program_desugar_class_private_field_stays_native() {
     let out = mangle_wp_desugar(src, Intensity::Minify, 7, true, false);
     // The private field (renamed by the minifier, but the `#` private-name syntax
     // survives) proves the class was NOT desugared — it stayed a native class.
-    assert!(out.contains('#') && out.contains("class"), "private-field class stays native:\n{out}");
+    assert!(
+        out.contains('#') && out.contains("class"),
+        "private-field class stays native:\n{out}"
+    );
     eval::assert_behaviorally_equal(src, &out);
 }
 
@@ -372,7 +410,10 @@ fn whole_program_desugar_class_static_block_stays_native() {
         globalThis.__out = String(C.n); \
     })();";
     let out = mangle_wp_desugar(src, Intensity::Minify, 7, true, false);
-    assert!(out.contains("static{") || out.contains("static {"), "static-block class stays native:\n{out}");
+    assert!(
+        out.contains("static{") || out.contains("static {"),
+        "static-block class stays native:\n{out}"
+    );
     eval::assert_behaviorally_equal(src, &out);
 }
 
@@ -387,7 +428,10 @@ fn whole_program_desugar_class_computed_key_stays_native() {
         globalThis.__out = String(new C().go()); \
     })();";
     let out = mangle_wp_desugar(src, Intensity::Minify, 7, true, false);
-    assert!(out.contains("class"), "computed-key class stays native:\n{out}");
+    assert!(
+        out.contains("class"),
+        "computed-key class stays native:\n{out}"
+    );
     eval::assert_behaviorally_equal(src, &out);
 }
 
@@ -405,7 +449,10 @@ fn whole_program_desugar_class_conditional_super_stays_native() {
         globalThis.__out = String(b1.x) + '|' + String(b1.y) + '|' + String(b2.x) + '|' + String(b2.y); \
     })();";
     let out = mangle_wp_desugar(src, Intensity::Minify, 7, true, false);
-    assert!(out.contains("class"), "conditional-super class stays native:\n{out}");
+    assert!(
+        out.contains("class"),
+        "conditional-super class stays native:\n{out}"
+    );
     eval::assert_behaviorally_equal(src, &out);
 }
 
@@ -440,9 +487,7 @@ fn whole_program_desugar_regex_behaves_identically() {
     eval::assert_behaviorally_equal(src, &off);
 }
 
-/// §9.1 desugar fuzz GATE — class. Generate many random class hierarchies and run each
-/// through `--virtualize-program --virtualize-desugar-class`; assert original-vs-output
-/// observable parity. This is the gate that decides class-desugar is safe to recommend.
+/// Generated class hierarchies preserve behavior while eligible methods are protected.
 #[test]
 fn fuzz_desugar_class_parity() {
     use mangler_testkit::fuzz::{build_class_program, check_program};
@@ -477,10 +522,7 @@ fn fuzz_desugar_class_deterministic() {
     }
 }
 
-/// §9.1 desugar fuzz GATE — regex. Generate random regex programs and run each through
-/// `--virtualize-program --virtualize-desugar-regex`; assert parity. This gate decides
-/// whether the regex flag is safe (it is left default-OFF regardless, per the Phase-4
-/// contract, but this proves the lowering is sound when enabled).
+/// The legacy regex flag must preserve native literal semantics across generated inputs.
 #[test]
 fn fuzz_desugar_regex_parity() {
     use mangler_testkit::fuzz::{build_regex_program, check_program};

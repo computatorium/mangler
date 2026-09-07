@@ -7,7 +7,7 @@
 //! optionally put a `DecoderAnchorArtifact` → run the pass → print ) →
 //! `assert_behaviorally_equal`.
 
-use super::{isqrt_ceil, CfFlattenPass};
+use super::{CfFlattenPass, isqrt_ceil};
 use crate::artifacts::{DecoderAnchorArtifact, ResolvedScopesArtifact};
 use crate::config::FileConfig;
 use mangler_config::{ConfigFlags, Intensity, ResolvedConfig};
@@ -59,7 +59,11 @@ fn run_pass(src: &str, level: Intensity, seed: u64, decoder: Option<&str>) -> St
         let mut notes = Notes::default();
         bus.enter_pass(
             "cfflatten",
-            &[Resource::decoder_anchor(), Resource::resolved_scopes()],
+            &[
+                Resource::decoder_anchor(),
+                Resource::resolved_scopes(),
+                Resource::vm_table(),
+            ],
             &[],
         );
         CfFlattenPass
@@ -89,7 +93,11 @@ fn pass_contract() {
     assert_eq!(pass.id(), "cfflatten");
     assert_eq!(
         pass.reads(),
-        &[Resource::decoder_anchor(), Resource::resolved_scopes()]
+        &[
+            Resource::decoder_anchor(),
+            Resource::resolved_scopes(),
+            Resource::vm_table()
+        ]
     );
     assert!(pass.writes().is_empty());
     assert!(pass.enabled(&config(Intensity::High, 1)));
@@ -116,9 +124,16 @@ fn isqrt_ceil_is_smallest_k_with_k_squared_ge_n() {
     for n in 1..2000usize {
         let k = isqrt_ceil(n);
         assert!(k * k >= n, "k*k must cover n: n={n} k={k}");
-        assert!((k - 1) * (k - 1) < n || k == 1, "k must be minimal: n={n} k={k}");
+        assert!(
+            (k - 1) * (k - 1) < n || k == 1,
+            "k must be minimal: n={n} k={k}"
+        );
         for v in 0..n {
-            assert_eq!((v / k) * k + (v % k), v, "split must reconstruct: n={n} k={k} v={v}");
+            assert_eq!(
+                (v / k) * k + (v % k),
+                v,
+                "split must reconstruct: n={n} k={k} v={v}"
+            );
         }
     }
 }
@@ -292,7 +307,10 @@ fn ineligible_try_body_is_left_intact() {
     let src = with_decoder(core, body);
     let reference = body.to_string();
     let out = run_pass(&src, Intensity::High, 1, Some(core));
-    assert!(out.contains("try"), "ineligible try body must remain: {out}");
+    assert!(
+        out.contains("try"),
+        "ineligible try body must remain: {out}"
+    );
     assert_behaviorally_equal(&reference, &out);
 }
 
@@ -467,15 +485,72 @@ fn gate_nested_fn_decl_detection() {
     use crate::passes::cfflatten::eligibility::scan_gates;
     use crate::passes::cfflatten::test_support::parse_body;
     // Direct-body fn decl: hoistable, gate stays false.
-    assert!(!scan_gates(&parse_body("var a=1; function f(){return a;} var b=f(); return b;")).has_nested_fn_decl);
+    assert!(
+        !scan_gates(&parse_body(
+            "var a=1; function f(){return a;} var b=f(); return b;"
+        ))
+        .has_nested_fn_decl
+    );
     // fn decl inside an `if`: not modellable, gate fires.
-    assert!(scan_gates(&parse_body("var a=1; if(a){ function f(){return a;} } var b=2; return b;")).has_nested_fn_decl);
+    assert!(
+        scan_gates(&parse_body(
+            "var a=1; if(a){ function f(){return a;} } var b=2; return b;"
+        ))
+        .has_nested_fn_decl
+    );
     // fn decl inside a loop: gate fires.
-    assert!(scan_gates(&parse_body("var a=1; while(a>0){ function f(){return a;} a=0; } var b=2; return b;")).has_nested_fn_decl);
+    assert!(
+        scan_gates(&parse_body(
+            "var a=1; while(a>0){ function f(){return a;} a=0; } var b=2; return b;"
+        ))
+        .has_nested_fn_decl
+    );
     // fn decl inside a bare block: gate fires.
-    assert!(scan_gates(&parse_body("var a=1; { function f(){return a;} } var b=2; return b;")).has_nested_fn_decl);
+    assert!(
+        scan_gates(&parse_body(
+            "var a=1; { function f(){return a;} } var b=2; return b;"
+        ))
+        .has_nested_fn_decl
+    );
     // fn decl inside a NESTED function (independent body): gate does NOT fire.
-    assert!(!scan_gates(&parse_body("var a=1; function outer(){ if(a){ function f(){return a;} } } var b=2; return b;")).has_nested_fn_decl);
+    assert!(
+        !scan_gates(&parse_body(
+            "var a=1; function outer(){ if(a){ function f(){return a;} } } var b=2; return b;"
+        ))
+        .has_nested_fn_decl
+    );
 }
 
+#[test]
+fn strict_prologue_survives_flattening_and_function_hoisting() {
+    let src = "function f(a){'use strict';function nested(){return this===undefined}a=9;return String(this===undefined)+':'+arguments[0]+':'+nested();}globalThis.__out=f(1);";
+    let out = run_pass(src, Intensity::High, 1, None);
+    assert!(
+        out.contains("switch"),
+        "must exercise flattened body: {out}"
+    );
+    assert_behaviorally_equal(src, &out);
+}
 
+#[test]
+fn tdz_hoists_preserve_function_and_program_directives() {
+    for src in [
+        "function f(){'use strict';let x=1;x++;return String(this===undefined)+':'+x;}globalThis.__out=f();",
+        "'use strict';function f(){let x=1;x++;return String(this===undefined)+':'+x;}globalThis.__out=f();",
+    ] {
+        let out = run_pass(src, Intensity::High, 1, None);
+        assert!(out.contains("switch"), "must exercise flattening: {out}");
+        assert_behaviorally_equal(src, &out);
+    }
+}
+
+#[test]
+fn decoder_initialization_is_not_flattened() {
+    let src = "var core=(function(){var a=1;var b=2;return function(){return String(a+b)}})();globalThis.__out=core(0);";
+    let out = run_pass(src, Intensity::High, 1, Some("core"));
+    assert!(
+        !out.contains("switch"),
+        "generated decoder initialization stays intact: {out}"
+    );
+    assert_behaviorally_equal(src, &out);
+}

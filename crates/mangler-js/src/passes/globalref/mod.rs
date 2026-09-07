@@ -1,51 +1,15 @@
-//! Global-reference indirection pass.
+//! Global-reference indirection through cached lexical accessors.
 //!
-//! Hoists provably-free globals into load-time-cached locals and rewrites their
-//! use sites to bare local reads, so use sites cost a local read + property
-//! lookup with no per-operation decode. Ordered `member-access → globalref →
-//! strings` by its declared reads/writes: it `reads()` [`PropertyLiterals`] (so
-//! it runs after member-access and sees `document["getElementById"]`) and
-//! `writes()` [`GlobalNameLiterals`] (so the strings pass — which reads it —
-//! runs after, encoding the global-name string literals this pass injects).
+//! Each selected name gets a zero-argument function whose body performs the
+//! original bare lookup. Aliases cache these functions, never their results;
+//! reads therefore observe mutations, external lexical bindings and missing-name
+//! errors at the original use site. Calling an accessor result is still an
+//! unqualified call, preserving the original receiver.
 //!
-//! ## Detection
-//!
-//! A name is *indirectable* iff it is **never declared anywhere in the file**
-//! (see [`detect`]). Any shadow of `X` anywhere disables indirection of `X`
-//! file-wide. Files containing a direct `eval(` call or a `with` statement bail
-//! entirely (those can introduce dynamic bindings, making free-global detection
-//! unsound).
-//!
-//! ## Selection
-//!
-//! * `Safe` (default): only names on the curated [`allowlist`].
-//! * `Aggressive`: every never-declared free name. `globalThis` is excluded in
-//!   both modes (it is the anchor).
-//!
-//! ## Whole-name write-exclusion (correctness-critical)
-//!
-//! Because the hoisted alias `_Ga = _G["X"]` captures the global's value *once at
-//! load*, a name is indirectable only if EVERY occurrence in the file is a
-//! *read*. If a free-global name `X` appears in ANY write / mutation-target
-//! position — assignment target, `++`/`--`, bare `delete X`, or a non-`VarDecl`
-//! for-in/for-of head — the ENTIRE name `X` is excluded (detected up front in
-//! [`detect`] via `Detection::written`, enforced by `Rewriter::is_selected`).
-//!
-//! **Why hoist-and-cache preserves `this`:** calling the hoisted local bare
-//! (`_Ga(args)`) is an *unqualified* call of the same function value the original
-//! bare `X(args)` resolved to, so `this` is identical (undefined strict / global
-//! sloppy).
-//!
-//! ## Injection
-//!
-//! At the top of the program body (after any leading directive prologue so
-//! `"use strict"` stays first) we inject the anchor `var _G = globalThis;`
-//! (anchor hardening may rewrite this) plus, depending on the combined entry
-//! count, either a one-hop `var _Ga = _G["<name>"]` table or a dispatcher
-//! (`_GN`/`_perm`/`_Gd`) that hides the alias→global mapping. The `"<name>"`
-//! literals are plain string literals the strings pass (ordered after us) then
-//! encodes. We also inject seeded, never-referenced **decoy** aliases for
-//! plausible allowlisted globals the file does NOT use.
+//! A shuffled table and optional name dispatcher obscure the use-site mapping.
+//! Decoys are uncalled accessors, so table initialization never reads host globals.
+//! Names declared or written anywhere in the file, CommonJS wrapper bindings,
+//! bare typeof operands, and files using eval/with remain native.
 
 mod allowlist;
 mod detect;
@@ -57,11 +21,11 @@ use mangler_core::{Language, Notes, Result, Rng};
 use mangler_jsast::Js;
 use mangler_passgraph::{ArtifactBus, Pass, Resource};
 use std::collections::{HashMap, HashSet};
-use swc_core::common::{SyntaxContext, DUMMY_SP};
+use swc_core::common::{DUMMY_SP, SyntaxContext};
 use swc_core::ecma::ast::*;
 use swc_core::ecma::visit::{VisitMut, VisitMutWith};
 
-/// Indirects provably-free globals through load-time-cached locals.
+/// Indirects free reads through live lexical accessors.
 pub struct GlobalRefPass;
 
 impl Pass<Js, FileConfig> for GlobalRefPass {
@@ -125,6 +89,13 @@ fn run(program: &mut Program, cfg: &FileConfig, rng: &mut Rng, notes: &mut Notes
             "dynamic scope (eval/with); skipping",
         ));
         return;
+    }
+
+    if cfg.resolved().passes.global_indirect.harden_anchor {
+        notes.push(mangler_core::Note::from(
+            "globalref",
+            "lexical accessors do not use a global-object anchor; anchor hardening is unnecessary",
+        ));
     }
 
     let aggressive = cfg.resolved().passes.global_indirect.mode == GlobalIndirect::Aggressive;
@@ -208,7 +179,7 @@ struct Rewriter<'a> {
 impl Rewriter<'_> {
     /// Whether the bare identifier `name` is a selected free global to indirect.
     fn is_selected(&self, name: &str) -> bool {
-        if name == ANCHOR_GLOBAL {
+        if name == ANCHOR_GLOBAL || name == "arguments" || allowlist::is_commonjs_binding(name) {
             return false;
         }
         if self.declared.contains(name) {
@@ -247,7 +218,7 @@ impl Rewriter<'_> {
             let name = id.sym.to_string();
             if self.is_selected(&name) {
                 let alias = self.alias_for(&name);
-                *expr = Expr::Ident(Ident::new(alias.into(), DUMMY_SP, SyntaxContext::empty()));
+                *expr = accessor_read(&alias);
                 return true;
             }
         }
@@ -284,10 +255,14 @@ impl VisitMut for Rewriter<'_> {
         n.arg.visit_mut_with(self);
     }
 
-    /// `delete X`: leave a bare-ident operand untouched. `typeof X` / `void X`
-    /// are ordinary reference positions — descend so the bare ident IS indirected.
+    /// Preserve bare delete/typeof operands, including parentheses. In particular
+    /// `typeof missing` must not call an accessor that would throw.
     fn visit_mut_unary_expr(&mut self, n: &mut UnaryExpr) {
-        if n.op == UnaryOp::Delete && matches!(&*n.arg, Expr::Ident(_)) {
+        let mut operand = &*n.arg;
+        while let Expr::Paren(p) = operand {
+            operand = &p.expr;
+        }
+        if matches!(n.op, UnaryOp::Delete | UnaryOp::TypeOf) && matches!(operand, Expr::Ident(_)) {
             return;
         }
         n.arg.visit_mut_with(self);
@@ -313,11 +288,7 @@ impl VisitMut for Rewriter<'_> {
                 let alias = self.alias_for(&name);
                 *n = Prop::KeyValue(KeyValueProp {
                     key: PropName::Ident(IdentName::new(name.into(), DUMMY_SP)),
-                    value: Box::new(Expr::Ident(Ident::new(
-                        alias.into(),
-                        DUMMY_SP,
-                        SyntaxContext::empty(),
-                    ))),
+                    value: Box::new(accessor_read(&alias)),
                 });
             }
         }
@@ -398,7 +369,7 @@ fn inject_table(
     if total >= DISPATCHER_MIN_ENTRIES {
         inject_dispatcher_table(program, cfg, rng, anchor_name, used, decoys);
     } else {
-        inject_onehop_table(program, cfg, rng, anchor_name, used, decoys);
+        inject_onehop_table(program, rng, anchor_name, used, decoys);
     }
 }
 
@@ -406,13 +377,12 @@ fn inject_table(
 /// under one anchor. Used only for tiny combined entry counts.
 fn inject_onehop_table(
     program: &mut Program,
-    cfg: &FileConfig,
     rng: &mut Rng,
     anchor_name: &str,
     used: &[(String, String)],
     decoys: &[(String, String)],
 ) {
-    let anchor_stmt = build_anchor_decl(cfg, anchor_name);
+    let anchor_stmt = build_anchor_decl(anchor_name, used, decoys);
 
     let mut alias_stmts: Vec<Stmt> = Vec::with_capacity(used.len() + decoys.len());
     for (gname, alias) in used.iter().chain(decoys.iter()) {
@@ -457,7 +427,7 @@ fn inject_dispatcher_table(
     let perm_name = cfg.fresh_name();
     let gd_name = cfg.fresh_name();
 
-    let anchor_stmt = build_anchor_decl(cfg, anchor_name);
+    let anchor_stmt = build_anchor_decl(anchor_name, used, decoys);
     let names_arr_stmt = build_names_array_decl(&gn_name, &name_at_pos);
     let perm_arr_stmt = build_perm_array_decl(&perm_name, &perm);
     let dispatcher_stmt = build_dispatcher_decl(&gd_name, anchor_name, &gn_name, &perm_name);
@@ -544,7 +514,10 @@ fn build_names_array_decl(gn_name: &str, names: &[&str]) -> Stmt {
             })
         })
         .collect();
-    let arr = Expr::Array(ArrayLit { span: DUMMY_SP, elems });
+    let arr = Expr::Array(ArrayLit {
+        span: DUMMY_SP,
+        elems,
+    });
     single_var_decl(gn_name, arr)
 }
 
@@ -563,7 +536,10 @@ fn build_perm_array_decl(perm_name: &str, perm: &[usize]) -> Stmt {
             })
         })
         .collect();
-    let arr = Expr::Array(ArrayLit { span: DUMMY_SP, elems });
+    let arr = Expr::Array(ArrayLit {
+        span: DUMMY_SP,
+        elems,
+    });
     single_var_decl(perm_name, arr)
 }
 
@@ -599,11 +575,14 @@ fn build_dispatcher_decl(gd_name: &str, anchor_name: &str, gn_name: &str, perm_n
         type_params: None,
         return_type: None,
     };
-    let fn_expr = Expr::Fn(FnExpr { ident: None, function: Box::new(func) });
+    let fn_expr = Expr::Fn(FnExpr {
+        ident: None,
+        function: Box::new(func),
+    });
     single_var_decl(gd_name, fn_expr)
 }
 
-/// `var <alias> = <gd>(<k>);` — cache the resolved global once at load.
+/// `var <alias> = <gd>(<k>);` — cache the accessor function, without reading the global.
 fn build_cached_call_decl(alias: &str, gd_name: &str, k: usize) -> Stmt {
     let call = Expr::Call(CallExpr {
         span: DUMMY_SP,
@@ -639,57 +618,61 @@ fn ident_expr(name: &str) -> Expr {
     Expr::Ident(Ident::new(name.into(), DUMMY_SP, SyntaxContext::empty()))
 }
 
-/// `var <anchor> = globalThis;` (default) or the hardened derivation.
-fn build_anchor_decl(cfg: &FileConfig, anchor_name: &str) -> Stmt {
-    let init: Expr = if cfg.resolved().passes.global_indirect.harden_anchor {
-        // Hardened anchor: `(function(){return this})() || globalThis`.
-        build_hardened_anchor_init()
-    } else {
-        Expr::Ident(Ident::new(ANCHOR_GLOBAL.into(), DUMMY_SP, SyntaxContext::empty()))
-    };
-    single_var_decl(anchor_name, init)
+/// Build the table without evaluating any source lookup. The bare identifier in
+/// each function resolves exactly where the source would (including an external
+/// global lexical binding that is absent from `globalThis`).
+fn build_anchor_decl(
+    anchor_name: &str,
+    used: &[(String, String)],
+    decoys: &[(String, String)],
+) -> Stmt {
+    let props = used
+        .iter()
+        .chain(decoys)
+        .map(|(name, _)| {
+            PropOrSpread::Prop(Box::new(Prop::KeyValue(KeyValueProp {
+                key: PropName::Computed(ComputedPropName {
+                    span: DUMMY_SP,
+                    expr: Box::new(Expr::Lit(Lit::Str(Str {
+                        span: DUMMY_SP,
+                        value: name.as_str().into(),
+                        raw: None,
+                    }))),
+                }),
+                value: Box::new(mangler_jsast::codegen::fn_expr(
+                    None,
+                    &[],
+                    vec![Stmt::Return(ReturnStmt {
+                        span: DUMMY_SP,
+                        arg: Some(Box::new(ident_expr(name))),
+                    })],
+                )),
+            })))
+        })
+        .collect();
+    single_var_decl(
+        anchor_name,
+        Expr::Object(ObjectLit {
+            span: DUMMY_SP,
+            props,
+        }),
+    )
 }
 
-/// Build `(function(){return this})() || globalThis`.
-fn build_hardened_anchor_init() -> Expr {
-    let func = Function {
-        params: vec![],
-        decorators: vec![],
+/// Read the original binding now, through its cached accessor. If this result is
+/// used as a callee, JavaScript treats it as a value (not a property reference).
+fn accessor_read(alias: &str) -> Expr {
+    // Parentheses are required when this expression becomes a `new` callee:
+    // `new (accessor())()` constructs the returned global, not the accessor.
+    Expr::Paren(ParenExpr {
         span: DUMMY_SP,
-        ctxt: SyntaxContext::empty(),
-        body: Some(BlockStmt {
+        expr: Box::new(Expr::Call(CallExpr {
             span: DUMMY_SP,
             ctxt: SyntaxContext::empty(),
-            stmts: vec![Stmt::Return(ReturnStmt {
-                span: DUMMY_SP,
-                arg: Some(Box::new(Expr::This(ThisExpr { span: DUMMY_SP }))),
-            })],
-        }),
-        is_generator: false,
-        is_async: false,
-        type_params: None,
-        return_type: None,
-    };
-    let fn_expr = Expr::Fn(FnExpr { ident: None, function: Box::new(func) });
-    let call = Expr::Call(CallExpr {
-        span: DUMMY_SP,
-        ctxt: SyntaxContext::empty(),
-        callee: Callee::Expr(Box::new(Expr::Paren(ParenExpr {
-            span: DUMMY_SP,
-            expr: Box::new(fn_expr),
-        }))),
-        args: vec![],
-        type_args: None,
-    });
-    Expr::Bin(BinExpr {
-        span: DUMMY_SP,
-        op: BinaryOp::LogicalOr,
-        left: Box::new(call),
-        right: Box::new(Expr::Ident(Ident::new(
-            ANCHOR_GLOBAL.into(),
-            DUMMY_SP,
-            SyntaxContext::empty(),
-        ))),
+            callee: Callee::Expr(Box::new(ident_expr(alias))),
+            args: vec![],
+            type_args: None,
+        })),
     })
 }
 
@@ -737,42 +720,9 @@ fn single_var_decl(name: &str, init: Expr) -> Stmt {
 // Prologue-aware splicing
 // ---------------------------------------------------------------------------
 
-/// Is `stmt` a leading directive-prologue statement (`"use strict";` etc.)?
-/// A directive is an expression statement whose expression is a bare string
-/// literal. Only a *contiguous leading run* of these counts as the prologue.
-fn is_directive_stmt(stmt: &Stmt) -> bool {
-    matches!(
-        stmt,
-        Stmt::Expr(ExprStmt { expr, .. }) if matches!(&**expr, Expr::Lit(Lit::Str(_)))
-    )
-}
-
-fn leading_directive_count(stmts: &[Stmt]) -> usize {
-    stmts.iter().take_while(|s| is_directive_stmt(s)).count()
-}
-
-/// Splice `stmts` into `program` at the leading-directive boundary, so a
-/// `"use strict"` prologue stays first.
+/// Splice the accessor table after source directives.
 fn splice_stmts_at_prologue(program: &mut Program, stmts: Vec<Stmt>) {
-    match program {
-        Program::Script(s) => {
-            let at = leading_directive_count(&s.body);
-            s.body.splice(at..at, stmts);
-        }
-        Program::Module(m) => {
-            // A module's leading directives are `ModuleItem::Stmt(ExprStmt(str))`.
-            let at = m
-                .body
-                .iter()
-                .take_while(|it| match it {
-                    ModuleItem::Stmt(s) => is_directive_stmt(s),
-                    ModuleItem::ModuleDecl(_) => false,
-                })
-                .count();
-            let items: Vec<ModuleItem> = stmts.into_iter().map(ModuleItem::Stmt).collect();
-            m.body.splice(at..at, items);
-        }
-    }
+    mangler_jsast::directives::insert_program_statements(program, stmts);
 }
 
 #[cfg(test)]

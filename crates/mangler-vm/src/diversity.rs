@@ -62,7 +62,8 @@ pub struct VmDiversity {
     pub bin_perm: Vec<usize>,
     /// Un sub-code permutation (bijection on `0..N_UN_OPS`).
     pub un_perm: Vec<usize>,
-    /// XOR key for the code array (high bit set, as production uses).
+    /// Seed material for the packed code-group mask and UTF-16 constant mask.
+    /// The high bit stays set to preserve the diversification draw contract.
     pub code_key: u32,
     /// FU3 skeleton variant (`0..SKELETON_VARIANTS`).
     pub skeleton_variant: usize,
@@ -275,7 +276,17 @@ mod tests {
     /// The MBA identities are exact over all int32 (representative sweep).
     #[test]
     fn mba_forms_are_int32_exact() {
-        let samples: [i32; 9] = [0, 1, -1, 2, -2, i32::MAX, i32::MIN, 0x5555_5555u32 as i32, 0x0F0F_0F0Fu32 as i32];
+        let samples: [i32; 9] = [
+            0,
+            1,
+            -1,
+            2,
+            -2,
+            i32::MAX,
+            i32::MIN,
+            0x5555_5555u32 as i32,
+            0x0F0F_0F0Fu32 as i32,
+        ];
         for &a in &samples {
             for &b in &samples {
                 // a & b

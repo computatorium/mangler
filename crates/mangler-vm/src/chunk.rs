@@ -11,6 +11,58 @@
 
 use crate::isa::Instr;
 
+/// The instructions an interpreter must support, before opcode diversification.
+/// A table accumulates one union for each strictness/exception-handling variant,
+/// including all descendants that re-enter that same interpreter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstructionUsage {
+    opcodes: [bool; crate::isa::N_OPCODES],
+    binary: [bool; crate::isa::N_BIN_OPS],
+    unary: [bool; crate::isa::N_UN_OPS],
+}
+
+impl Default for InstructionUsage {
+    fn default() -> Self {
+        Self {
+            opcodes: [false; crate::isa::N_OPCODES],
+            binary: [false; crate::isa::N_BIN_OPS],
+            unary: [false; crate::isa::N_UN_OPS],
+        }
+    }
+}
+
+impl InstructionUsage {
+    /// Include this body and every nested bytecode closure.
+    pub fn include(&mut self, compiled: &Compiled) {
+        for instr in &compiled.code {
+            self.opcodes[instr.discriminant()] = true;
+            match instr {
+                Instr::Bin(op) => self.binary[*op as usize] = true,
+                Instr::Un(op) => self.unary[*op as usize] = true,
+                _ => {}
+            }
+        }
+        for child in &compiled.children {
+            self.include(&child.compiled);
+        }
+    }
+
+    /// Whether the canonical instruction is used.
+    pub fn opcode(&self, opcode: usize) -> bool {
+        self.opcodes[opcode]
+    }
+
+    /// Whether the canonical binary operator is used.
+    pub fn binary(&self, operator: usize) -> bool {
+        self.binary[operator]
+    }
+
+    /// Whether the canonical unary operator is used.
+    pub fn unary(&self, operator: usize) -> bool {
+        self.unary[operator]
+    }
+}
+
 /// A VM constant-pool entry.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Const {

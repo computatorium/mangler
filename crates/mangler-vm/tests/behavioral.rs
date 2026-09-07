@@ -10,14 +10,14 @@
 use std::collections::HashSet;
 
 use mangler_core::Rng;
-use mangler_testkit::eval::{assert_behaviorally_equal_with, eval_same_value_with, CaptureMode};
+use mangler_testkit::eval::{CaptureMode, assert_behaviorally_equal_with, eval_same_value_with};
 use mangler_vm::diversity::VmDiversity;
 use mangler_vm::table::{TableBuilder, VmNames};
 use swc_core::common::sync::Lrc;
 use swc_core::common::{FileName, SourceMap};
 use swc_core::ecma::ast::*;
-use swc_core::ecma::codegen::{text_writer::JsWriter, Config as CodegenConfig, Emitter};
-use swc_core::ecma::parser::{lexer::Lexer, EsSyntax, Parser, StringInput, Syntax};
+use swc_core::ecma::codegen::{Config as CodegenConfig, Emitter, text_writer::JsWriter};
+use swc_core::ecma::parser::{EsSyntax, Parser, StringInput, Syntax, lexer::Lexer};
 
 /// Parse a function-expression source into `(name, params, body)`. `name` is the
 /// function's own identifier (a named function expression like `function fac(){…}`),
@@ -26,7 +26,12 @@ fn parse_fn_named(src: &str) -> (Option<String>, Vec<Param>, BlockStmt) {
     let cm: Lrc<SourceMap> = Default::default();
     let wrapped = format!("var __f = ({src});");
     let fm = cm.new_source_file(Lrc::new(FileName::Custom("t.js".into())), wrapped);
-    let lexer = Lexer::new(Syntax::Es(EsSyntax::default()), EsVersion::EsNext, StringInput::from(&*fm), None);
+    let lexer = Lexer::new(
+        Syntax::Es(EsSyntax::default()),
+        EsVersion::EsNext,
+        StringInput::from(&*fm),
+        None,
+    );
     let mut parser = Parser::new_from(lexer);
     let program = parser.parse_program().unwrap();
     let stmt = match program {
@@ -57,7 +62,12 @@ fn parse_fn(src: &str) -> (Vec<Param>, BlockStmt) {
     let cm: Lrc<SourceMap> = Default::default();
     let wrapped = format!("var __f = ({src});");
     let fm = cm.new_source_file(Lrc::new(FileName::Custom("t.js".into())), wrapped);
-    let lexer = Lexer::new(Syntax::Es(EsSyntax::default()), EsVersion::EsNext, StringInput::from(&*fm), None);
+    let lexer = Lexer::new(
+        Syntax::Es(EsSyntax::default()),
+        EsVersion::EsNext,
+        StringInput::from(&*fm),
+        None,
+    );
     let mut parser = Parser::new_from(lexer);
     let program = parser.parse_program().unwrap();
     let stmt = match program {
@@ -132,7 +142,11 @@ fn virtualize(src: &str, seed: u64) -> Option<String> {
     // resolves to the thunk itself — exactly as the real pass replaces a function's
     // body in place. `function f(<params>){ return <interp>(T[i][0],T[i][1],arguments,[caps],capStart,pcount,this); }`
     let fn_name = own_name.as_deref().unwrap_or("f");
-    let interp = if chunk.needs_eh { &names.eh_interp } else { &names.lean_interp };
+    let interp = if chunk.needs_eh {
+        &names.eh_interp
+    } else {
+        &names.lean_interp
+    };
     let caps = format!("[{}]", chunk.captures.join(","));
     let param_src: Vec<String> = (0..chunk.pcount).map(|i| format!("p{i}")).collect();
     let thunk = format!(
@@ -159,7 +173,9 @@ fn original_program(src: &str, call_args: &str) -> String {
 /// A program that calls the VIRTUALIZED function the same way.
 fn virtualized_program(src: &str, call_args: &str, seed: u64) -> Option<String> {
     let v = virtualize(src, seed)?;
-    Some(format!("{v}\nglobalThis.__out=JSON.stringify(f({call_args}));"))
+    Some(format!(
+        "{v}\nglobalThis.__out=JSON.stringify(f({call_args}));"
+    ))
 }
 
 /// Assert the virtualized function produces the same result as the original for the
@@ -192,28 +208,58 @@ fn comparisons_and_logic() {
 
 #[test]
 fn control_flow() {
-    assert_vm_equiv("function(n){ if(n>0){return 'pos';}else if(n<0){return 'neg';}else{return 'zero';} }", "-4");
-    assert_vm_equiv("function(n){ var s=0; for(var i=0;i<n;i++){ s+=i; } return s; }", "10");
-    assert_vm_equiv("function(n){ var s=0,i=0; while(i<n){ s=s+i*i; i++; } return s; }", "6");
-    assert_vm_equiv("function(n){ var s=0; do { s++; n--; } while(n>0); return s; }", "5");
+    assert_vm_equiv(
+        "function(n){ if(n>0){return 'pos';}else if(n<0){return 'neg';}else{return 'zero';} }",
+        "-4",
+    );
+    assert_vm_equiv(
+        "function(n){ var s=0; for(var i=0;i<n;i++){ s+=i; } return s; }",
+        "10",
+    );
+    assert_vm_equiv(
+        "function(n){ var s=0,i=0; while(i<n){ s=s+i*i; i++; } return s; }",
+        "6",
+    );
+    assert_vm_equiv(
+        "function(n){ var s=0; do { s++; n--; } while(n>0); return s; }",
+        "5",
+    );
 }
 
 #[test]
 fn loops_with_break_continue() {
-    assert_vm_equiv("function(n){ var s=0; for(var i=0;i<n;i++){ if(i===3)continue; if(i===7)break; s+=i; } return s; }", "10");
-    assert_vm_equiv("function(n){ outer: for(var i=0;i<n;i++){ for(var j=0;j<n;j++){ if(i*j>6)break outer; } } return i; }", "5");
+    assert_vm_equiv(
+        "function(n){ var s=0; for(var i=0;i<n;i++){ if(i===3)continue; if(i===7)break; s+=i; } return s; }",
+        "10",
+    );
+    assert_vm_equiv(
+        "function(n){ outer: for(var i=0;i<n;i++){ for(var j=0;j<n;j++){ if(i*j>6)break outer; } } return i; }",
+        "5",
+    );
 }
 
 #[test]
 fn switch_stmt() {
-    assert_vm_equiv("function(x){ switch(x){ case 1: return 'a'; case 2: return 'b'; default: return 'z'; } }", "2");
-    assert_vm_equiv("function(x){ var r=''; switch(x){ case 1: r+='1'; case 2: r+='2'; break; case 3: r+='3'; } return r; }", "1");
+    assert_vm_equiv(
+        "function(x){ switch(x){ case 1: return 'a'; case 2: return 'b'; default: return 'z'; } }",
+        "2",
+    );
+    assert_vm_equiv(
+        "function(x){ var r=''; switch(x){ case 1: r+='1'; case 2: r+='2'; break; case 3: r+='3'; } return r; }",
+        "1",
+    );
 }
 
 #[test]
 fn try_catch_finally() {
-    assert_vm_equiv("function(x){ try { if(x<0) throw 'neg'; return 'ok'; } catch(e){ return 'caught:'+e; } finally { } }", "-1");
-    assert_vm_equiv("function(x){ var r=''; try { r+='t'; throw 1; } catch(e){ r+='c'; } finally { r+='f'; } return r; }", "0");
+    assert_vm_equiv(
+        "function(x){ try { if(x<0) throw 'neg'; return 'ok'; } catch(e){ return 'caught:'+e; } finally { } }",
+        "-1",
+    );
+    assert_vm_equiv(
+        "function(x){ var r=''; try { r+='t'; throw 1; } catch(e){ r+='c'; } finally { r+='f'; } return r; }",
+        "0",
+    );
 }
 
 #[test]
@@ -233,18 +279,30 @@ fn string_ops_and_template() {
 fn recursion_via_named_fn_expr() {
     // Named function expression self-reference (SELF_UPVALUE path).
     assert_vm_equiv("function fac(n){ return n<=1 ? 1 : n*fac(n-1); }", "6");
-    assert_vm_equiv("function fib(n){ return n<2 ? n : fib(n-1)+fib(n-2); }", "10");
+    assert_vm_equiv(
+        "function fib(n){ return n<2 ? n : fib(n-1)+fib(n-2); }",
+        "10",
+    );
 }
 
 #[test]
 fn closures_capture() {
-    assert_vm_equiv("function(a){ var add=function(b){ return a+b; }; return add(10); }", "5");
-    assert_vm_equiv("function(n){ var acc=0; var f=function(){ acc+=1; return acc; }; f(); f(); return f(); }", "0");
+    assert_vm_equiv(
+        "function(a){ var add=function(b){ return a+b; }; return add(10); }",
+        "5",
+    );
+    assert_vm_equiv(
+        "function(n){ var acc=0; var f=function(){ acc+=1; return acc; }; f(); f(); return f(); }",
+        "0",
+    );
 }
 
 #[test]
 fn for_of_destructure() {
-    assert_vm_equiv("function(arr){ var s=0; for(var x of arr){ s+=x; } return s; }", "[1,2,3,4]");
+    assert_vm_equiv(
+        "function(arr){ var s=0; for(var x of arr){ s+=x; } return s; }",
+        "[1,2,3,4]",
+    );
     assert_vm_equiv("function(a,b){ var [x,y]=[a,b]; return x*10+y; }", "3,7");
     assert_vm_equiv("function(o){ var {p,q}=o; return p+q; }", "{p:2,q:5}");
 }
@@ -256,7 +314,9 @@ fn diversity_variants_all_correct() {
     let src = "function(a,b){ var s=0; for(var i=0;i<b;i++){ s += (a & i) | (a ^ i); } return s; }";
     let orig = original_program(src, "13,8");
     for seed in 0u64..24 {
-        let Some(v) = virtualized_program(src, "13,8", seed) else { continue };
+        let Some(v) = virtualized_program(src, "13,8", seed) else {
+            continue;
+        };
         let r = eval_same_value_with(&orig, &v, &CaptureMode::sink());
         assert!(r.equal, "seed {seed} diverged: {}\n{v}", r.reason);
     }
@@ -308,9 +368,13 @@ fn fuzz_virtualize_mode(program: &str, seed: u64, strict: bool) -> String {
             if n.ident.sym.as_ref() != "f" || self.prologue.is_some() {
                 return;
             }
-            let Some(body) = n.function.body.clone() else { return };
+            let Some(body) = n.function.body.clone() else {
+                return;
+            };
             let params = n.function.params.clone();
-            let Ok(compiled) = mangler_vm::compile_body(&params, &body) else { return };
+            let Ok(compiled) = mangler_vm::compile_body(&params, &body) else {
+                return;
+            };
 
             let div = VmDiversity::draw(&mut Rng::for_pass(self.seed, "vm"));
             let mut tb = TableBuilder::with_diversity(div);
@@ -333,7 +397,12 @@ fn fuzz_virtualize_mode(program: &str, seed: u64, strict: bool) -> String {
                 names.table, chunk.index, names.table, chunk.index, chunk.cap_start, chunk.pcount,
             );
             // Parse the thunk body and install it.
-            let wrapped = Js.parse(&format!("function _(){{{thunk_src}}}"), &ParseOpts::default()).unwrap();
+            let wrapped = Js
+                .parse(
+                    &format!("function _(){{{thunk_src}}}"),
+                    &ParseOpts::default(),
+                )
+                .unwrap();
             let new_body = match wrapped.into_program() {
                 Program::Script(s) => match s.body.into_iter().next().unwrap() {
                     Stmt::Decl(Decl::Fn(fd)) => fd.function.body.unwrap(),
@@ -347,7 +416,11 @@ fn fuzz_virtualize_mode(program: &str, seed: u64, strict: bool) -> String {
         fn visit_mut_arrow_expr(&mut self, _: &mut ArrowExpr) {}
     }
 
-    let mut v = V { seed, strict, prologue: None };
+    let mut v = V {
+        seed,
+        strict,
+        prologue: None,
+    };
     ast.program_mut().visit_mut_with(&mut v);
     let Some(prologue) = v.prologue else {
         return program.to_string(); // f not found or bailed
@@ -468,7 +541,9 @@ fn strict_store_to_nonwritable_throws() {
     for seed in [1u64, 7, 42] {
         // STRICT: both the strict source and the strict-virtualized version throw.
         let v = virtualize_with_strict(src, seed, true).expect("compiles");
-        let prog = format!("{v}\nglobalThis.__out=JSON.stringify((function(){{try{{return f({call});}}catch(e){{return 'THROW:'+e.constructor.name;}}}})());");
+        let prog = format!(
+            "{v}\nglobalThis.__out=JSON.stringify((function(){{try{{return f({call});}}catch(e){{return 'THROW:'+e.constructor.name;}}}})());"
+        );
         let orig = format!(
             "var f=(function(o){{\"use strict\"; o.x = 9; return o.x; }});globalThis.__out=JSON.stringify((function(){{try{{return f({call});}}catch(e){{return 'THROW:'+e.constructor.name;}}}})());"
         );
@@ -476,7 +551,9 @@ fn strict_store_to_nonwritable_throws() {
 
         // SLOPPY: both silently no-op (the frozen value is returned, no throw).
         let v = virtualize_with_strict(src, seed, false).expect("compiles");
-        let prog = format!("{v}\nglobalThis.__out=JSON.stringify((function(){{try{{return f({call});}}catch(e){{return 'THROW:'+e.constructor.name;}}}})());");
+        let prog = format!(
+            "{v}\nglobalThis.__out=JSON.stringify((function(){{try{{return f({call});}}catch(e){{return 'THROW:'+e.constructor.name;}}}})());"
+        );
         let orig = format!(
             "var f=({src});globalThis.__out=JSON.stringify((function(){{try{{return f({call});}}catch(e){{return 'THROW:'+e.constructor.name;}}}})());"
         );
@@ -491,14 +568,18 @@ fn strict_store_to_getter_only_throws() {
     let call = "Object.defineProperty({}, 'g', {get:function(){return 7;}, configurable:true})";
     for seed in [1u64, 7, 42] {
         let v = virtualize_with_strict(src, seed, true).expect("compiles");
-        let prog = format!("{v}\nglobalThis.__out=JSON.stringify((function(){{try{{return f({call});}}catch(e){{return 'THROW:'+e.constructor.name;}}}})());");
+        let prog = format!(
+            "{v}\nglobalThis.__out=JSON.stringify((function(){{try{{return f({call});}}catch(e){{return 'THROW:'+e.constructor.name;}}}})());"
+        );
         let orig = format!(
             "var f=(function(o){{\"use strict\"; o.g = 5; return o.g; }});globalThis.__out=JSON.stringify((function(){{try{{return f({call});}}catch(e){{return 'THROW:'+e.constructor.name;}}}})());"
         );
         assert_behaviorally_equal_with(&orig, &prog, &CaptureMode::sink());
 
         let v = virtualize_with_strict(src, seed, false).expect("compiles");
-        let prog = format!("{v}\nglobalThis.__out=JSON.stringify((function(){{try{{return f({call});}}catch(e){{return 'THROW:'+e.constructor.name;}}}})());");
+        let prog = format!(
+            "{v}\nglobalThis.__out=JSON.stringify((function(){{try{{return f({call});}}catch(e){{return 'THROW:'+e.constructor.name;}}}})());"
+        );
         let orig = format!(
             "var f=({src});globalThis.__out=JSON.stringify((function(){{try{{return f({call});}}catch(e){{return 'THROW:'+e.constructor.name;}}}})());"
         );
@@ -539,7 +620,10 @@ fn strict_deterministic_same_seed_same_bytes() {
     let src = "function(o){ o.x = 1; return typeof this; }";
     let v1 = virtualize_with_strict(src, 99, true).unwrap();
     let v2 = virtualize_with_strict(src, 99, true).unwrap();
-    assert_eq!(v1, v2, "same seed must produce byte-identical strict VM output");
+    assert_eq!(
+        v1, v2,
+        "same seed must produce byte-identical strict VM output"
+    );
 }
 
 /// §9.1 strict-divergence fuzz net: the same generated bodies, but each `function f`
@@ -578,7 +662,11 @@ fn virtualize_opts(
 ) -> Option<String> {
     use mangler_vm::CompileOptions;
     let (params, body) = parse_fn(src);
-    let opts = CompileOptions { exclude, divert_ineligible };
+    let opts = CompileOptions {
+        exclude,
+        divert_ineligible,
+        ..Default::default()
+    };
     let compiled = mangler_vm::compile_body_with_opts(&params, &body, opts).ok()?;
 
     let div = VmDiversity::draw(&mut Rng::for_pass(seed, "vm"));
@@ -595,7 +683,11 @@ fn virtualize_opts(
         sy: "syy".into(),
     };
     let vt = tb.finish(&names).expect("finish");
-    let interp = if chunk.needs_eh { &names.eh_interp } else { &names.lean_interp };
+    let interp = if chunk.needs_eh {
+        &names.eh_interp
+    } else {
+        &names.lean_interp
+    };
     let caps = format!("[{}]", chunk.captures.join(","));
     let param_src: Vec<String> = (0..chunk.pcount).map(|i| format!("p{i}")).collect();
     let thunk = format!(
@@ -646,13 +738,20 @@ fn excluded_arrow_and_member_binding_stay_native() {
     // `const render = () => …`
     let src = "function(n){ const render = () => n * 2; return render() + render(); }";
     let v = virtualize_opts(src, 7, Some("render"), false).expect("compiles");
-    assert!(v.contains("=>"), "excluded arrow must stay native (arrow source):\n{v}");
+    assert!(
+        v.contains("=>"),
+        "excluded arrow must stay native (arrow source):\n{v}"
+    );
     assert_opts_equiv(src, "4", Some("render"), false);
 
     // `obj.render = function(){}`
-    let src2 = "function(n){ var obj={}; obj.render = function(){ return n + 7; }; return obj.render(); }";
+    let src2 =
+        "function(n){ var obj={}; obj.render = function(){ return n + 7; }; return obj.render(); }";
     let v2 = virtualize_opts(src2, 7, Some("render"), false).expect("compiles");
-    assert!(v2.contains("function"), "member-assigned excluded fn stays native:\n{v2}");
+    assert!(
+        v2.contains("function"),
+        "member-assigned excluded fn stays native:\n{v2}"
+    );
     assert_opts_equiv(src2, "10", Some("render"), false);
 }
 
@@ -664,7 +763,10 @@ fn excluded_mutable_capture_native_closure() {
     let src = "function(){ var count=0; function tick(){ count = count + 1; return count; } \
                tick(); tick(); return tick() + count; }";
     let v = virtualize_opts(src, 7, Some("tick"), false).expect("compiles");
-    assert!(v.contains("function tick("), "excluded `tick` stays native:\n{v}");
+    assert!(
+        v.contains("function tick("),
+        "excluded `tick` stays native:\n{v}"
+    );
     // 1,2,3 → returns 3 + count(=3) = 6.
     assert_opts_equiv(src, "", Some("tick"), false);
 }
@@ -701,16 +803,36 @@ fn ineligible_nested_diverts_to_native() {
     assert!(v2.contains("async"), "async stays native:\n{v2}");
     assert_opts_equiv(a, "", None, true);
 
-    // `with` (structurally ineligible) diverts to native.
-    let w = "function(o){ function rd(){ with(o){ return x + y; } } return rd(); }";
-    let v3 = virtualize_opts(w, 7, None, true).expect("compiles with divert");
-    assert!(v3.contains("with("), "with-using fn stays native:\n{v3}");
-    assert_opts_equiv(w, "{x:3,y:4}", None, true);
+    // A native factory cannot reproduce dynamic lookup of hidden VM locals.
+    for (source, reason) in [
+        (
+            "function(o){ function rd(){ with(o){ return x + y; } } return rd(); }",
+            "native_with",
+        ),
+        (
+            "function(x){ function rd(){ return eval('x'); } return rd(); }",
+            "native_direct_eval",
+        ),
+    ] {
+        let (params, body) = parse_fn(source);
+        let result = mangler_vm::compile_body_with_opts(
+            &params,
+            &body,
+            mangler_vm::CompileOptions {
+                divert_ineligible: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.unwrap_err(), reason);
+    }
 
     // own `"use strict"` nested fn diverts to native.
     let s = "function(){ function st(){ \"use strict\"; return typeof this; } return st(); }";
     let v4 = virtualize_opts(s, 7, None, true).expect("compiles with divert");
-    assert!(v4.contains("use strict"), "strict nested fn stays native:\n{v4}");
+    assert!(
+        v4.contains("use strict"),
+        "strict nested fn stays native:\n{v4}"
+    );
     assert_opts_equiv(s, "", None, true);
 }
 
@@ -721,7 +843,10 @@ fn native_closure_reads_global_untouched() {
     // `mk` reads global `Math` (untouched) and captures local `base` (threaded).
     let src = "function(base){ function mk(x){ return Math.max(base, x); } return mk(3) + mk(9); }";
     let v = virtualize_opts(src, 7, Some("mk"), false).expect("compiles");
-    assert!(v.contains("Math.max"), "global Math left untouched in native body:\n{v}");
+    assert!(
+        v.contains("Math.max"),
+        "global Math left untouched in native body:\n{v}"
+    );
     assert_opts_equiv(src, "5", Some("mk"), false);
 }
 
@@ -749,4 +874,176 @@ fn bail_leaves_no_output() {
     used.insert("x".to_string());
     // The compiler also bails directly.
     assert!(mangler_vm::compile_body(&params, &body).is_err());
+}
+
+/// These regressions must compile; silently bailing would hide lost coverage.
+fn assert_vm_required_equiv(src: &str, args: &str) {
+    for seed in [1, 7, 42] {
+        let generated = virtualized_program(src, args, seed).expect("regression must virtualize");
+        assert_behaviorally_equal_with(
+            &original_program(src, args),
+            &generated,
+            &CaptureMode::sink(),
+        );
+    }
+}
+
+#[test]
+fn updates_use_numeric_coercion() {
+    for args in ["'1'", "2n", "{valueOf(){return 5}}", "null", "undefined"] {
+        assert_vm_required_equiv("function(x){x++;return String(x)}", args);
+        assert_vm_required_equiv("function(x){x--;return String(x)}", args);
+    }
+}
+
+#[test]
+fn object_properties_coerce_keys_before_values_and_define_own_data() {
+    assert_vm_required_equiv(
+        "function(k){return Object.hasOwn({[k]:123},k)}",
+        "'__proto__'",
+    );
+    // QuickJS itself coerces computed literal keys after the value; Node follows
+    // the specified key-before-value order. Assert that expected order directly.
+    for seed in [1, 7, 42] {
+        let generated = virtualized_program(
+            "function(log,key,value){var o={[key]:value()};return log}",
+            "globalThis.log=[],{toString(){log.push('key');return 'a'}},function(){log.push('value');return 1}", seed).unwrap();
+        assert_behaviorally_equal_with(
+            "globalThis.__out=JSON.stringify(['key','value'])",
+            &generated,
+            &CaptureMode::sink(),
+        );
+    }
+    assert_vm_required_equiv(
+        "function(log,source,value){var o={...source,x:value()};return log}",
+        "globalThis.log=[],{get x(){log.push('getter');return 1}},function(){log.push('value');return 2}",
+    );
+}
+
+#[test]
+fn calls_ignore_function_own_apply_property() {
+    assert_vm_required_equiv(
+        "function(f){return f()}",
+        "Object.assign(function(){return 1},{apply(){return 2}})",
+    );
+    assert_vm_required_equiv(
+        "function(f){return f(...[3])}",
+        "Object.assign(function(x){return x},{apply(){return 2}})",
+    );
+    assert_vm_required_equiv(
+        "function(o){return o.f(...[3])}",
+        "{f:Object.assign(function(x){return x},{apply(){return 2}})}",
+    );
+}
+
+#[test]
+fn for_in_observes_deletion_during_enumeration() {
+    assert_vm_required_equiv(
+        "function(){var o={a:1,b:2};var s='';for(var k in o){s+=k;delete o.b}return s}",
+        "",
+    );
+}
+
+#[test]
+fn lexical_bindings_preserve_tdz_const_and_iteration_identity() {
+    assert_vm_required_equiv(
+        "function(){const x=1;try{x=2}catch(e){return e.name}return x}",
+        "",
+    );
+    assert_vm_required_equiv(
+        "function(){try{return typeof x}catch(e){return e.name}let x}",
+        "",
+    );
+    assert_vm_required_equiv(
+        "function(){var a=[];for(let i=0;i<3;i++){a.push(()=>i)}return a.map(f=>f())}",
+        "",
+    );
+    assert_vm_required_equiv(
+        "function(){var a=[];for(const i of [1,2,3]){a.push(()=>i)}return a.map(f=>f())}",
+        "",
+    );
+    assert_vm_required_equiv(
+        "function(){var a=[];for(var i=0;i<3;i++){let x=i;a.push(()=>x)}return a.map(f=>f())}",
+        "",
+    );
+}
+
+#[test]
+fn object_rest_does_not_read_excluded_getters_twice() {
+    assert_vm_required_equiv(
+        "function(source,log){let {x,...rest}=source;return [x,rest,log]}",
+        "{get x(){globalThis.log.push('x');return 1},get y(){globalThis.log.push('y');return 2}},globalThis.log=[]",
+    );
+    assert_vm_required_equiv(
+        "function(x){try{let {}=x;return false}catch(e){return e.name}}",
+        "null",
+    );
+    assert_vm_required_equiv(
+        "function(){let a=[];for(var i=0;i<2;i++){try{throw i}catch(e){a.push(()=>e)}}return a.map(f=>f())}",
+        "",
+    );
+}
+
+#[test]
+fn switch_discriminant_uses_enclosing_scope() {
+    assert_vm_required_equiv("function(){let x=1;switch(x){case 1:let x=2;return x}}", "");
+}
+
+#[test]
+fn nested_catch_in_finally_preserves_pending_completion() {
+    for src in [
+        "function(){try{return 1}finally{try{throw 2}catch(e){}}}",
+        "function(){try{try{throw 1}finally{try{throw 2}catch(e){}}}catch(e){return e}}",
+        "function(){try{return 1}finally{try{return 2}finally{var x=3}}}",
+        "function(){try{return 1}finally{try{throw 2}finally{var x=3}}}",
+    ] {
+        assert_vm_required_equiv(src, "");
+    }
+}
+
+#[test]
+fn arithmetic_mba_does_not_repeat_coercion() {
+    for op in ["&", "|", "^"] {
+        let src = format!("function(a,b,log){{var x=a{op}b;return [x,log]}}");
+        for seed in 1..12 {
+            let args = "{valueOf(){globalThis.log.push('a');return 3}},{valueOf(){globalThis.log.push('b');return 2}},globalThis.log=[]";
+            let generated = virtualized_program(&src, args, seed).unwrap();
+            assert_behaviorally_equal_with(
+                &original_program(&src, args),
+                &generated,
+                &CaptureMode::sink(),
+            );
+        }
+        assert_vm_required_equiv(&format!("function(a,b){{return String(a{op}b)}}"), "3n,2n");
+    }
+}
+
+#[test]
+fn arrows_are_not_constructors() {
+    assert_vm_required_equiv(
+        "function(){var f=()=>1;try{new f();return false}catch(e){return e.name}}",
+        "",
+    );
+}
+
+#[test]
+fn destructuring_stops_advancing_after_iterator_exhaustion() {
+    assert_vm_required_equiv(
+        "function(it,count){var [a,b]=it;return [a,b,count.n]}",
+        "{[Symbol.iterator](){return this},next(){globalThis.count.n++;return {done:true}}},globalThis.count={n:0}",
+    );
+    assert_vm_required_equiv(
+        "function(it,count){var [,a]=it;return [a,count.n]}",
+        "{[Symbol.iterator](){return this},next(){globalThis.count.n++;return {done:true}}},globalThis.count={n:0}",
+    );
+    // QuickJS reads an elided value getter; Node correctly reads only `a`.
+    for seed in [1, 7, 42] {
+        let generated = virtualized_program("function(it,count){var [,a]=it;return [a,count.n]}",
+            "{[Symbol.iterator](){return this},next(){return {done:false,get value(){globalThis.count.n++;return 3}}},return(){return {done:true}}},globalThis.count={n:0}", seed).unwrap();
+        assert_behaviorally_equal_with(
+            "globalThis.__out=JSON.stringify([3,1])",
+            &generated,
+            &CaptureMode::sink(),
+        );
+    }
 }

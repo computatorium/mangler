@@ -27,9 +27,9 @@
 //!
 //! # Finalizers
 //!
-//! After codegen the runner applies post-codegen STRING finalizers (anti-tamper
-//! [`wrap`](crate::selfdefend::wrap), and — left as a seam — the self-coupled-key
-//! patch), then the `--verify` reparse + prefix parse-check. These are not
+//! After codegen the runner patches self-coupled keys, applies the anti-tamper
+//! [`wrap`](crate::selfdefend::wrap), then runs `--verify` against the exact final
+//! artifact. These are not
 //! scheduler passes because they operate on the emitted string, not the AST.
 
 use crate::artifacts::{MangleControlArtifact, ResolvedScopesArtifact, SelfCoupledKeyArtifact};
@@ -43,7 +43,7 @@ use crate::{seed, selfdefend};
 use mangler_config::ResolvedConfig;
 use mangler_core::{Error, Language, Notes, PassConfig, Result, Rng};
 use mangler_jsast::{Js, ParseOpts};
-use mangler_passgraph::{schedule_nodes, ArtifactBus, Pass, PassNode};
+use mangler_passgraph::{ArtifactBus, Pass, PassNode, schedule_nodes};
 
 /// The id of the resolver pseudo-pass.
 const RESOLVER_ID: &str = "resolver";
@@ -84,7 +84,8 @@ pub fn process(src: &str, opts: &ParseOpts, cfg: &ResolvedConfig) -> Result<(Str
     let (eff_seed, reserved_idents) =
         seed::effective_seed_and_idents(ast.program(), cfg.engine.seed);
 
-    let file_cfg = FileConfig::new(cfg.clone(), eff_seed, reserved_idents);
+    let file_cfg = FileConfig::new(cfg.clone(), eff_seed, reserved_idents)
+        .with_source_functions(crate::passes::virtualize::source_functions(ast.program()));
 
     // Collect the enabled AST passes, plus the resolver + minify pseudo-pass nodes.
     let passes = register_passes();
@@ -117,110 +118,98 @@ pub fn process(src: &str, opts: &ParseOpts, cfg: &ResolvedConfig) -> Result<(Str
     // interoperate. The closure also surfaces the optional self-coupled-key
     // interpreter name (the strings pass `put`s it on the bus when `--self-coupled-key`
     // is active) so the POST-codegen finalizer below can patch the source-hash sentinel.
-    let (output, self_coupled_interp) = Js::with_globals(|| -> Result<(String, Option<String>)> {
-        let mut ast = ast;
-        let mut bus = ArtifactBus::new();
-        let mut marks: Option<(swc_core::common::Mark, swc_core::common::Mark)> = None;
+    let (output, self_coupled_interp) =
+        Js::with_globals(|| -> Result<(String, Option<String>)> {
+            let mut ast = ast;
+            let mut bus = ArtifactBus::new();
+            let mut marks: Option<(swc_core::common::Mark, swc_core::common::Mark)> = None;
 
-        for node in &order {
-            match node.id {
-                RESOLVER_ID => {
-                    bus.enter_pass(RESOLVER_ID, &node.reads, &node.writes);
-                    let (unresolved, top_level) = Js::resolve(&mut ast);
-                    marks = Some((unresolved, top_level));
-                    bus.put(ResolvedScopesArtifact {
-                        unresolved_mark: unresolved,
-                        top_level_mark: top_level,
-                    })
-                    .map_err(|e| Error::transform(RESOLVER_ID, e.to_string()))?;
-                }
-                _ => {
-                    let pass = passes
-                        .iter()
-                        .find(|p| p.id() == node.id)
-                        .expect("scheduled node has a registered pass");
-                    let mut rng = Rng::for_pass(file_cfg.seed(), pass.id());
-                    bus.enter_pass(pass.id(), pass.reads(), pass.writes());
-                    pass.run(&mut ast, &file_cfg, &mut rng, &mut bus, &mut notes)?;
+            for node in &order {
+                match node.id {
+                    RESOLVER_ID => {
+                        bus.enter_pass(RESOLVER_ID, &node.reads, &node.writes);
+                        let (unresolved, top_level) = Js::resolve(&mut ast);
+                        marks = Some((unresolved, top_level));
+                        bus.put(ResolvedScopesArtifact {
+                            unresolved_mark: unresolved,
+                            top_level_mark: top_level,
+                        })
+                        .map_err(|e| Error::transform(RESOLVER_ID, e.to_string()))?;
+                    }
+                    _ => {
+                        let pass = passes
+                            .iter()
+                            .find(|p| p.id() == node.id)
+                            .expect("scheduled node has a registered pass");
+                        let mut rng = Rng::for_pass(file_cfg.seed(), pass.id());
+                        bus.enter_pass(pass.id(), pass.reads(), pass.writes());
+                        pass.run(&mut ast, &file_cfg, &mut rng, &mut bus, &mut notes)?;
+                    }
                 }
             }
-        }
 
-        // Surface the self-coupled-key interpreter name (if the strings pass put one)
-        // BEFORE codegen consumes the AST, under a reader scope that declares the
-        // resource the artifact rides on (`decoder_anchor`).
-        bus.enter_pass(
-            "self-coupled-key-reader",
-            &[mangler_passgraph::Resource::decoder_anchor()],
-            &[],
-        );
-        let self_coupled_interp = bus
-            .get::<SelfCoupledKeyArtifact>()
-            .map_err(|e| Error::transform("strings", e.to_string()))?
-            .map(|a| a.interp_name.clone());
+            // Surface the self-coupled-key interpreter name (if the strings pass put one)
+            // BEFORE codegen consumes the AST, under a reader scope that declares the
+            // resource the artifact rides on (`decoder_anchor`).
+            bus.enter_pass(
+                "self-coupled-key-reader",
+                &[mangler_passgraph::Resource::decoder_anchor()],
+                &[],
+            );
+            let self_coupled_interp = bus
+                .get::<SelfCoupledKeyArtifact>()
+                .map_err(|e| Error::transform("strings", e.to_string()))?
+                .map(|a| a.interp_name.clone());
 
-        // -- Terminal minify/codegen (always runs last, after every pass) --
-        // Scope the bus to the codegen step so its reads are contract-valid.
-        bus.enter_pass(
-            MINIFY_ID,
-            &[
-                mangler_passgraph::Resource::mangle_control(),
-                mangler_passgraph::Resource::resolved_scopes(),
-            ],
-            &[],
-        );
-        let (unresolved, top_level) =
-            marks.expect("the resolver pseudo-pass is always scheduled, so marks are set");
-        let control = bus
-            .get::<MangleControlArtifact>()
-            .map_err(|e| Error::transform(MINIFY_ID, e.to_string()))?
-            .cloned()
-            .unwrap_or_default();
-        // swc mangle runs unless the idnames pass suppressed it.
-        let mangle = cfg.passes.mangle.enabled && !control.suppress_builtin_mangle;
-        let reserved = if control.reserved.is_empty() {
-            cfg.engine.keep_names.clone()
-        } else {
-            control.reserved.clone()
-        };
-        Ok((
-            Js::print_optimized(ast, (unresolved, top_level), mangle, &reserved),
-            self_coupled_interp,
-        ))
-    })?;
+            // -- Terminal minify/codegen (always runs last, after every pass) --
+            // Scope the bus to the codegen step so its reads are contract-valid.
+            bus.enter_pass(
+                MINIFY_ID,
+                &[
+                    mangler_passgraph::Resource::mangle_control(),
+                    mangler_passgraph::Resource::resolved_scopes(),
+                ],
+                &[],
+            );
+            let (unresolved, top_level) =
+                marks.expect("the resolver pseudo-pass is always scheduled, so marks are set");
+            let control = bus
+                .get::<MangleControlArtifact>()
+                .map_err(|e| Error::transform(MINIFY_ID, e.to_string()))?
+                .cloned()
+                .unwrap_or_default();
+            // swc mangle runs unless the idnames pass suppressed it.
+            let mangle = cfg.passes.mangle.enabled && !control.suppress_builtin_mangle;
+            let reserved = if control.reserved.is_empty() {
+                cfg.engine.keep_names.clone()
+            } else {
+                control.reserved.clone()
+            };
+            Ok((
+                Js::print_optimized(ast, (unresolved, top_level), mangle, &reserved),
+                self_coupled_interp,
+            ))
+        })?;
 
     // -- Post-codegen finalizers (operate on the STRING, not the AST) --
 
     let eff_seed = file_cfg.seed();
     let anti = &cfg.passes.anti_tamper;
-    let output = selfdefend::wrap(output, anti, eff_seed, cfg.engine.verify);
-
-    // The self-coupled-key patch (`--self-coupled-key`) runs here, AFTER `wrap` (which
-    // only prepends a prefix, leaving the hashed interpreter/decoder spans final) and
-    // only when active. The strings pass already gates the artifact on `!verify` (the
-    // patch must be skipped under `--verify`, else an unpatched self-hash check would
-    // always mismatch and poison decode), so its presence is the whole signal.
+    // Patch interpreter hashes before anti-tamper computes final function-source
+    // checksums. Verification never changes either finalizer's behavior.
     let output = match self_coupled_interp {
-        Some(interp_name) => crate::passes::strings::stub::patch_self_coupled_expected(
-            output,
-            &interp_name,
-        ),
+        Some(interp_name) => {
+            crate::passes::strings::stub::patch_self_coupled_expected(output, &interp_name)
+        }
         None => output,
     };
 
+    let output = selfdefend::wrap(output, anti, eff_seed, opts)?;
+
     if cfg.engine.verify {
         // Re-parse the certified output to catch a pass that emitted malformed code.
-        Js::reparse(&output, opts).map_err(|e| {
-            Error::verify(format!("mangled output failed to re-parse: {e}"))
-        })?;
-        // `wrap` skips the live traps in verify mode, so the certified output is the
-        // pre-anti-tamper artifact. Statically parse-check the prefix templates the
-        // anti-tamper finalizer WOULD emit so --verify still covers their syntax.
-        if let Some(prefix) = selfdefend::verify_prefix(anti, eff_seed) {
-            Js::reparse(&prefix, opts).map_err(|e| {
-                Error::verify(format!("anti-tamper prefix template failed to parse-check: {e}"))
-            })?;
-        }
+        Js::reparse(&output, opts)
+            .map_err(|e| Error::verify(format!("mangled output failed to re-parse: {e}")))?;
     }
 
     Ok((output, notes))
@@ -245,7 +234,10 @@ fn augment_order(
     id: &str,
     reads: &[mangler_passgraph::Resource],
     writes: &[mangler_passgraph::Resource],
-) -> (Vec<mangler_passgraph::Resource>, Vec<mangler_passgraph::Resource>) {
+) -> (
+    Vec<mangler_passgraph::Resource>,
+    Vec<mangler_passgraph::Resource>,
+) {
     use mangler_passgraph::Resource;
     const EXPR_DONE: Resource = Resource::Custom("js::ord/expr-obfuscated");
     const CF_DONE: Resource = Resource::Custom("js::ord/cf-flattened");
@@ -324,7 +316,8 @@ mod tests {
 
     #[test]
     fn renames_locals_but_not_globals() {
-        let src = "function f(){ var localVariable = 5; return localVariable + window.GLOBAL_THING; }";
+        let src =
+            "function f(){ var localVariable = 5; return localVariable + window.GLOBAL_THING; }";
         let out = run(src, Intensity::Minify, 1);
         assert!(!out.contains("localVariable"), "local renamed: {out}");
         assert!(out.contains("GLOBAL_THING"), "global preserved: {out}");
@@ -350,8 +343,12 @@ mod tests {
 
     #[test]
     fn parse_error_is_an_error_not_panic() {
-        let err = process("function (", &ParseOpts::default(), &cfg(Intensity::Minify, 1))
-            .unwrap_err();
+        let err = process(
+            "function (",
+            &ParseOpts::default(),
+            &cfg(Intensity::Minify, 1),
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::Parse { .. }));
     }
 
@@ -365,5 +362,65 @@ mod tests {
             &c,
         );
         assert!(out.is_ok(), "verify must accept valid output: {out:?}");
+    }
+
+    #[test]
+    fn verify_preserves_the_exact_hardened_artifact() {
+        let src = "function pay(x){return 'paid:'+x;}globalThis.__out=pay(42);";
+        let mut config = cfg(Intensity::Max, 42);
+        config.passes.strings.exec_trace_key = true;
+        config.passes.strings.self_coupled_key = true;
+        config.engine.verify = false;
+        let original = process(src, &ParseOpts::default(), &config).unwrap().0;
+        config.engine.verify = true;
+        let verified = process(src, &ParseOpts::default(), &config).unwrap().0;
+        assert_eq!(original, verified);
+        mangler_testkit::assert_behaviorally_equal(src, &verified);
+    }
+
+    #[test]
+    fn minification_preserves_function_strict_receivers_and_stores() {
+        for src in [
+            "function pay(){'use strict';return this===undefined;}globalThis.__out=pay();",
+            "function pay(){'use strict';var obj=Object.freeze({x:1});try{obj.x=2;return false;}catch(e){return e instanceof TypeError;}}globalThis.__out=pay();",
+        ] {
+            let out = run(src, Intensity::Minify, 1);
+            assert!(
+                out.contains("use strict"),
+                "strict directive disappeared: {out}"
+            );
+            mangler_testkit::assert_behaviorally_equal(src, &out);
+        }
+    }
+
+    #[test]
+    fn short_names_respect_keep_globs() {
+        let src = "function f(x){var publicTotal=x+1,privateTotal=x+2;sink(publicTotal,privateTotal);return publicTotal;}f(window.q);";
+        let mut config = cfg(Intensity::Minify, 7);
+        config.engine.keep_names = vec!["public*".into()];
+        config.passes.mangle.keep_names = config.engine.keep_names.clone();
+        let out = process(src, &ParseOpts::default(), &config).unwrap().0;
+        assert!(out.contains("publicTotal"), "{out}");
+        assert!(!out.contains("privateTotal"), "{out}");
+    }
+    #[test]
+    fn all_presets_preserve_observable_initializers_and_strict_receivers() {
+        let sources = [
+            "function f(){'use strict';return this===undefined};console.log(f())",
+            "function pay(){let s=[];let k={[Symbol.toPrimitive](){s.push('key');return 'x'}};let o={[k]:(s.push('value'),1)};return s};console.log(JSON.stringify(pay()))",
+            "let C='outer';try{let X=class C extends C{}}catch(e){console.log(e.name)}",
+        ];
+        for level in [
+            Intensity::Minify,
+            Intensity::Low,
+            Intensity::Medium,
+            Intensity::High,
+            Intensity::Max,
+        ] {
+            for src in sources {
+                let out = run(src, level, 1);
+                mangler_testkit::assert_behaviorally_equal(src, &out);
+            }
+        }
     }
 }

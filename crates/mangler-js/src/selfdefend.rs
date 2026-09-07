@@ -1,116 +1,140 @@
-//! Anti-tamper output hardening — a **post-codegen string finalizer**.
+//! Final-source hardening without wrapping the application's lexical scope.
 //!
-//! Unlike the AST passes, the anti-tamper transforms operate on the FINAL emitted
-//! JS string: [`wrap`] prepends a guard prefix to the codegen output. The plan
-//! calls anti-tamper a "pass", but it is post-codegen by nature (it hashes the
-//! emitted source and prepends raw text), so the runner applies it as a finalizer
-//! stage after [`mangler_jsast::Js::print_optimized`], not as a scheduler node.
-//!
-//! Gated by [`mangler_config::AntiTamperConfig`]'s `self_defending` /
-//! `debug_protection`. The guards deliberately diverge under
-//! debugging/DevTools/beautification ("aggressive, accept divergence"); the
-//! behavioral corpus disables them.
-//!
-//! # Determinism
-//!
-//! Reproducible: the same `eff_seed` yields the same guard names/periods, drawn
-//! from a per-finalizer [`Rng`] (`Rng::for_pass(eff_seed, "anti-tamper")`). The
-//! baked integrity constant uses [`mangler_core::hash::djb2_utf16`] — the exact
-//! mirror of the in-JS DJB2 loop emitted into the guard — so the build-time
-//! expected digest matches what the runtime probe reports.
+//! The integrity check detects changes to its probe and to unambiguous top-level
+//! function declarations. It does not attest arbitrary top-level statements or
+//! provide a security boundary against an attacker who can replace the guard.
+//! Checks fail with an exception rather than an unbounded CPU loop. Debug timers
+//! are unreferenced in Node so enabling protection does not keep a CLI alive.
 
 use mangler_config::AntiTamperConfig;
 use mangler_core::hash::djb2_utf16;
-use mangler_core::Rng;
+use mangler_core::{Language, NameAllocator, Result, Rng};
+use mangler_jsast::directives::is_directive;
+use mangler_jsast::{Js, ParseOpts};
+use std::collections::HashMap;
+use swc_core::common::{SourceMapper, Spanned};
+use swc_core::ecma::ast::{Decl, ModuleDecl, ModuleItem, Program, Stmt};
 
-/// A seeded `_0x…` guard identifier.
-fn name(rng: &mut Rng) -> String {
-    format!("_0x{:08x}", rng.random_u32())
-}
-
-/// Browser-only `debugger`/interval trap, guarded so a host without the APIs still
-/// runs the user code. Interval period is seeded. The trap function does NOT call
-/// itself: `setInterval` re-arms the `debugger` hit each period on a fresh stack.
-fn debug_protection_snippet(rng: &mut Rng) -> String {
-    let f = name(rng);
+fn debug_protection_snippet(rng: &mut Rng, names: &mut NameAllocator) -> String {
+    let f = names.fresh();
+    let timer = names.fresh();
     let period = 2000 + (rng.random_u32() % 4000);
     format!(
-        "try{{(function(){{var {f}=function(){{try{{(function(){{}}).constructor('debugger')();}}catch(e){{}}}};try{{{f}();}}catch(e){{}}try{{setInterval({f},{period});}}catch(e){{}}}})();}}catch(e){{}}"
+        "(function(){{try{{var {f}=function(){{try{{(function(){{}}).constructor('debugger')();}}catch(e){{}}}};{f}();var {timer}=setInterval({f},{period});if({timer}&&typeof {timer}.unref==='function'){timer}.unref();}}catch(e){{}}}})();"
     )
 }
 
-/// The standalone DJB2 string-hash helper emitted into the guard:
-/// `h = (h*33 + s.charCodeAt(k)) >>> 0` over the UTF-16 code units — the in-JS
-/// mirror of [`mangler_core::hash::djb2_utf16`].
-fn djb2_check_src(fn_name: &str) -> String {
-    format!(
-        "function {fn_name}(s){{var h=5381,k=0;for(;k<s.length;k++)h=(h*33+s.charCodeAt(k))>>>0;return h;}}"
-    )
-}
-
-/// Self-defending guard: defines the DJB2 hasher, a fixed `probe` function, and a
-/// guard that hashes the probe's `toString()` and on mismatch recurses into a
-/// runaway loop. The probed string is the *probe's* source (so the baked digest
-/// does not depend on itself), computed here via [`djb2_utf16`] over the exact
-/// `function {probe}(){return <nonce>;}` text the engine reports back verbatim.
-fn self_defending_snippet(rng: &mut Rng) -> String {
-    let check = name(rng);
-    let probe = name(rng);
-    let g = name(rng);
-    let chk_src = djb2_check_src(&check);
+fn self_defending_snippet(
+    names: &mut NameAllocator,
+    functions: &[(String, String)],
+    rng: &mut Rng,
+) -> String {
+    let check = names.fresh();
+    let probe = names.fresh();
     let nonce = rng.random_u32();
     let probe_src = format!("function {probe}(){{return {nonce};}}");
-    let expected = djb2_utf16(&probe_src);
+    let mut tests = format!("{check}({probe})!=={}", djb2_utf16(&probe_src));
+    for (name, source) in functions {
+        tests.push_str(&format!("||{check}({name})!=={}", djb2_utf16(source)));
+    }
     format!(
-        "try{{{chk_src}{probe_src}var {g}=function(){{if({check}(\"\"+{probe})!=={expected}){{while(1){{}}}}}};{g}();}}catch(e){{}}"
+        "(function(){{function {check}(f){{var s=(function(){{}}).toString.call(f),h=5381,k=0;for(;k<s.length;k++)h=(h*33+s.charCodeAt(k))>>>0;return h;}}{probe_src}if({tests})throw 'Mangler integrity check failed';}})();"
     )
 }
 
-/// Build the anti-tamper prefix the config would emit (debug protection and/or
-/// self-defending snippets), or `None` when neither is on. Reproducible: same
-/// `eff_seed` → same snippet names/periods.
-fn anti_tamper_prefix(cfg: &AntiTamperConfig, eff_seed: u64) -> Option<String> {
+/// Finalize the exact emitted source, inserting guards after its directives and
+/// shebang. No re-emission happens after checksums are calculated.
+pub fn wrap(
+    output: String,
+    cfg: &AntiTamperConfig,
+    eff_seed: u64,
+    opts: &ParseOpts,
+) -> Result<String> {
     if !cfg.self_defending && !cfg.debug_protection {
-        return None;
+        return Ok(output);
     }
+    let ast = Js.parse(&output, opts)?;
+    let cm = ast.source_map();
+    let mut names = NameAllocator::new(eff_seed);
+    names.reserve(crate::seed::effective_seed_and_idents(ast.program(), eff_seed).1);
     let mut rng = Rng::for_pass(eff_seed, "anti-tamper");
+    let mut declarations = Vec::new();
+    let mut directive_end = None;
+    let mut in_directives = true;
+    let mut inspect = |stmt: &Stmt| {
+        if in_directives && is_directive(stmt) {
+            directive_end = Some(stmt.span().hi);
+        } else {
+            in_directives = false;
+        }
+        if let Stmt::Decl(Decl::Fn(decl)) = stmt
+            && let Ok(source) = cm.span_to_snippet(decl.function.span)
+        {
+            declarations.push((decl.ident.sym.to_string(), source));
+        }
+    };
+    match ast.program() {
+        Program::Script(script) => {
+            for stmt in &script.body {
+                inspect(stmt);
+            }
+        }
+        Program::Module(module) => {
+            for item in &module.body {
+                match item {
+                    ModuleItem::Stmt(stmt) => inspect(stmt),
+                    // Exported declarations are hoisted like ordinary functions.
+                    ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => {
+                        inspect(&Stmt::Decl(export.decl.clone()));
+                    }
+                    _ => {
+                        inspect(&Stmt::Empty(swc_core::ecma::ast::EmptyStmt {
+                            span: swc_core::common::DUMMY_SP,
+                        }));
+                    }
+                }
+            }
+        }
+    }
+    // Duplicate declarations resolve to the last definition, not each source
+    // occurrence. Omit ambiguous names instead of rejecting valid scripts.
+    let mut counts = HashMap::new();
+    for (name, _) in &declarations {
+        *counts.entry(name.clone()).or_insert(0) += 1;
+    }
+    declarations.retain(|(name, _)| counts[name] == 1);
     let mut prefix = String::new();
     if cfg.debug_protection {
-        prefix.push_str(&debug_protection_snippet(&mut rng));
+        prefix.push_str(&debug_protection_snippet(&mut rng, &mut names));
     }
     if cfg.self_defending {
-        prefix.push_str(&self_defending_snippet(&mut rng));
+        prefix.push_str(&self_defending_snippet(&mut names, &declarations, &mut rng));
     }
-    Some(prefix)
-}
-
-/// The prefix [`wrap`] WOULD prepend for this config/seed, so `--verify` can
-/// statically parse-check its syntax even though `wrap` skips the traps in verify
-/// mode (executing them would hang/diverge the re-parse run). `None` when no
-/// anti-tamper feature is enabled.
-pub fn verify_prefix(cfg: &AntiTamperConfig, eff_seed: u64) -> Option<String> {
-    anti_tamper_prefix(cfg, eff_seed)
-}
-
-/// Apply the configured anti-tamper wrap to `output`, prepending the guard prefix.
-/// Reproducible: same `eff_seed` → same names/periods. When `verify` is true the
-/// traps are skipped (executing the `setInterval(debugger)` / `while(1)` traps
-/// would hang or diverge the equivalence-check re-parse); the prefix templates are
-/// still parse-checked separately by the caller via [`verify_prefix`].
-pub fn wrap(output: String, cfg: &AntiTamperConfig, eff_seed: u64, verify: bool) -> String {
-    if verify {
-        return output;
+    let at = directive_end
+        .map(|pos| cm.lookup_byte_offset(pos).pos.0 as usize)
+        .unwrap_or_else(|| {
+            if output.starts_with("#!") {
+                output.find('\n').map_or(output.len(), |at| at + 1)
+            } else {
+                0
+            }
+        });
+    let mut result = String::with_capacity(output.len() + prefix.len() + 1);
+    result.push_str(&output[..at]);
+    // Source may have an ASI-terminated directive or an unterminated shebang.
+    if directive_end.is_some() && !output[..at].ends_with(';') {
+        result.push(';');
+    } else if at > 0 && !output[..at].ends_with([';', '\n']) {
+        result.push('\n');
     }
-    match anti_tamper_prefix(cfg, eff_seed) {
-        Some(prefix) => format!("{prefix}{output}"),
-        None => output,
-    }
+    result.push_str(&prefix);
+    result.push_str(&output[at..]);
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mangler_jsast::{Js, ParseOpts};
 
     fn at(self_defending: bool, debug_protection: bool) -> AntiTamperConfig {
         AntiTamperConfig {
@@ -119,54 +143,55 @@ mod tests {
         }
     }
 
+    fn harden(src: &str, cfg: &AntiTamperConfig) -> String {
+        wrap(src.to_string(), cfg, 7, &ParseOpts::default()).unwrap()
+    }
+
     #[test]
     fn disabled_is_a_no_op() {
-        let out = wrap("CODE;".to_string(), &at(false, false), 1, false);
-        assert_eq!(out, "CODE;");
-        assert!(verify_prefix(&at(false, false), 1).is_none());
+        assert_eq!(harden("CODE;", &at(false, false)), "CODE;");
     }
 
     #[test]
-    fn verify_mode_skips_traps() {
-        let out = wrap("CODE;".to_string(), &at(true, true), 1, true);
-        assert_eq!(out, "CODE;", "verify mode must not prepend live traps");
-    }
-
-    #[test]
-    fn wrap_prepends_and_is_deterministic() {
-        let a = wrap("X;".to_string(), &at(true, true), 7, false);
-        let b = wrap("X;".to_string(), &at(true, true), 7, false);
-        assert_eq!(a, b, "same seed → byte-identical wrap");
-        assert!(a.ends_with("X;"));
-        assert!(a.len() > 2, "a prefix was prepended");
-    }
-
-    #[test]
-    fn prefix_templates_parse() {
-        let prefix = verify_prefix(&at(true, true), 42).expect("enabled → prefix");
+    fn wrap_preserves_shebang_and_directives() {
+        let src = "#!/usr/bin/env node\n'use strict';'custom';console.log(42);";
+        let output = harden(src, &at(true, true));
+        assert!(output.starts_with("#!/usr/bin/env node\n'use strict';'custom';"));
         assert!(
-            Js::reparse(&prefix, &ParseOpts::default()).is_ok(),
-            "anti-tamper prefix must be valid JS: {prefix}"
+            Js::reparse(&output, &ParseOpts::default()).is_ok(),
+            "{output}"
+        );
+        assert_eq!(output, harden(src, &at(true, true)));
+    }
+
+    #[test]
+    fn guards_execute_without_changing_strict_this() {
+        let src = "'use strict'; function pay(){return this===undefined;} globalThis.__out=pay();";
+        mangler_testkit::assert_behaviorally_equal(src, &harden(src, &at(true, true)));
+    }
+
+    #[test]
+    fn detects_application_function_mutation() {
+        let output = harden(
+            "function pay(){return 42;}globalThis.__out=pay();",
+            &at(true, false),
+        );
+        let changed = output.replace("return 42", "return 43");
+        assert_ne!(output, changed);
+        mangler_testkit::assert_behaviorally_equal(
+            "throw 'Mangler integrity check failed';",
+            &changed,
         );
     }
 
     #[test]
-    fn self_defending_digest_matches_core_djb2() {
-        // The baked expected constant must equal djb2_utf16 of the probe source —
-        // proving the build-time mirror agrees with the in-JS loop.
-        let mut rng = Rng::for_pass(99, "anti-tamper");
-        let snippet = self_defending_snippet(&mut rng);
-        // Re-derive: the snippet embeds `function <probe>(){return <nonce>;}` and the
-        // matching digest. We just assert it reparses and contains a numeric digest.
-        assert!(Js::reparse(&snippet, &ParseOpts::default()).is_ok());
-        // Sanity: djb2_utf16 of a known probe matches the documented recurrence.
-        let probe_src = "function _0x1(){return 5;}";
-        assert_eq!(djb2_utf16(probe_src), {
-            let mut h: u32 = 5381;
-            for c in probe_src.encode_utf16() {
-                h = h.wrapping_mul(33).wrapping_add(c as u32);
-            }
-            h
-        });
+    fn preserves_duplicate_declaration_semantics() {
+        let src = "function pay(){return 1;} function pay(){return 2;}globalThis.__out=pay();";
+        mangler_testkit::assert_behaviorally_equal(src, &harden(src, &at(true, false)));
+    }
+    #[test]
+    fn asi_directives_and_unicode_function_sources_remain_valid() {
+        let src = "'use strict' // directive comment\nfunction pay(){return 'paid:😀';}globalThis.__out=pay();";
+        mangler_testkit::assert_behaviorally_equal(src, &harden(src, &at(true, false)));
     }
 }

@@ -26,16 +26,16 @@
 use crate::span::injected_span;
 use mangler_core::{Error, Language, Result};
 use swc_core::common::sync::Lrc;
-use swc_core::common::{FileName, Mark, SourceMap, GLOBALS};
-use swc_core::ecma::ast::{EsVersion, Program};
-use swc_core::ecma::codegen::{text_writer::JsWriter, Config as CodegenConfig, Emitter};
+use swc_core::common::{FileName, GLOBALS, Mark, SourceMap};
+use swc_core::ecma::ast::{Class, EsVersion, Expr, Lit, Module, Program, PropName, Stmt};
+use swc_core::ecma::codegen::{Config as CodegenConfig, Emitter, text_writer::JsWriter};
 use swc_core::ecma::minifier::optimize;
 use swc_core::ecma::minifier::option::{
     CompressOptions, ExtraOptions, MangleOptions, MinifyOptions,
 };
-use swc_core::ecma::parser::{lexer::Lexer, EsSyntax, Parser, StringInput, Syntax, TsSyntax};
+use swc_core::ecma::parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
 use swc_core::ecma::transforms::base::{fixer::fixer, resolver};
-use swc_core::ecma::visit::VisitMutWith;
+use swc_core::ecma::visit::{Visit, VisitMutWith, VisitWith};
 
 /// Explicit parse configuration. Dialect is a **decision the caller makes**, not
 /// a filename guess (the legacy `.ts`/`.tsx` sniffing is gone from the seam).
@@ -55,12 +55,15 @@ impl ParseOpts {
     /// Convenience mirroring the legacy filename-sniffing behavior, for callers
     /// that still want it. New callers should set the flags explicitly.
     pub fn from_filename(filename: &str) -> Self {
-        let typescript = filename.ends_with(".ts") || filename.ends_with(".tsx");
+        let typescript = filename.ends_with(".ts")
+            || filename.ends_with(".tsx")
+            || filename.ends_with(".mts")
+            || filename.ends_with(".cts");
         let jsx = filename.ends_with(".jsx") || filename.ends_with(".tsx");
         ParseOpts {
             typescript,
             jsx,
-            module: false,
+            module: filename.ends_with(".mjs") || filename.ends_with(".mts"),
         }
     }
 
@@ -145,11 +148,22 @@ impl Language for Js {
             Lrc::new(FileName::Custom(format!("{}.js", Self::ID))),
             src.to_string(),
         );
-        let lexer = Lexer::new(opts.syntax(), EsVersion::EsNext, StringInput::from(&*fm), None);
+        let lexer = Lexer::new(
+            opts.syntax(),
+            EsVersion::EsNext,
+            StringInput::from(&*fm),
+            None,
+        );
         let mut parser = Parser::new_from(lexer);
-        let program = parser
-            .parse_program()
-            .map_err(|e| Error::parse(Self::ID, format!("{e:?}")))?;
+        let program = if opts.module {
+            parser.parse_module().map(Program::Module)
+        } else {
+            parser.parse_program()
+        }
+        .map_err(|e| Error::parse(Self::ID, format!("{e:?}")))?;
+        if let Some(error) = parser.take_errors().into_iter().next() {
+            return Err(Error::parse(Self::ID, format!("{error:?}")));
+        }
         Ok(Ast {
             program,
             source_map: cm,
@@ -181,6 +195,8 @@ impl Js {
         let top_level = Mark::new();
         ast.program
             .visit_mut_with(&mut resolver(unresolved, top_level, ast.typescript));
+        ast.program
+            .visit_mut_with(&mut crate::class_scope::RepairClassHeritage);
         (unresolved, top_level)
     }
 
@@ -196,6 +212,8 @@ impl Js {
     ) -> String {
         let (unresolved_mark, top_level_mark) = marks;
         let cm = ast.source_map.clone();
+        let mut safety = CompressionSafety::default();
+        ast.program.visit_with(&mut safety);
         let mut program = optimize(
             ast.program,
             cm.clone(),
@@ -204,6 +222,15 @@ impl Js {
             &MinifyOptions {
                 compress: Some(CompressOptions {
                     drop_debugger: false,
+                    // SWC's return merging drops directives independently of
+                    // its directives option. DCE also overlooks key coercion and
+                    // class-heritage exceptions. Limit those passes to programs
+                    // without the affected constructs; other compression stays on.
+                    directives: false,
+                    if_return: !safety.directives,
+                    unused: !safety.observable_initializers,
+                    dead_code: !safety.observable_initializers,
+                    side_effects: !safety.observable_initializers,
                     ..Default::default()
                 }),
                 mangle: if mangle {
@@ -235,6 +262,48 @@ impl Js {
     }
 }
 
+/// Narrow guard around upstream optimizer assumptions that fail on observable
+/// initialization. Keep this at the terminal compression boundary so every pass
+/// and caller receives the same semantics.
+#[derive(Default)]
+struct CompressionSafety {
+    directives: bool,
+    observable_initializers: bool,
+}
+
+impl Visit for CompressionSafety {
+    fn visit_stmts(&mut self, statements: &[Stmt]) {
+        self.directives |= statements
+            .first()
+            .is_some_and(crate::directives::is_directive);
+        statements.visit_children_with(self);
+    }
+
+    fn visit_module(&mut self, module: &Module) {
+        self.directives |= module.body.first().is_some_and(|item| {
+            matches!(item, swc_core::ecma::ast::ModuleItem::Stmt(stmt) if crate::directives::is_directive(stmt))
+        });
+        module.visit_children_with(self);
+    }
+
+    fn visit_prop_name(&mut self, name: &PropName) {
+        // Primitive literal keys do not invoke user coercion. All other keys can
+        // execute Symbol.toPrimitive/toString before the property's value.
+        if let PropName::Computed(key) = name {
+            self.observable_initializers |=
+                !matches!(key.expr.as_ref(), Expr::Lit(lit) if !matches!(lit, Lit::Regex(_)));
+        }
+        name.visit_children_with(self);
+    }
+
+    fn visit_class(&mut self, class: &Class) {
+        // Even an unused heritage expression can throw (including a reference
+        // to the class's own still-uninitialized name).
+        self.observable_initializers |= class.super_class.is_some();
+        class.visit_children_with(self);
+    }
+}
+
 /// Emit `program` to source. `minify` selects the minified, ascii-only production
 /// config (the only config used today); the `injected_span` seam means a future
 /// source-map emit is localized.
@@ -243,7 +312,7 @@ fn emit(program: &Program, cm: &Lrc<SourceMap>, minify: bool) -> String {
     let _ = injected_span();
     let mut buf = Vec::new();
     {
-        let wr = JsWriter::new(cm.clone(), "", &mut buf, None);
+        let wr = JsWriter::new(cm.clone(), "\n", &mut buf, None);
         let mut emitter = Emitter {
             cfg: CodegenConfig::default()
                 .with_minify(minify)
@@ -267,11 +336,16 @@ mod tests {
 
     #[test]
     fn parse_print_round_trips_and_minifies() {
-        let ast = Js.parse("// hi\nconst x = 1 + 2;\n", &ParseOpts::default()).unwrap();
+        let ast = Js
+            .parse("// hi\nconst x = 1 + 2;\n", &ParseOpts::default())
+            .unwrap();
         let out = Js.print(&ast);
         assert!(!out.contains("hi"), "comment stripped: {out}");
         assert!(!out.contains('\n'), "minified single line: {out}");
-        assert!(out.contains("1+2") || out.contains('3'), "expr present: {out}");
+        assert!(
+            out.contains("1+2") || out.contains('3'),
+            "expr present: {out}"
+        );
     }
 
     #[test]
@@ -291,7 +365,10 @@ mod tests {
         assert!(Js.parse("interface I { x: number }", &ts).is_ok());
         // ...and must FAIL under the default (ES) dialect, proving the dialect
         // comes from opts, not a filename.
-        assert!(Js.parse("interface I { x: number }", &ParseOpts::default()).is_err());
+        assert!(
+            Js.parse("interface I { x: number }", &ParseOpts::default())
+                .is_err()
+        );
     }
 
     #[test]
@@ -301,7 +378,10 @@ mod tests {
             ..Default::default()
         };
         assert!(Js.parse("const e = <div/>;", &jsx).is_ok());
-        assert!(Js.parse("const e = <div/>;", &ParseOpts::default()).is_err());
+        assert!(
+            Js.parse("const e = <div/>;", &ParseOpts::default())
+                .is_err()
+        );
     }
 
     #[test]
@@ -310,6 +390,48 @@ mod tests {
         assert!(ParseOpts::from_filename("a.tsx").jsx);
         assert!(ParseOpts::from_filename("a.jsx").jsx);
         assert!(!ParseOpts::from_filename("a.js").typescript);
+    }
+
+    #[test]
+    fn shebang_keeps_its_required_line_break() {
+        let ast = Js
+            .parse(
+                "#!/usr/bin/env node\nconsole.log(42);",
+                &ParseOpts::default(),
+            )
+            .unwrap();
+        let out = Js.print(&ast);
+        assert!(out.starts_with("#!/usr/bin/env node\n"), "{out}");
+        let parsed = Js.parse(&out, &ParseOpts::default()).unwrap();
+        let Program::Script(script) = parsed.program() else {
+            panic!("script expected")
+        };
+        assert_eq!(
+            script.body.len(),
+            1,
+            "shebang must not swallow executable statements"
+        );
+    }
+
+    #[test]
+    fn module_option_enforces_implicit_strictness() {
+        let opts = ParseOpts {
+            module: true,
+            ..Default::default()
+        };
+        let ast = Js.parse("const value = 1;", &opts).unwrap();
+        assert!(matches!(ast.program(), Program::Module(_)));
+        assert!(Js.parse("with ({}) {}", &opts).is_err());
+        assert!(Js.parse("with ({}) {}", &ParseOpts::default()).is_ok());
+        assert!(ParseOpts::from_filename("entry.mjs").module);
+        assert!(ParseOpts::from_filename("entry.mts").typescript);
+        assert!(ParseOpts::from_filename("entry.mts").module);
+        assert!(ParseOpts::from_filename("entry.cts").typescript);
+    }
+
+    #[test]
+    fn recoverable_parser_errors_are_rejected() {
+        assert!(Js.parse("return 1;", &ParseOpts::default()).is_err());
     }
 
     #[test]
@@ -341,6 +463,19 @@ mod tests {
             let marks = Js::resolve(&mut ast);
             Js::print_optimized(ast, marks, true, &["keepThisName".to_string()])
         });
-        assert!(out.contains("keepThisName"), "reserved name preserved: {out}");
+        assert!(
+            out.contains("keepThisName"),
+            "reserved name preserved: {out}"
+        );
+    }
+    #[test]
+    fn explicit_function_strictness_survives_optimization() {
+        let src = "function f(){'use strict';return this===undefined};console.log(f())";
+        let out = Js::with_globals(|| {
+            let mut ast = Js.parse(src, &ParseOpts::default()).unwrap();
+            let marks = Js::resolve(&mut ast);
+            Js::print_optimized(ast, marks, true, &[])
+        });
+        assert!(out.contains("use strict"), "{out}");
     }
 }

@@ -1,38 +1,20 @@
-//! Phase 3 native-closure escape hatch (§4): build the factory function
-//! expression for an excluded / ineligible nested function that must run as
-//! **native JS at full speed** while still capturing enclosing VM-frame locals.
+//! Native closure factories bridge JavaScript functions to live VM-frame bindings.
 //!
-//! The compiler ([`super::emit_nested_closure`]) decides WHICH nested functions
-//! divert here (exclude-glob match, or async/generator/`"use strict"`/structurally
-//! ineligible under the divert-ineligible option). This module owns the
-//! representation: given the original function/arrow AST, the set of free names
-//! that resolve to enclosing-VM-frame bindings (the upvalues, in deterministic
-//! order) and which of those are CELLS (boxed mutable captures), it produces the
-//! factory source
-//!
-//! ```js
-//! function (u0, u1, …) { return <original, frame-locals rewritten to u0,u1,…>; }
-//! ```
-//!
-//! Free **module globals** (names NOT bound in any enclosing VM frame) are left
-//! untouched — the factory lives at module scope in the shared program-table, so
-//! they resolve to the real globals (no threading, no obfuscation lost). A celled
-//! upvalue is rewritten to `u_i[0]` (read) / `u_i[0] = v` (write) so the native fn
-//! shares the same one-element cell array the VM frame holds (mutation
-//! propagates). For an arrow, the enclosing `this` is threaded as an extra trailing
-//! upvalue and the factory closes over it lexically (an arrow ignores the call-time
-//! receiver, so this preserves lexical `this`).
-//!
-//! The output is a pure function of the AST + the rename map, so the same diversity
-//! seed yields byte-identical factory source (§4.4 determinism).
+//! SWC's resolver identifies free references, including parameter defaults and
+//! block/catch shadows. Each factory receives fresh-named accessor cells pointing
+//! at parent frame slots. Reads and writes remain live; boxed slots add one further
+//! dereference. Bare/optional/tagged calls retain their original receiver semantics.
+//! Native arrows additionally receive lexical `this`; nested regular functions
+//! keep their own receiver. Dynamic eval/with scopes are rejected conservatively.
 
 use std::collections::{HashMap, HashSet};
 
-use swc_core::common::DUMMY_SP;
+use swc_core::common::{DUMMY_SP, GLOBALS, Globals, Mark, SyntaxContext};
 use swc_core::ecma::ast::*;
 use swc_core::ecma::codegen::text_writer::JsWriter;
 use swc_core::ecma::codegen::{Config as CodegenConfig, Emitter};
-use swc_core::ecma::visit::{VisitMut, VisitMutWith};
+use swc_core::ecma::transforms::base::resolver;
+use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 /// One upvalue the factory takes as a parameter (`u_i`).
 #[derive(Debug, Clone)]
@@ -40,8 +22,8 @@ pub(crate) struct Upvalue {
     /// The original enclosing-frame name this upvalue stands in for. `None` for the
     /// synthetic arrow-`this` upvalue (no source name; never rewritten by name).
     pub name: Option<String>,
-    /// True if the enclosing-frame slot holds a one-element CELL `[v]` (a boxed
-    /// mutable capture): the native fn reads/writes `u_i[0]`.
+    /// True if the enclosing-frame slot itself holds a binding cell. The native
+    /// function dereferences the accessor and then this cell: `u_i[0][0]`.
     pub celled: bool,
     /// True if this is the synthetic arrow-`this` upvalue: every `this` in the
     /// original arrow body becomes `u_i`.
@@ -54,6 +36,30 @@ pub(crate) struct Upvalue {
 /// name from this generator), and with the factory's own scope it is fresh anyway.
 fn up_param(i: usize) -> String {
     format!("$u{i}")
+}
+
+/// Dynamic scope can resolve names hidden inside strings or with objects. Walk
+/// through nested functions and parameter defaults: moving any such closure into
+/// a factory would change its lexical environment.
+pub(crate) fn unsupported_scope(params: &[Pat], body: &BlockStmt) -> Option<&'static str> {
+    struct Scan(Option<&'static str>);
+    impl Visit for Scan {
+        fn visit_call_expr(&mut self, call: &CallExpr) {
+            if matches!(&call.callee, Callee::Expr(expr) if matches!(&**expr, Expr::Ident(id) if id.sym.as_ref() == "eval"))
+            {
+                self.0 = Some("native_direct_eval");
+            }
+            call.visit_children_with(self);
+        }
+        fn visit_with_stmt(&mut self, stmt: &WithStmt) {
+            self.0 = Some("native_with");
+            stmt.visit_children_with(self);
+        }
+    }
+    let mut scan = Scan(None);
+    params.visit_with(&mut scan);
+    body.visit_with(&mut scan);
+    scan.0
 }
 
 /// Build the factory function-expression SOURCE for `is_arrow` original, given its
@@ -70,85 +76,115 @@ pub(crate) fn build_factory_src(
     self_name: Option<&str>,
     upvalues: &[Upvalue],
 ) -> Option<String> {
-    // Map each celled / plain frame-local NAME to its factory-param ident, and find
-    // the arrow-`this` param (if any).
-    let mut rename: HashMap<String, RewriteTarget> = HashMap::new();
-    let mut this_param: Option<String> = None;
-    for (i, uv) in upvalues.iter().enumerate() {
-        let p = up_param(i);
-        if uv.is_this {
-            this_param = Some(p);
-        } else if let Some(n) = &uv.name {
-            rename.insert(
-                n.clone(),
-                RewriteTarget { param: p, celled: uv.celled },
-            );
-        }
-    }
-
-    // Clone + rewrite the inner function/arrow so frame-local refs become the
-    // factory params (`u_i` / `u_i[0]`), `this` becomes the arrow-this param, and
-    // module globals are left untouched. Locals the inner fn itself binds shadow a
-    // same-named upvalue and are NOT rewritten.
-    let inner_expr = build_inner_expr(
-        params, body, is_arrow, is_async, is_generator, self_name,
-    );
-    let mut rw = Rewriter {
-        rename: &rename,
-        this_param: this_param.as_deref(),
-        scopes: vec![local_names(params, body, self_name)],
-    };
-    let mut inner_expr = inner_expr;
-    inner_expr.visit_mut_with(&mut rw);
-
-    // Wrap: `function ($u0,$u1,…){ return <inner>; }`. The factory itself is plain
-    // (sloppy) — the inner fn carries its OWN strictness directive, so it runs in
-    // its correct mode regardless (§5a.2).
-    let factory_params: Vec<Pat> = (0..upvalues.len())
-        .map(|i| {
-            Pat::Ident(BindingIdent {
-                id: Ident::new(up_param(i).into(), DUMMY_SP, Default::default()),
-                type_ann: None,
-            })
-        })
-        .collect();
-    let factory = Expr::Fn(FnExpr {
-        ident: None,
-        function: Box::new(Function {
-            params: factory_params
-                .into_iter()
-                .map(|pat| Param { span: DUMMY_SP, decorators: vec![], pat })
-                .collect(),
-            decorators: vec![],
-            span: DUMMY_SP,
-            ctxt: Default::default(),
-            body: Some(BlockStmt {
-                span: DUMMY_SP,
-                stmts: vec![Stmt::Return(ReturnStmt {
-                    span: DUMMY_SP,
-                    arg: Some(Box::new(inner_expr)),
-                })],
-                ..Default::default()
-            }),
-            is_generator: false,
-            is_async: false,
-            type_params: None,
-            return_type: None,
-        }),
-    });
-
-    let src = print_expr(&factory);
-    // Defensive reparse: a malformed factory would corrupt the program table. The
-    // serializer renders this const PARENTHESIZED (`(<src>)`) into the consts-array
-    // expression position, so validate it in that exact form — an anonymous
-    // `function(...)` at bare statement position is a syntax error, but `(function
-    // (...))` is a valid expression.
-    let check = format!("({src})");
-    if mangler_jsast::lang::Js::reparse(&check, &mangler_jsast::lang::ParseOpts::default()).is_err()
-    {
+    // Dynamic scope cannot be represented by static capture rewrites.
+    if unsupported_scope(params, body).is_some() {
         return None;
     }
-    Some(src)
+    GLOBALS.set(&Globals::new(), || {
+        let mut inner_expr =
+            build_inner_expr(params, body, is_arrow, is_async, is_generator, self_name);
+        let unresolved = Mark::new();
+        inner_expr.visit_mut_with(&mut resolver(unresolved, Mark::new(), false));
+        let unresolved = SyntaxContext::empty().apply_mark(unresolved);
+        let mut reserved = Names::default();
+        inner_expr.visit_with(&mut reserved);
+        let mut parameter_names = Vec::new();
+        for i in 0..upvalues.len() {
+            let mut name = up_param(i);
+            while reserved.0.contains(&name) {
+                name.push('_');
+            }
+            reserved.0.insert(name.clone());
+            parameter_names.push(name);
+        }
+        // Map each celled / plain frame-local NAME to its factory-param ident, and find
+        // the arrow-`this` param (if any).
+        let mut rename: HashMap<String, RewriteTarget> = HashMap::new();
+        let mut this_param: Option<String> = None;
+        for (i, uv) in upvalues.iter().enumerate() {
+            let p = parameter_names[i].clone();
+            if uv.is_this {
+                this_param = Some(p);
+            } else if let Some(n) = &uv.name {
+                rename.insert(
+                    n.clone(),
+                    RewriteTarget {
+                        param: p,
+                        celled: uv.celled,
+                    },
+                );
+            }
+        }
+
+        // Clone + rewrite the inner function/arrow so frame-local refs become the
+        // factory params (`u_i` / `u_i[0]`), `this` becomes the arrow-this param, and
+        // module globals are left untouched. Locals the inner fn itself binds shadow a
+        // same-named upvalue and are NOT rewritten.
+        let mut rw = Rewriter {
+            rename: &rename,
+            this_param: this_param.as_deref(),
+            unresolved,
+        };
+        inner_expr.visit_mut_with(&mut rw);
+
+        // Wrap: `function ($u0,$u1,…){ return <inner>; }`. The factory itself is plain
+        // (sloppy) — the inner fn carries its OWN strictness directive, so it runs in
+        // its correct mode regardless (§5a.2).
+        let factory_params: Vec<Pat> = (0..upvalues.len())
+            .map(|i| {
+                Pat::Ident(BindingIdent {
+                    id: Ident::new(
+                        parameter_names[i].clone().into(),
+                        DUMMY_SP,
+                        Default::default(),
+                    ),
+                    type_ann: None,
+                })
+            })
+            .collect();
+        let factory = Expr::Fn(FnExpr {
+            ident: None,
+            function: Box::new(Function {
+                params: factory_params
+                    .into_iter()
+                    .map(|pat| Param {
+                        span: DUMMY_SP,
+                        decorators: vec![],
+                        pat,
+                    })
+                    .collect(),
+                decorators: vec![],
+                span: DUMMY_SP,
+                ctxt: Default::default(),
+                body: Some(BlockStmt {
+                    span: DUMMY_SP,
+                    stmts: vec![Stmt::Return(ReturnStmt {
+                        span: DUMMY_SP,
+                        arg: Some(Box::new(inner_expr)),
+                    })],
+                    ..Default::default()
+                }),
+                is_generator: false,
+                is_async: false,
+                type_params: None,
+                return_type: None,
+            }),
+        });
+
+        let src = print_expr(&factory);
+        // Defensive reparse: a malformed factory would corrupt the program table. The
+        // serializer renders this const PARENTHESIZED (`(<src>)`) into the consts-array
+        // expression position, so validate it in that exact form — an anonymous
+        // `function(...)` at bare statement position is a syntax error, but `(function
+        // (...))` is a valid expression.
+        let check = format!("({src})");
+        if mangler_jsast::lang::Js::reparse(&check, &mangler_jsast::lang::ParseOpts::default())
+            .is_err()
+        {
+            return None;
+        }
+        Some(src)
+    })
 }
 
 /// Reconstruct the original inner function/arrow as an [`Expr`] from its parts. A
@@ -180,7 +216,11 @@ fn build_inner_expr(
             function: Box::new(Function {
                 params: params
                     .iter()
-                    .map(|pat| Param { span: DUMMY_SP, decorators: vec![], pat: pat.clone() })
+                    .map(|pat| Param {
+                        span: DUMMY_SP,
+                        decorators: vec![],
+                        pat: pat.clone(),
+                    })
                     .collect(),
                 decorators: vec![],
                 span: DUMMY_SP,
@@ -195,20 +235,43 @@ fn build_inner_expr(
     }
 }
 
-/// The names the inner fn binds itself (params + locals + own self-name): these
-/// SHADOW a same-named upvalue and must NOT be rewritten.
-fn local_names(params: &[Pat], body: &BlockStmt, self_name: Option<&str>) -> HashSet<String> {
-    let mut names = HashSet::new();
-    for p in params {
-        mangler_jsast::analysis::binding_names(p, &mut |id| {
-            names.insert(id.sym.to_string());
-        });
+#[derive(Default)]
+struct Names(HashSet<String>);
+impl Visit for Names {
+    fn visit_ident(&mut self, id: &Ident) {
+        self.0.insert(id.sym.to_string());
     }
-    if let Some(n) = self_name {
-        names.insert(n.to_string());
-    }
-    super::stmt::collect_body_local_decls(body, &mut names);
-    names
+}
+
+/// Native escapes and their factories use one scope authority: SWC's resolver.
+/// Parameter defaults, block/catch shadows and nested scopes therefore agree.
+pub(crate) fn free_names(params: &[Pat], body: &BlockStmt, self_name: Option<&str>) -> Vec<String> {
+    GLOBALS.set(&Globals::new(), || {
+        let mut expr = build_inner_expr(params, body, true, false, false, self_name);
+        let mark = Mark::new();
+        expr.visit_mut_with(&mut resolver(mark, Mark::new(), false));
+        struct Free {
+            unresolved: SyntaxContext,
+            names: Vec<String>,
+            seen: HashSet<String>,
+        }
+        impl Visit for Free {
+            fn visit_ident(&mut self, id: &Ident) {
+                let name = id.sym.to_string();
+                if id.ctxt == self.unresolved && self.seen.insert(name.clone()) {
+                    self.names.push(name);
+                }
+            }
+        }
+        let mut free = Free {
+            unresolved: SyntaxContext::empty().apply_mark(mark),
+            names: Vec::new(),
+            seen: HashSet::new(),
+        };
+        expr.visit_with(&mut free);
+        free.names.retain(|name| Some(name.as_str()) != self_name);
+        free.names
+    })
 }
 
 struct RewriteTarget {
@@ -224,13 +287,35 @@ struct RewriteTarget {
 struct Rewriter<'a> {
     rename: &'a HashMap<String, RewriteTarget>,
     this_param: Option<&'a str>,
-    /// Stack of binding-name sets; a name in ANY frame is a local (not rewritten).
-    scopes: Vec<HashSet<String>>,
+    unresolved: SyntaxContext,
 }
 
 impl Rewriter<'_> {
-    fn is_local(&self, name: &str) -> bool {
-        self.scopes.iter().any(|s| s.contains(name))
+    fn is_free(&self, id: &Ident) -> bool {
+        id.ctxt == self.unresolved
+    }
+
+    /// A free call must keep an undefined receiver after becoming a cell member.
+    fn rewrite_callee(&self, callee: &mut Box<Expr>) {
+        if let Expr::Ident(id) = callee.as_ref()
+            && self.is_free(id)
+            && let Some(target) = self.target_expr(id.sym.as_ref(), id.span)
+        {
+            **callee = Expr::Paren(ParenExpr {
+                span: id.span,
+                expr: Box::new(Expr::Seq(SeqExpr {
+                    span: id.span,
+                    exprs: vec![
+                        Box::new(Expr::Lit(Lit::Num(Number {
+                            span: id.span,
+                            value: 0.0,
+                            raw: None,
+                        }))),
+                        Box::new(target),
+                    ],
+                })),
+            });
+        }
     }
 
     /// Rewrite a `for-in`/`for-of` head whose target is a bare upvalue ident
@@ -239,7 +324,7 @@ impl Rewriter<'_> {
     fn cellify_for_head(&mut self, head: &mut ForHead) {
         if let ForHead::Pat(p) = head
             && let Pat::Ident(bi) = &**p
-            && !self.is_local(bi.id.sym.as_ref())
+            && self.is_free(&bi.id)
             && let Some(Expr::Member(m)) = self.target_expr(bi.id.sym.as_ref(), bi.id.span)
         {
             *head = ForHead::Pat(Box::new(Pat::Expr(Box::new(Expr::Member(m)))));
@@ -248,60 +333,53 @@ impl Rewriter<'_> {
         }
     }
 
-    /// `$u_i` (plain) or `$u_i[0]` (cell) for the upvalue `name` stands in for.
+    /// Dereference a live slot accessor, and then the binding cell if boxed.
     fn target_expr(&self, name: &str, span: swc_core::common::Span) -> Option<Expr> {
         let t = self.rename.get(name)?;
-        let base = Expr::Ident(Ident::new(t.param.clone().into(), span, Default::default()));
-        if t.celled {
-            Some(Expr::Member(MemberExpr {
+        let mut expr = Expr::Ident(Ident::new(t.param.clone().into(), span, Default::default()));
+        // Every native upvalue is a live accessor cell over its parent frame slot.
+        // Boxed slots add one further dereference to the shared binding cell.
+        for _ in 0..if t.celled { 2 } else { 1 } {
+            expr = Expr::Member(MemberExpr {
                 span,
-                obj: Box::new(base),
+                obj: Box::new(expr),
                 prop: MemberProp::Computed(ComputedPropName {
                     span,
-                    expr: Box::new(Expr::Lit(Lit::Num(Number { span, value: 0.0, raw: None }))),
+                    expr: Box::new(Expr::Lit(Lit::Num(Number {
+                        span,
+                        value: 0.0,
+                        raw: None,
+                    }))),
                 }),
-            }))
-        } else {
-            Some(base)
+            });
         }
+        Some(expr)
     }
 }
 
 impl VisitMut for Rewriter<'_> {
-    // A nested function/arrow opens its own scope: collect its bound names so a
-    // same-named upvalue is shadowed there. We still descend (free names of the
-    // nested fn that are OUR upvalues must be rewritten too — they are captures of
-    // the same enclosing VM frame).
+    // Regular functions own their receiver; nested arrows inherit the active one.
     fn visit_mut_function(&mut self, f: &mut Function) {
-        let mut names = HashSet::new();
-        for p in &f.params {
-            mangler_jsast::analysis::binding_names(&p.pat, &mut |id| {
-                names.insert(id.sym.to_string());
-            });
-        }
-        if let Some(b) = &f.body {
-            super::stmt::collect_body_local_decls(b, &mut names);
-        }
-        self.scopes.push(names);
+        let previous = self.this_param.take();
         f.visit_mut_children_with(self);
-        self.scopes.pop();
+        self.this_param = previous;
     }
-    fn visit_mut_arrow_expr(&mut self, a: &mut ArrowExpr) {
-        let mut names = HashSet::new();
-        for p in &a.params {
-            mangler_jsast::analysis::binding_names(p, &mut |id| {
-                names.insert(id.sym.to_string());
-            });
+
+    fn visit_mut_call_expr(&mut self, call: &mut CallExpr) {
+        if let Callee::Expr(callee) = &mut call.callee {
+            self.rewrite_callee(callee);
         }
-        if let BlockStmtOrExpr::BlockStmt(b) = &*a.body {
-            super::stmt::collect_body_local_decls(b, &mut names);
-        }
-        self.scopes.push(names);
-        a.visit_mut_children_with(self);
-        self.scopes.pop();
-        // NOTE: a nested arrow's `this` is still the enclosing lexical `this`, so the
-        // arrow-this rewrite below (which fires on the outer `Expr::This`) is correct
-        // — `visit_mut_expr` handles `this` uniformly across nested arrows.
+        call.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_opt_call(&mut self, call: &mut OptCall) {
+        self.rewrite_callee(&mut call.callee);
+        call.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_tagged_tpl(&mut self, tag: &mut TaggedTpl) {
+        self.rewrite_callee(&mut tag.tag);
+        tag.visit_mut_children_with(self);
     }
 
     // Assignment / compound-assignment target `x = v` / `x op= v` → `$u_i[0] op= v`
@@ -311,16 +389,16 @@ impl VisitMut for Rewriter<'_> {
     fn visit_mut_assign_expr(&mut self, n: &mut AssignExpr) {
         if let AssignTarget::Simple(SimpleAssignTarget::Ident(bi)) = &n.left {
             let name = bi.id.sym.as_ref();
-            if !self.is_local(name) {
-                if let Some(rep) = self.target_expr(name, bi.id.span) {
-                    if let Expr::Member(m) = rep {
-                        n.left = AssignTarget::Simple(SimpleAssignTarget::Member(m));
-                    } else if let Expr::Ident(id) = rep {
-                        n.left = AssignTarget::Simple(SimpleAssignTarget::Ident(BindingIdent {
-                            id,
-                            type_ann: None,
-                        }));
-                    }
+            if self.is_free(&bi.id)
+                && let Some(rep) = self.target_expr(name, bi.id.span)
+            {
+                if let Expr::Member(m) = rep {
+                    n.left = AssignTarget::Simple(SimpleAssignTarget::Member(m));
+                } else if let Expr::Ident(id) = rep {
+                    n.left = AssignTarget::Simple(SimpleAssignTarget::Ident(BindingIdent {
+                        id,
+                        type_ann: None,
+                    }));
                 }
             }
         } else {
@@ -333,11 +411,11 @@ impl VisitMut for Rewriter<'_> {
     fn visit_mut_update_expr(&mut self, n: &mut UpdateExpr) {
         if let Expr::Ident(id) = &*n.arg {
             let name = id.sym.as_ref();
-            if !self.is_local(name) {
-                if let Some(rep) = self.target_expr(name, id.span) {
-                    *n.arg = rep;
-                    return;
-                }
+            if self.is_free(id)
+                && let Some(rep) = self.target_expr(name, id.span)
+            {
+                *n.arg = rep;
+                return;
             }
         }
         n.arg.visit_mut_with(self);
@@ -359,11 +437,11 @@ impl VisitMut for Rewriter<'_> {
         match e {
             Expr::Ident(id) => {
                 let name = id.sym.as_ref();
-                if !self.is_local(name) {
-                    if let Some(rep) = self.target_expr(name, id.span) {
-                        *e = rep;
-                        return;
-                    }
+                if self.is_free(id)
+                    && let Some(rep) = self.target_expr(name, id.span)
+                {
+                    *e = rep;
+                    return;
                 }
                 // global / local / non-upvalue → untouched
             }
@@ -396,14 +474,14 @@ impl VisitMut for Rewriter<'_> {
     fn visit_mut_prop(&mut self, p: &mut Prop) {
         if let Prop::Shorthand(id) = p {
             let name = id.sym.as_ref();
-            if !self.is_local(name) {
-                if let Some(rep) = self.target_expr(name, id.span) {
-                    *p = Prop::KeyValue(KeyValueProp {
-                        key: PropName::Ident(IdentName::new(id.sym.clone(), id.span)),
-                        value: Box::new(rep),
-                    });
-                    return;
-                }
+            if self.is_free(id)
+                && let Some(rep) = self.target_expr(name, id.span)
+            {
+                *p = Prop::KeyValue(KeyValueProp {
+                    key: PropName::Ident(IdentName::new(id.sym.clone(), id.span)),
+                    value: Box::new(rep),
+                });
+                return;
             }
         }
         p.visit_mut_children_with(self);
@@ -413,8 +491,8 @@ impl VisitMut for Rewriter<'_> {
 /// Print an expression to minified JS source (as `(<expr>)`-ready text). Used for
 /// the factory const; deterministic for a given AST.
 fn print_expr(e: &Expr) -> String {
-    use swc_core::common::sync::Lrc;
     use swc_core::common::SourceMap;
+    use swc_core::common::sync::Lrc;
     let cm: Lrc<SourceMap> = Default::default();
     let mut buf = Vec::new();
     {
@@ -427,11 +505,16 @@ fn print_expr(e: &Expr) -> String {
         };
         let program = Program::Script(Script {
             span: DUMMY_SP,
-            body: vec![Stmt::Expr(ExprStmt { span: DUMMY_SP, expr: Box::new(e.clone()) })],
+            body: vec![Stmt::Expr(ExprStmt {
+                span: DUMMY_SP,
+                expr: Box::new(e.clone()),
+            })],
             shebang: None,
         });
         use swc_core::ecma::codegen::Node;
-        program.emit_with(&mut emitter).expect("codegen of factory expr");
+        program
+            .emit_with(&mut emitter)
+            .expect("codegen of factory expr");
     }
     let mut s = String::from_utf8(buf).expect("utf8 codegen");
     // Strip a trailing `;` (the ExprStmt terminator) so the source is the bare

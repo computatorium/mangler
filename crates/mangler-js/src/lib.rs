@@ -16,7 +16,7 @@
 //!       → schedule_nodes  (topological sort over declared reads/writes)
 //!       → run loop  (Rng::for_pass(eff_seed, id); bus.enter_pass; pass.run)
 //!       → codegen (Js::print_optimized, reading MangleControl)
-//!       → finalizers (anti-tamper wrap; --verify reparse + prefix check)
+//!       → finalizers (self-coupled key patch; anti-tamper wrap; exact --verify reparse)
 //! ```
 //!
 //! The legacy PreResolver/PostResolver phase split is **not** hardcoded: the

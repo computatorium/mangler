@@ -5,10 +5,8 @@
 //! Every `emit_*` here takes `&mut Cx` and shares the frame model and the other
 //! construct-family emitters (`stmt`, `destructure`) via `use super::*`.
 
-use swc_core::ecma::ast::*;
-
 use super::*;
-use crate::isa::{bin_op_code, un_op_code, Instr};
+use crate::isa::{Instr, bin_op_code, un_op_code};
 
 pub(crate) fn emit_expr(cx: &mut Cx<'_>, expr: &Expr) {
     if cx.bailed() {
@@ -250,10 +248,7 @@ pub(crate) fn emit_expr(cx: &mut Cx<'_>, expr: &Expr) {
             }
         }
         Expr::Object(o) => {
-            let has_spread = o
-                .props
-                .iter()
-                .any(|p| matches!(p, PropOrSpread::Spread(_)));
+            let has_spread = o.props.iter().any(|p| matches!(p, PropOrSpread::Spread(_)));
             if has_spread {
                 emit_object_spread(cx, o);
             } else {
@@ -669,7 +664,10 @@ pub(crate) fn emit_member_key(cx: &mut Cx<'_>, prop: &MemberProp) {
             let ci = cx.const_str(name.sym.to_string());
             cx.emit(Instr::PushConst(ci));
         }
-        MemberProp::Computed(c) => emit_expr(cx, &c.expr),
+        MemberProp::Computed(c) => {
+            emit_expr(cx, &c.expr);
+            cx.emit(Instr::Un(crate::isa::UN_TO_PROPERTY_KEY));
+        }
         MemberProp::PrivateName(_) => cx.bail(),
     }
 }
@@ -712,7 +710,10 @@ pub(crate) fn emit_prop_key(cx: &mut Cx<'_>, key: &PropName) {
                 cx.bail_with("numeric_prop_key");
             }
         }
-        PropName::Computed(c) => emit_expr(cx, &c.expr),
+        PropName::Computed(c) => {
+            emit_expr(cx, &c.expr);
+            cx.emit(Instr::Un(crate::isa::UN_TO_PROPERTY_KEY));
+        }
         PropName::BigInt(_) => cx.bail(),
     }
 }

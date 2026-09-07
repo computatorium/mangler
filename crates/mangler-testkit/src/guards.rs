@@ -28,7 +28,10 @@ where
     F: FnMut(&str) -> String,
 {
     let out = transform(src);
-    assert!(!out.is_empty(), "{tag}: transformed output must be non-empty");
+    assert!(
+        !out.is_empty(),
+        "{tag}: transformed output must be non-empty"
+    );
     let ratio = out.len() as f64 / src.len().max(1) as f64;
     assert!(
         ratio < band,
@@ -67,7 +70,10 @@ where
     F: FnMut(&str) -> String,
 {
     let (out, elapsed) = time_transform(src, transform);
-    assert!(!out.is_empty(), "{tag}: transformed output must be non-empty");
+    assert!(
+        !out.is_empty(),
+        "{tag}: transformed output must be non-empty"
+    );
     let ratio = out.len() as f64 / src.len().max(1) as f64;
     assert!(
         ratio < band,
@@ -107,13 +113,9 @@ mod tests {
 
     #[test]
     fn timing_guard_passes_for_fast_identity() {
-        let out = assert_size_and_timing(
-            "hello world",
-            "fast",
-            2.0,
-            Duration::from_secs(5),
-            |s| s.to_string(),
-        );
+        let out = assert_size_and_timing("hello world", "fast", 2.0, Duration::from_secs(5), |s| {
+            s.to_string()
+        });
         assert_eq!(out, "hello world");
     }
 

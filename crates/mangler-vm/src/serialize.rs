@@ -14,9 +14,10 @@
 //! interpreter `pc` indexes the flat array directly). The `PushHandler` `u32::MAX`
 //! "absent" sentinel passes through verbatim (the handler maps `>2e9` back to -1).
 //!
-//! The XOR `code_key` is applied by [`code_array_js`]: every code word is a
-//! non-negative `< 2^32` integer, so `^ key` is its own exact inverse — the
-//! interpreter de-XORs each fetched word with the same key.
+//! [`code_array_js`] packs unsigned words into five-bit variable-length groups.
+//! Each group carries a continuation bit and is XOR-masked with the seed's low
+//! six bits before rendering as printable ASCII. [`code_decode_js`] expands the
+//! payload once into the same shared word array used by the interpreter.
 
 use crate::chunk::{Compiled, Const};
 use crate::isa::{Instr, Layout};
@@ -61,7 +62,7 @@ pub fn serialize(
     offsets.push(acc);
 
     // Pass 2: opcode word (permuted discriminant) + operand words per layout.
-    let mut out: Vec<f64> = Vec::new();
+    let mut out: Vec<f64> = Vec::with_capacity(acc as usize);
     for i in &c.code {
         out.push(op(perm, i.discriminant()));
         match i {
@@ -73,7 +74,10 @@ pub fn serialize(
             | Instr::StoreLocal(slot)
             | Instr::MakeCell(slot)
             | Instr::LoadCell(slot)
-            | Instr::StoreCell(slot) => out.push(*slot as f64),
+            | Instr::StoreCell(slot)
+            | Instr::BeginLexical(slot)
+            | Instr::InitLocal(slot)
+            | Instr::CloneLexical(slot) => out.push(*slot as f64),
             Instr::Bin(o) => out.push(bin_perm[*o as usize] as f64),
             Instr::Un(o) => out.push(un_perm[*o as usize] as f64),
             Instr::MakeArray(n) | Instr::MakeObject(n) => out.push(*n as f64),
@@ -130,27 +134,57 @@ pub fn serialize(
                 }
             }
             // Nullary-layout ops have no operand words.
-            _ => debug_assert_eq!(i.layout(), Layout::Nullary, "unhandled operand layout for {i:?}"),
+            _ => debug_assert_eq!(
+                i.layout(),
+                Layout::Nullary,
+                "unhandled operand layout for {i:?}"
+            ),
         }
     }
 
     (out, c.consts.clone())
 }
 
-/// Render a flat code vector as a JS array literal, XOR-encrypting each word with
-/// the per-file `key`. Each word is a non-negative integer `< 2^32`, so the XOR is
-/// its own exact inverse: the interpreter de-XORs each fetched word with the SAME
-/// `key` before use.
+/// Render compact bytecode as a mutable, one-element array containing its packed
+/// string. Five payload bits plus one continuation bit encode each unsigned word
+/// in one to seven ASCII characters; a seed-derived XOR masks each group. This
+/// is obfuscation, not cryptographic encryption. Decoding replaces the array's
+/// contents in place, so every thunk and recursive closure shares the cache.
 pub fn code_array_js(code: &[f64], key: u32) -> String {
-    let mut s = String::from("[");
-    for (i, n) in code.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
+    let mut s = String::from("[\"");
+    for &n in code {
+        let mut word = n as u32;
+        loop {
+            let mut group = word & 31;
+            word >>= 5;
+            if word != 0 {
+                group |= 32;
+            }
+            // The alphabet is ASCII 63..126, containing neither quote nor `<`.
+            // Only backslash needs escaping in the JavaScript string literal.
+            let ch = (63 + (group ^ (key & 63))) as u8 as char;
+            if ch == '\\' {
+                s.push('\\');
+            }
+            s.push(ch);
+            if word == 0 {
+                break;
+            }
         }
-        s.push_str(&((*n as u32) ^ key).to_string());
     }
-    s.push(']');
+    s.push_str("\"]");
     s
+}
+
+/// The sole runtime decoder for [`code_array_js`]. Uses the interpreter's existing
+/// scratch locals, and keeps the decoded unsigned words in `code` for later calls.
+pub(crate) fn code_decode_js(key: u32) -> String {
+    let mask = key & 63;
+    format!(
+        "if(!code.d){{t=code[0];code.length=0;n=0;k=0;\
+for(i=0;i<t.length;i++){{v=(t.charCodeAt(i)-63)^{mask};n|=(v&31)<<k;\
+if(v&32)k+=5;else{{code.push(n>>>0);n=0;k=0;}}}}code.d=1;}}C=code;"
+    )
 }
 
 /// Render one string as an array of XOR'd UTF-16 code units (the encrypted-Str form
@@ -174,7 +208,11 @@ fn num_js(n: f64) -> String {
     if n.is_nan() {
         "NaN".to_string()
     } else if n.is_infinite() {
-        if n > 0.0 { "Infinity".to_string() } else { "-Infinity".to_string() }
+        if n > 0.0 {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        }
     } else if n == 0.0 && n.is_sign_negative() {
         "-0".to_string()
     } else {
@@ -270,7 +308,14 @@ mod tests {
     }
 
     fn compiled(code: Vec<Instr>, consts: Vec<Const>) -> Compiled {
-        Compiled { code, consts, captures: vec![], slots: 4, pcount: 2, children: vec![] }
+        Compiled {
+            code,
+            consts,
+            captures: vec![],
+            slots: 4,
+            pcount: 2,
+            children: vec![],
+        }
     }
 
     /// THE serialized-form round-trip: serialize a program containing EVERY opcode,
@@ -334,8 +379,28 @@ mod tests {
             Instr::MakeCell(0),
             Instr::LoadCell(0),
             Instr::StoreCell(0),
-            Instr::MakeClosure { child: 0, is_arrow: true, cap_start: 1, pcount: 0, up_slots: vec![0, 1, 2] },
-            Instr::MakeNativeClosure { const_idx: 0, is_arrow: true, up_slots: vec![0, 1] },
+            Instr::MakeClosure {
+                child: 0,
+                is_arrow: true,
+                cap_start: 1,
+                pcount: 0,
+                up_slots: vec![0, 1, 2],
+            },
+            Instr::MakeNativeClosure {
+                const_idx: 0,
+                is_arrow: true,
+                up_slots: vec![0, 1],
+            },
+            Instr::CopyProps,
+            Instr::BeginLexical(0),
+            Instr::InitLocal(0),
+            Instr::CloneLexical(0),
+            Instr::LoadArguments,
+            Instr::CallArray,
+            Instr::RestProps,
+            Instr::RequireObject,
+            Instr::BeginFinally,
+            Instr::IterElide,
         ];
         assert_eq!(code.len(), N_OPCODES);
         let src_discs: Vec<usize> = code.iter().map(|i| i.discriminant()).collect();
@@ -367,13 +432,22 @@ mod tests {
             pc += 1 + n_operands;
         }
         assert_eq!(pc, words.len(), "decode consumed exactly the whole stream");
-        assert_eq!(decoded_discs, src_discs, "decoded discriminants match source");
-        assert_eq!(decoded_sizes, src_sizes, "decoded sizes match Instr::size()");
+        assert_eq!(
+            decoded_discs, src_discs,
+            "decoded discriminants match source"
+        );
+        assert_eq!(
+            decoded_sizes, src_sizes,
+            "decoded sizes match Instr::size()"
+        );
     }
 
     #[test]
     fn nullary_and_unary_encode_with_discriminant() {
-        let c = compiled(vec![Instr::PushUndef, Instr::LoadLocal(3), Instr::Ret], vec![]);
+        let c = compiled(
+            vec![Instr::PushUndef, Instr::LoadLocal(3), Instr::Ret],
+            vec![],
+        );
         let (code, _) = serialize(&c, &id_perm(), &id_bin(), &id_un());
         // PushUndef(disc 1), LoadLocal(disc 3) slot 3, Ret(disc 18).
         assert_eq!(code, vec![1.0, 3.0, 3.0, 18.0]);
@@ -398,8 +472,10 @@ mod tests {
         let un_perm: Vec<usize> = (0..N_UN_OPS).rev().collect();
         let c = compiled(vec![Instr::Bin(0), Instr::Un(0)], vec![]);
         let (code, _) = serialize(&c, &id_perm(), &bin_perm, &un_perm);
-        // Bin(disc 5) sub-code bin_perm[0]=19; Un(disc 6) sub-code un_perm[0]=6.
-        assert_eq!(code, vec![5.0, 19.0, 6.0, 6.0]);
+        assert_eq!(
+            code,
+            vec![5.0, (N_BIN_OPS - 1) as f64, 6.0, (N_UN_OPS - 1) as f64]
+        );
     }
 
     #[test]
@@ -407,10 +483,7 @@ mod tests {
         // PushHandler @off0 (size3), PopHandler @off3. catch -> instr1 offset 3,
         // fin -> u32::MAX sentinel passes through.
         let c = compiled(
-            vec![
-                Instr::PushHandler(1, u32::MAX),
-                Instr::PopHandler,
-            ],
+            vec![Instr::PushHandler(1, u32::MAX), Instr::PopHandler],
             vec![],
         );
         let (code, _) = serialize(&c, &id_perm(), &id_bin(), &id_un());
@@ -474,17 +547,48 @@ mod tests {
     }
 
     #[test]
-    fn code_array_xor_is_involution() {
-        let code = vec![0.0, 5.0, 19.0, 255.0];
-        let key = 0x9E37_79B9;
-        let js = code_array_js(&code, key);
-        // De-XOR each rendered value with the same key recovers the cleartext.
-        let nums: Vec<u32> = js
-            .trim_matches(|c| c == '[' || c == ']')
-            .split(',')
-            .map(|t| t.parse::<u32>().unwrap() ^ key)
-            .collect();
-        assert_eq!(nums, vec![0u32, 5, 19, 255]);
+    fn packed_code_round_trips_all_masks_and_word_boundaries() {
+        use mangler_testkit::assert_behaviorally_equal;
+        let code = vec![
+            0.0,
+            5.0,
+            31.0,
+            32.0,
+            255.0,
+            1023.0,
+            1024.0,
+            2147483646.0,
+            2147483647.0,
+            2147483648.0,
+            4294967295.0,
+        ];
+        for key in 0..64 {
+            let js = code_array_js(&code, key);
+            let decode = code_decode_js(key);
+            let source = format!(
+                "var code={js},i,t,n,k,v,C;{decode}\
+var first=JSON.stringify(code);{decode}globalThis.__out=first+'|'+JSON.stringify(code);"
+            );
+            let expected = "[0,5,31,32,255,1023,1024,2147483646,2147483647,2147483648,4294967295]";
+            assert_behaviorally_equal(
+                &format!("globalThis.__out='{expected}|{expected}';"),
+                &source,
+            );
+        }
+    }
+
+    #[test]
+    fn packed_code_empty_and_large_payloads() {
+        use mangler_testkit::assert_behaviorally_equal;
+        for code in [vec![], vec![7.0; 100_000]] {
+            let js = code_array_js(&code, 42);
+            let source = format!(
+                "var code={js},i,t,n,k,v,C;{}globalThis.__out=code.length;",
+                code_decode_js(42)
+            );
+            assert_behaviorally_equal(&format!("globalThis.__out={};", code.len()), &source);
+            assert_eq!(js, code_array_js(&code, 42));
+        }
     }
 
     #[test]
@@ -508,7 +612,10 @@ mod tests {
 
     #[test]
     fn program_table_pairs() {
-        let progs = vec![("[1,2]".to_string(), "[3]".to_string()), ("[4]".to_string(), "[]".to_string())];
+        let progs = vec![
+            ("[1,2]".to_string(), "[3]".to_string()),
+            ("[4]".to_string(), "[]".to_string()),
+        ];
         assert_eq!(program_table_js(&progs), "[[[1,2],[3]],[[4],[]]]");
     }
 }

@@ -49,14 +49,14 @@ use mangler_core::{Notes, Result, Rng};
 use mangler_jsast::lang::{Js, ParseOpts};
 use mangler_passgraph::{ArtifactBus, Pass, Resource};
 use mangler_vm::{
-    classify_body, compile_body_with_opts, Chunk, CompileOptions, Eligibility, TableBuilder,
-    VmNames,
+    Chunk, CompileOptions, Eligibility, TableBuilder, VmNames, classify_body,
+    compile_body_with_opts,
 };
 use swc_core::common::DUMMY_SP;
 use swc_core::ecma::ast::*;
 use swc_core::ecma::visit::{VisitMut, VisitMutWith};
 
-mod desugar;
+mod coverage;
 mod glob;
 mod partition;
 
@@ -64,6 +64,13 @@ mod partition;
 /// replace them with thunks that re-enter a spliced interpreter over a shared program
 /// table.
 pub struct VirtualizePass;
+
+pub(crate) fn source_functions(program: &Program) -> Vec<(u32, String)> {
+    coverage::candidates(program)
+        .into_iter()
+        .map(|c| (c.span, c.name))
+        .collect()
+}
 
 impl Pass<Js, FileConfig> for VirtualizePass {
     fn id(&self) -> &'static str {
@@ -140,7 +147,7 @@ impl Pass<Js, FileConfig> for VirtualizePass {
         // level is strict (ES Module / `"use strict"` Script). Named mode: scan for a
         // strict candidate. Either way we only draw the strict names when needed.
         let need_strict_names = if whole_program {
-            program_top_is_strict(ast.program())
+            program_top_is_strict(ast.program()) || vcfg.desugar_class
         } else {
             program_has_strict_candidate(ast.program_mut(), &target, exclude.as_deref())
         };
@@ -169,6 +176,38 @@ impl Pass<Js, FileConfig> for VirtualizePass {
             _ => Vec::new(),
         };
 
+        let original_candidates: Vec<_> = coverage::candidates(ast.program())
+            .into_iter()
+            .filter(|c| {
+                cfg.source_functions()
+                    .is_none_or(|source| source.contains(&(c.span, c.name.clone())))
+            })
+            .collect();
+        let mut outcomes = std::collections::HashMap::new();
+        if let Some(name) = runtime_intrinsic_shadow(ast.program()) {
+            for c in &original_candidates {
+                outcomes.insert(c.span, Some(format!("runtime_intrinsic_shadow: {name}")));
+            }
+            coverage::report(&original_candidates, &outcomes, vcfg, notes)?;
+            return Ok(());
+        }
+        let mut class_used = false;
+        if whole_program && vcfg.desugar_class {
+            let mut v = Virtualizer {
+                target: "*",
+                exclude: exclude.as_deref(),
+                names: &names,
+                tb: &mut tb,
+                used: false,
+                strict_stack: vec![program_top_is_strict(ast.program())],
+                excluded: Vec::new(),
+                outcomes: &mut outcomes,
+                class_methods_only: true,
+                source_functions: cfg.source_functions(),
+            };
+            ast.program_mut().visit_mut_with(&mut v);
+            class_used = v.used;
+        }
         let used = if whole_program {
             // Phase 1: all-or-nothing top-level wrapper. Returns true iff the whole
             // top level was virtualized (else the program is left native).
@@ -178,8 +217,6 @@ impl Pass<Js, FileConfig> for VirtualizePass {
                 &mut tb,
                 exclude.as_deref(),
                 &protect_native,
-                vcfg.desugar_class,
-                vcfg.desugar_regex,
             )
         } else {
             let mut v = Virtualizer {
@@ -190,6 +227,9 @@ impl Pass<Js, FileConfig> for VirtualizePass {
                 used: false,
                 strict_stack: vec![program_top_is_strict(ast.program())],
                 excluded: Vec::new(),
+                outcomes: &mut outcomes,
+                class_methods_only: false,
+                source_functions: cfg.source_functions(),
             };
             ast.program_mut().visit_mut_with(&mut v);
             // §10: surface which functions were kept native so the user can confirm a
@@ -208,7 +248,36 @@ impl Pass<Js, FileConfig> for VirtualizePass {
                 ));
             }
             v.used
-        };
+        } || class_used;
+
+        if whole_program {
+            let native = coverage::candidates(ast.program());
+            for c in &original_candidates {
+                if outcomes.contains_key(&c.span) {
+                    continue;
+                }
+                let reason = if exclude.as_deref().is_some_and(|g| {
+                    original_candidates
+                        .iter()
+                        .any(|p| p.span <= c.span && c.span < p.end && glob::matches(g, &p.name))
+                }) {
+                    Some("excluded".to_string())
+                } else if let Some(c) = native.iter().find(|n| n.span == c.span && n.name == c.name)
+                {
+                    Some(c.reason.unwrap_or("native_partition").to_string())
+                } else if used {
+                    original_candidates
+                        .iter()
+                        .filter(|p| p.span <= c.span && c.span < p.end)
+                        .find_map(|p| p.reason.filter(|r| *r != "arrow"))
+                        .map(str::to_string)
+                } else {
+                    Some("native_partition".to_string())
+                };
+                outcomes.insert(c.span, reason);
+            }
+        }
+        coverage::report(&original_candidates, &outcomes, vcfg, notes)?;
 
         // §10: in whole-program mode, report that everything was virtualized and which
         // exclude glob (if any) protected hot paths kept native inside the VM frames.
@@ -236,7 +305,12 @@ impl Pass<Js, FileConfig> for VirtualizePass {
         splice_prologue(ast.program_mut(), vt.prologue);
 
         bus.put(VmTableArtifact {
-            interp_name: names.lean_interp,
+            interpreter_names: vec![
+                names.lean_interp,
+                names.eh_interp,
+                names.lean_interp_strict,
+                names.eh_interp_strict,
+            ],
             program_table_name: names.table,
         })
         .map_err(|e| mangler_core::Error::transform(self.id(), e.to_string()))?;
@@ -266,6 +340,9 @@ struct Virtualizer<'a> {
     /// Names of functions kept native because they matched `exclude` (for the §10
     /// `Notes` report). First-seen order, de-duplicated.
     excluded: Vec<String>,
+    outcomes: &'a mut std::collections::HashMap<u32, Option<String>>,
+    class_methods_only: bool,
+    source_functions: Option<&'a std::collections::HashSet<(u32, String)>>,
 }
 
 impl Virtualizer<'_> {
@@ -273,21 +350,46 @@ impl Virtualizer<'_> {
     /// its body was replaced with a thunk. **Bail-to-safe**: any reason to skip
     /// returns false and leaves the function untouched (never a miscompile).
     fn try_virtualize(&mut self, name: &str, function: &mut Function) -> bool {
-        if !glob::matches(self.target, name) {
+        if self.class_methods_only
+            || !self.is_source(name, function)
+            || !glob::matches(self.target, name)
+        {
             return false;
         }
+        self.outcomes
+            .insert(function.span.lo.0, Some("unsupported".to_string()));
         // Exclude check: if the function's inferred name matches the exclude glob,
         // keep it native. Bail-to-safe: exclude never miscompiles.
-        if let Some(excl) = self.exclude {
-            if glob::matches(excl, name) {
-                if !self.excluded.iter().any(|n| n == name) {
-                    self.excluded.push(name.to_string());
-                }
-                return false;
+        if let Some(excl) = self.exclude
+            && glob::matches(excl, name)
+        {
+            self.outcomes
+                .insert(function.span.lo.0, Some("excluded".to_string()));
+            if !self.excluded.iter().any(|n| n == name) {
+                self.excluded.push(name.to_string());
             }
+            return false;
         }
         // Generators/async are not modeled by the flat-slot VM.
         if function.is_generator || function.is_async {
+            self.outcomes.insert(
+                function.span.lo.0,
+                Some(
+                    if function.is_async {
+                        "async"
+                    } else {
+                        "generator"
+                    }
+                    .to_string(),
+                ),
+            );
+            return false;
+        }
+        if parameter_dynamic_scope(function) {
+            self.outcomes.insert(
+                function.span.lo.0,
+                Some("parameter_direct_eval".to_string()),
+            );
             return false;
         }
         let body = match &function.body {
@@ -296,7 +398,11 @@ impl Virtualizer<'_> {
         };
         // Structural eligibility (with/eval/await/yield + sloppy arguments-alias bail
         // + §5a `arguments.callee/.caller` bail).
-        if let Eligibility::Skip(_) = classify_body(&function.params, body) {
+        if let Eligibility::Skip(reason) = classify_body(&function.params, body)
+            && !matches!(reason, "arguments_alias" | "arguments_callee")
+        {
+            self.outcomes
+                .insert(function.span.lo.0, Some(format!("{reason:?}")));
             return false;
         }
         // §5a: strictness is a top-down inherited attribute. This function is strict
@@ -315,13 +421,35 @@ impl Virtualizer<'_> {
         // target mode we do NOT divert ineligible nested fns (an ineligible nested fn
         // still bails the parent, preserving pre-Phase-3 behavior); whole-program mode
         // (the coverage driver) enables that divert separately.
+        let native_parameters = needs_native_parameters(function);
         let opts = CompileOptions {
             exclude: self.exclude,
             divert_ineligible: false,
+            live_captures: true,
+            native_parameters,
         };
-        let compiled = match compile_body_with_opts(&function.params, body, opts) {
+        // Native JavaScript owns parameter initialization. Body parameter references
+        // use the same lazy binding descriptors as outer variables, preserving defaults,
+        // destructuring, rest, aliases captured by defaults, and Function.length.
+        if native_parameters && parameter_body_collision(function) {
+            self.outcomes.insert(
+                function.span.lo.0,
+                Some("parameter_body_redeclaration".to_string()),
+            );
+            return false;
+        }
+        let params = if native_parameters {
+            &[][..]
+        } else {
+            &function.params[..]
+        };
+        let compiled = match compile_body_with_opts(params, body, opts) {
             Ok(c) => c,
-            Err(_) => return false,
+            Err(reason) => {
+                self.outcomes
+                    .insert(function.span.lo.0, Some(reason.to_string()));
+                return false;
+            }
         };
 
         // Register the chunk tree (children flattened, MakeClosure child-indices
@@ -335,10 +463,32 @@ impl Virtualizer<'_> {
         // would call the un-thunked function while its table entry sits unused, which
         // is fine (extra dead table entry, never a miscompile).
         let interp = self.names.interp_for(chunk.needs_eh, chunk.is_strict);
-        let stmts = match thunk_stmts(interp, &self.names.table, &chunk, is_strict) {
+        let stmts = match thunk_stmts(
+            interp,
+            &self.names.table,
+            &chunk,
+            has_use_strict_directive(body),
+        ) {
             Some(s) => s,
             None => return false,
         };
+        // A successfully compiled body also protects nested child chunks, except
+        // explicit native escapes. Record original spans before installing the thunk.
+        let descendants = coverage::function_candidates(function);
+        for candidate in &descendants {
+            let reason = self
+                .exclude
+                .filter(|g| {
+                    descendants.iter().any(|parent| {
+                        parent.span <= candidate.span
+                            && candidate.span < parent.end
+                            && glob::matches(g, &parent.name)
+                    })
+                })
+                .map(|_| "excluded".to_string());
+            self.outcomes.insert(candidate.span, reason);
+        }
+        self.outcomes.insert(function.span.lo.0, None);
         function.body = Some(BlockStmt {
             span: DUMMY_SP,
             stmts,
@@ -346,6 +496,11 @@ impl Virtualizer<'_> {
         });
         self.used = true;
         true
+    }
+
+    fn is_source(&self, name: &str, function: &Function) -> bool {
+        self.source_functions
+            .is_none_or(|source| source.contains(&(function.span.lo.0, name.to_string())))
     }
 
     /// The strictness inherited by the scope currently being walked (the top of the
@@ -362,9 +517,32 @@ impl Virtualizer<'_> {
 }
 
 impl VisitMut for Virtualizer<'_> {
+    fn visit_mut_class(&mut self, class: &mut swc_core::ecma::ast::Class) {
+        self.strict_stack.push(true);
+        class.visit_mut_children_with(self);
+        self.strict_stack.pop();
+    }
+
+    fn visit_mut_class_method(&mut self, method: &mut ClassMethod) {
+        self.strict_stack.push(true);
+        let only = self.class_methods_only;
+        self.class_methods_only = false;
+        let replaced = method.kind == MethodKind::Method
+            && static_prop_key_name(&method.key)
+                .is_some_and(|name| self.try_virtualize(&name, &mut method.function));
+        self.class_methods_only = only;
+        if !replaced {
+            method.visit_mut_children_with(self);
+        }
+        self.strict_stack.pop();
+    }
+
     fn visit_mut_fn_decl(&mut self, n: &mut FnDecl) {
         // Own ident is the canonical name for a function declaration.
         let name = n.ident.sym.to_string();
+        if !self.is_source(&name, &n.function) {
+            return;
+        }
         if self.try_virtualize(&name, &mut n.function) {
             return; // replaced — don't recurse into the (now-thunk) body
         }
@@ -375,6 +553,9 @@ impl VisitMut for Virtualizer<'_> {
         // Own ident (e.g. `var x = function render(){}`): own ident wins.
         if let Some(id) = n.ident.clone() {
             let name = id.sym.to_string();
+            if !self.is_source(&name, &n.function) {
+                return;
+            }
             if self.try_virtualize(&name, &mut n.function) {
                 return;
             }
@@ -393,15 +574,18 @@ impl VisitMut for Virtualizer<'_> {
     fn visit_mut_var_declarator(&mut self, n: &mut VarDeclarator) {
         if let Pat::Ident(binding) = &n.name {
             let binding_name = binding.id.sym.to_string();
-            if let Some(Expr::Fn(fn_expr)) = n.init.as_deref_mut() {
-                if fn_expr.ident.is_none() {
-                    // Anonymous function expression: try to virtualize under the
-                    // binding name. On success, stop; on skip, fall through to
-                    // children (the fn_expr visitor will re-encounter it but find
-                    // no own ident and do nothing).
-                    if self.try_virtualize(&binding_name, &mut fn_expr.function) {
-                        return;
-                    }
+            if let Some(Expr::Fn(fn_expr)) = n.init.as_deref_mut()
+                && fn_expr.ident.is_none()
+            {
+                if !self.is_source(&binding_name, &fn_expr.function) {
+                    return;
+                }
+                // Anonymous function expression: try to virtualize under the
+                // binding name. On success, stop; on skip, fall through to
+                // children (the fn_expr visitor will re-encounter it but find
+                // no own ident and do nothing).
+                if self.try_virtualize(&binding_name, &mut fn_expr.function) {
+                    return;
                 }
             }
         }
@@ -413,16 +597,13 @@ impl VisitMut for Virtualizer<'_> {
     /// for the same reason as above (thunk uses `arguments`).
     fn visit_mut_assign_expr(&mut self, n: &mut AssignExpr) {
         // Only simple `=` assignment, not compound (`+=` etc.).
-        if n.op == AssignOp::Assign {
-            if let Some(member_name) = last_member_key(&n.left) {
-                if let Expr::Fn(fn_expr) = n.right.as_mut() {
-                    if fn_expr.ident.is_none() {
-                        if self.try_virtualize(&member_name, &mut fn_expr.function) {
-                            return;
-                        }
-                    }
-                }
-            }
+        if n.op == AssignOp::Assign
+            && let Some(member_name) = last_member_key(&n.left)
+            && let Expr::Fn(fn_expr) = n.right.as_mut()
+            && fn_expr.ident.is_none()
+            && self.try_virtualize(&member_name, &mut fn_expr.function)
+        {
+            return;
         }
         n.visit_mut_children_with(self);
     }
@@ -430,24 +611,22 @@ impl VisitMut for Virtualizer<'_> {
     /// `{ render: function(){} }` — key-value property binding-name inference
     /// (§4.3 form 4a). Arrow values are skipped (thunk uses `arguments`).
     fn visit_mut_key_value_prop(&mut self, n: &mut KeyValueProp) {
-        if let Some(key_name) = static_prop_key_name(&n.key) {
-            if let Expr::Fn(fn_expr) = n.value.as_mut() {
-                if fn_expr.ident.is_none() {
-                    if self.try_virtualize(&key_name, &mut fn_expr.function) {
-                        return;
-                    }
-                }
-            }
+        if let Some(key_name) = static_prop_key_name(&n.key)
+            && let Expr::Fn(fn_expr) = n.value.as_mut()
+            && fn_expr.ident.is_none()
+            && self.try_virtualize(&key_name, &mut fn_expr.function)
+        {
+            return;
         }
         n.visit_mut_children_with(self);
     }
 
     /// `{ render() {} }` — shorthand method property (§4.3 form 4).
     fn visit_mut_method_prop(&mut self, n: &mut MethodProp) {
-        if let Some(key_name) = static_prop_key_name(&n.key) {
-            if self.try_virtualize(&key_name, &mut n.function) {
-                return;
-            }
+        if let Some(key_name) = static_prop_key_name(&n.key)
+            && self.try_virtualize(&key_name, &mut n.function)
+        {
+            return;
         }
         n.visit_mut_children_with(self);
     }
@@ -506,23 +685,157 @@ fn static_prop_key_name(key: &PropName) -> Option<String> {
     }
 }
 
+/// Runtime helpers live at program scope; a source binding with the same name
+/// would redirect their intrinsic operations or trigger a lexical TDZ on startup.
+fn runtime_intrinsic_shadow(program: &Program) -> Option<String> {
+    use swc_core::ecma::visit::{Visit, VisitWith};
+    struct Bindings(Option<String>);
+    impl Bindings {
+        fn check(&mut self, name: &str) {
+            if self.0.is_none()
+                && matches!(
+                    name,
+                    "Object"
+                        | "Array"
+                        | "Reflect"
+                        | "String"
+                        | "Symbol"
+                        | "TypeError"
+                        | "ReferenceError"
+                )
+            {
+                self.0 = Some(name.to_string());
+            }
+        }
+    }
+    impl Visit for Bindings {
+        fn visit_binding_ident(&mut self, binding: &BindingIdent) {
+            self.check(binding.id.sym.as_ref());
+        }
+        fn visit_fn_decl(&mut self, f: &FnDecl) {
+            self.check(f.ident.sym.as_ref());
+        }
+        fn visit_class_decl(&mut self, c: &ClassDecl) {
+            self.check(c.ident.sym.as_ref());
+        }
+        fn visit_function(&mut self, _: &Function) {}
+        fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
+        fn visit_import_specifier(&mut self, s: &ImportSpecifier) {
+            self.check(s.local().sym.as_ref());
+        }
+    }
+    let mut bindings = Bindings(None);
+    program.visit_with(&mut bindings);
+    bindings.0
+}
 
-/// Format + parse the thunk statements that re-enter the interpreter for `chunk`:
-///
-/// ```text
-/// function _v(p0,p1,…){ return <interp>(T[i][0], T[i][1], arguments, [caps], capStart, pcount, this); }
-/// ```
-///
-/// `interp` is the interpreter the chunk must call (EH or lean); `table` is the shared
-/// program-table name. The thunk declares one formal per positional param (`p0..`) so
-/// a `Function.prototype.length` read sees the right arity, but the real arguments are
-/// forwarded via `arguments`. The captured free-globals are spread into an array in
-/// the order the interpreter threads them. Built by formatting the call as source and
-/// reparsing it (the table index and capture names are the only variable parts; there
-/// is no Rust AST mirror to drift from), mirroring the legacy `thunk_body_src`.
+/// Accessors defer resolving each source binding until the corresponding VM read.
+/// Arrow functions preserve lexical `arguments` and avoid introducing a setter
+/// parameter that could shadow the source name.
+fn capture_descriptors(captures: &[String], strict: bool) -> String {
+    let descriptors = captures
+        .iter()
+        .map(|name| {
+            if strict && matches!(name.as_str(), "arguments" | "eval") {
+                return format!("{{get:()=>{name}}}");
+            }
+            let value = if name == "_value" {
+                "_value2"
+            } else {
+                "_value"
+            };
+            format!("{{get:()=>{name},set:({value})=>{name}={value}}}")
+        })
+        .collect::<Vec<_>>();
+    format!("[{}]", descriptors.join(","))
+}
+
+fn parameter_dynamic_scope(function: &Function) -> bool {
+    use swc_core::ecma::visit::{Visit, VisitWith};
+    struct Scan(bool);
+    impl Visit for Scan {
+        fn visit_call_expr(&mut self, call: &CallExpr) {
+            self.0 |= matches!(&call.callee, Callee::Expr(expr) if matches!(&**expr, Expr::Ident(id) if id.sym.as_ref() == "eval"));
+            call.visit_children_with(self);
+        }
+    }
+    let mut scan = Scan(false);
+    function.params.visit_with(&mut scan);
+    scan.0
+}
+
+/// Simple positional parameters need no accessor allocation: rebinding identifiers
+/// is side-effect-free and no default initializer can expose their native scope.
+/// Arguments references retain native binding ownership to preserve mapped aliases.
+fn needs_native_parameters(function: &Function) -> bool {
+    use swc_core::ecma::visit::{Visit, VisitWith};
+    if function
+        .params
+        .iter()
+        .any(|p| !matches!(p.pat, Pat::Ident(_)))
+    {
+        return true;
+    }
+    struct Arguments(bool);
+    impl Visit for Arguments {
+        fn visit_ident(&mut self, id: &Ident) {
+            self.0 |= id.sym.as_ref() == "arguments";
+        }
+    }
+    let mut arguments = Arguments(false);
+    if let Some(body) = &function.body {
+        body.visit_with(&mut arguments);
+    }
+    arguments.0
+}
+
+/// A body var/function redeclaration shares native parameter storage. Until the
+/// compiler can represent that shared declaration directly, keep this shape native.
+fn parameter_body_collision(function: &Function) -> bool {
+    use swc_core::ecma::visit::{Visit, VisitWith};
+    let mut params = std::collections::HashSet::new();
+    for param in &function.params {
+        mangler_jsast::analysis::binding_names(&param.pat, &mut |id| {
+            params.insert(id.sym.to_string());
+        });
+    }
+    struct Scan {
+        params: std::collections::HashSet<String>,
+        collision: bool,
+    }
+    impl Visit for Scan {
+        fn visit_var_decl(&mut self, var: &VarDecl) {
+            if var.kind == VarDeclKind::Var {
+                for decl in &var.decls {
+                    mangler_jsast::analysis::binding_names(&decl.name, &mut |id| {
+                        self.collision |= self.params.contains(id.sym.as_ref());
+                    });
+                }
+            }
+            var.visit_children_with(self);
+        }
+        fn visit_fn_decl(&mut self, f: &FnDecl) {
+            self.collision |= self.params.contains(f.ident.sym.as_ref());
+        }
+        fn visit_function(&mut self, _: &Function) {}
+        fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
+    }
+    let mut scan = Scan {
+        params,
+        collision: false,
+    };
+    if let Some(body) = &function.body {
+        body.visit_with(&mut scan);
+    }
+    scan.collision
+}
+
+/// Parse the VM re-entry body. The original function keeps its parameters and
+/// arity; its body forwards actual arguments, lazy capture descriptors, and `this`.
+/// Only an original own directive is reinserted: inherited strictness remains
+/// inherited, avoiding forbidden directives in non-simple parameter functions.
 fn thunk_stmts(interp: &str, table: &str, chunk: &Chunk, is_strict: bool) -> Option<Vec<Stmt>> {
-    let caps = format!("[{}]", chunk.captures.join(","));
-    let params: Vec<String> = (0..chunk.pcount).map(|i| format!("p{i}")).collect();
+    let caps = capture_descriptors(&chunk.captures, chunk.is_strict);
     // §5a case 1: a STRICT source function's thunk must itself be strict, so a plain
     // call (`f()`) forwards `this === undefined` (strict) rather than the boxed
     // `globalThis` a sloppy thunk would see. The `"use strict"` directive governs the
@@ -530,8 +843,7 @@ fn thunk_stmts(interp: &str, table: &str, chunk: &Chunk, is_strict: bool) -> Opt
     // receiver. Sloppy thunks are byte-for-byte unchanged (empty prefix).
     let directive = if is_strict { "\"use strict\";" } else { "" };
     let src = format!(
-        "function _v({}){{{directive}return {interp}({table}[{idx}][0],{table}[{idx}][1],arguments,{caps},{cap_start},{pcount},this);}}",
-        params.join(","),
+        "function _v(){{{directive}return {interp}({table}[{idx}][0],{table}[{idx}][1],arguments,{caps},{cap_start},{pcount},this,true);}}",
         idx = chunk.index,
         cap_start = chunk.cap_start,
         pcount = chunk.pcount,
@@ -567,18 +879,7 @@ fn parse_fn_body_stmts(src: &str) -> Option<Vec<Stmt>> {
 /// Splice `prologue` statements at the top of `program`'s module/script body, above
 /// every thunk that references them.
 fn splice_prologue(program: &mut Program, prologue: Vec<Stmt>) {
-    match program {
-        Program::Script(s) => {
-            let mut body = prologue;
-            body.append(&mut s.body);
-            s.body = body;
-        }
-        Program::Module(m) => {
-            let mut body: Vec<ModuleItem> = prologue.into_iter().map(ModuleItem::Stmt).collect();
-            body.append(&mut m.body);
-            m.body = body;
-        }
-    }
+    mangler_jsast::directives::insert_program_statements(program, prologue);
 }
 
 // ---------------------------------------------------------------------------
@@ -609,16 +910,14 @@ fn virtualize_whole_program(
     tb: &mut TableBuilder,
     exclude: Option<&str>,
     protect_native: &[String],
-    desugar_class: bool,
-    desugar_regex: bool,
 ) -> bool {
-    // §2.1 / §5: the top-level `this`. Module / strict Script → `undefined`; sloppy
-    // Script → `globalThis`. Each chunk's strictness matches the program top level.
+    // Each chunk's strictness matches the program top level; its re-entry call
+    // forwards native top-level `this`, preserving the script/module distinction.
     let strict = program_top_is_strict(program);
 
     // Lift the top-level body into a uniform `Vec<ModuleItem>` (a Script body has no
     // ModuleDecls, so each statement just wraps).
-    let items: Vec<ModuleItem> = match program {
+    let mut items: Vec<ModuleItem> = match program {
         Program::Script(s) => std::mem::take(&mut s.body)
             .into_iter()
             .map(ModuleItem::Stmt)
@@ -630,14 +929,10 @@ fn virtualize_whole_program(
     // ORIGINAL (un-desugared) program, so a no-op restore is byte-identical to input.
     let pristine = items.clone();
 
-    // §3.2 Phase 4: opportunistic, sound, LOCAL desugaring applied BEFORE classify so a
-    // lowered construct (class→fn, regex→RegExp) can be classified Wrappable and pulled
-    // into the VM. Each lowering is its own opt-in flag (default OFF) and only fires for
-    // constructs proven sound; an unsupported shape is left native (bail-to-safe). If
-    // nothing ends up virtualizing, the pristine (un-desugared) body is restored, so a
-    // desugaring that produced no coverage win leaves the output byte-identical to
-    // input.
-    let items = desugar::desugar_top_level(items, desugar_class, desugar_regex);
+    // Directives govern every native partition and every generated binding getter.
+    // Keep them at program scope rather than compiling them as string expressions.
+    let count = items.iter().take_while(|item| matches!(item, ModuleItem::Stmt(stmt) if mangler_jsast::directives::is_directive(stmt))).count();
+    let directives: Vec<_> = items.drain(..count).collect();
 
     // §5: export-bound names must stay resolvable as module bindings. We treat them as
     // cross-run (the `export` reads them outside any run), so they are hoisted to a
@@ -665,7 +960,7 @@ fn virtualize_whole_program(
         cross.cells.difference(&cells).cloned().collect();
 
     // Build the new top-level item list, run by run, splicing native items verbatim.
-    let mut out_items: Vec<ModuleItem> = Vec::new();
+    let mut out_items: Vec<ModuleItem> = directives;
     let mut cells_emitted = false;
     let mut any_virtualized = false;
 
@@ -690,8 +985,7 @@ fn virtualize_whole_program(
                 }
                 // Compile the run (bisecting on failure) into chunk re-entry calls
                 // interleaved with any sub-statements that had to stay native.
-                let produced =
-                    compile_run(stmts, names, tb, strict, exclude, &mut any_virtualized);
+                let produced = compile_run(stmts, names, tb, strict, exclude, &mut any_virtualized);
                 out_items.extend(produced.into_iter().map(ModuleItem::Stmt));
             }
         }
@@ -768,11 +1062,13 @@ fn compile_run(
     let opts = CompileOptions {
         exclude,
         divert_ineligible: exclude.is_some(),
+        live_captures: true,
+        native_parameters: false,
     };
     if let Ok(compiled) = compile_body_with_opts(&[], &block, opts) {
         let chunk = tb.add_strict(compiled, strict);
         let interp = names.interp_for(chunk.needs_eh, chunk.is_strict);
-        if let Some(call) = top_level_call_stmt(interp, &names.table, &chunk, strict) {
+        if let Some(call) = top_level_call_stmt(interp, &names.table, &chunk) {
             *any_virtualized = true;
             return vec![call];
         }
@@ -799,7 +1095,14 @@ fn compile_run(
     let mut left = stmts;
     let right = left.split_off(mid);
     let mut out = compile_run(left, names, tb, strict, exclude, any_virtualized);
-    out.extend(compile_run(right, names, tb, strict, exclude, any_virtualized));
+    out.extend(compile_run(
+        right,
+        names,
+        tb,
+        strict,
+        exclude,
+        any_virtualized,
+    ));
     out
 }
 
@@ -903,15 +1206,16 @@ fn set_body(program: &mut Program, items: Vec<ModuleItem>) {
 /// * `<caps>` — the run's free globals spread in capture order, referenced by their
 ///   real module-scope names (they resolve to the real globals because the call sits
 ///   at module scope) — the SAME capture array the function thunk builds.
-/// * `<thisExpr>` — `undefined` for Module top level / strict Script; `globalThis`
-///   for sloppy Script.
+/// * `<thisExpr>` — native top-level `this`: undefined in modules, globalThis in scripts.
 /// * The result is discarded (a wrapped run never returns — top-level `return` is a
 ///   syntax error).
-fn top_level_call_stmt(interp: &str, table: &str, chunk: &Chunk, strict: bool) -> Option<Stmt> {
-    let caps = format!("[{}]", chunk.captures.join(","));
-    let this_expr = if strict { "undefined" } else { "globalThis" };
+fn top_level_call_stmt(interp: &str, table: &str, chunk: &Chunk) -> Option<Stmt> {
+    let caps = capture_descriptors(&chunk.captures, chunk.is_strict);
+    // Native top-level `this` is globalThis in scripts (including strict scripts)
+    // and undefined in modules. Preserve the parser/runtime distinction directly.
+    let this_expr = "this";
     let src = format!(
-        "{interp}({table}[{idx}][0],{table}[{idx}][1],[],{caps},{cap_start},0,{this_expr});",
+        "{interp}({table}[{idx}][0],{table}[{idx}][1],[],{caps},{cap_start},0,{this_expr},true);",
         idx = chunk.index,
         cap_start = chunk.cap_start,
     );
@@ -965,10 +1269,10 @@ fn program_has_strict_candidate(program: &Program, target: &str, exclude: Option
             if self.found || !glob::matches(self.target, name) {
                 return;
             }
-            if let Some(e) = self.exclude {
-                if glob::matches(e, name) {
-                    return;
-                }
+            if let Some(e) = self.exclude
+                && glob::matches(e, name)
+            {
+                return;
             }
             if self.cur() || body_strict {
                 self.found = true;
@@ -994,7 +1298,10 @@ fn program_has_strict_candidate(program: &Program, target: &str, exclude: Option
         fn visit_fn_decl(&mut self, n: &FnDecl) {
             self.consider(
                 n.ident.sym.as_ref(),
-                n.function.body.as_ref().is_some_and(has_use_strict_directive),
+                n.function
+                    .body
+                    .as_ref()
+                    .is_some_and(has_use_strict_directive),
             );
             n.visit_children_with(self);
         }
@@ -1002,43 +1309,54 @@ fn program_has_strict_candidate(program: &Program, target: &str, exclude: Option
             if let Some(id) = &n.ident {
                 self.consider(
                     id.sym.as_ref(),
-                    n.function.body.as_ref().is_some_and(has_use_strict_directive),
+                    n.function
+                        .body
+                        .as_ref()
+                        .is_some_and(has_use_strict_directive),
                 );
             }
             n.visit_children_with(self);
         }
         fn visit_var_declarator(&mut self, n: &VarDeclarator) {
-            if let (Pat::Ident(b), Some(Expr::Fn(fe))) = (&n.name, n.init.as_deref()) {
-                if fe.ident.is_none() {
-                    self.consider(
-                        b.id.sym.as_ref(),
-                        fe.function.body.as_ref().is_some_and(has_use_strict_directive),
-                    );
-                }
+            if let (Pat::Ident(b), Some(Expr::Fn(fe))) = (&n.name, n.init.as_deref())
+                && fe.ident.is_none()
+            {
+                self.consider(
+                    b.id.sym.as_ref(),
+                    fe.function
+                        .body
+                        .as_ref()
+                        .is_some_and(has_use_strict_directive),
+                );
             }
             n.visit_children_with(self);
         }
         fn visit_assign_expr(&mut self, n: &AssignExpr) {
-            if n.op == AssignOp::Assign {
-                if let (Some(name), Expr::Fn(fe)) = (last_member_key(&n.left), n.right.as_ref()) {
-                    if fe.ident.is_none() {
-                        self.consider(
-                            &name,
-                            fe.function.body.as_ref().is_some_and(has_use_strict_directive),
-                        );
-                    }
-                }
+            if n.op == AssignOp::Assign
+                && let (Some(name), Expr::Fn(fe)) = (last_member_key(&n.left), n.right.as_ref())
+                && fe.ident.is_none()
+            {
+                self.consider(
+                    &name,
+                    fe.function
+                        .body
+                        .as_ref()
+                        .is_some_and(has_use_strict_directive),
+                );
             }
             n.visit_children_with(self);
         }
         fn visit_key_value_prop(&mut self, n: &KeyValueProp) {
-            if let (Some(name), Expr::Fn(fe)) = (static_prop_key_name(&n.key), n.value.as_ref()) {
-                if fe.ident.is_none() {
-                    self.consider(
-                        &name,
-                        fe.function.body.as_ref().is_some_and(has_use_strict_directive),
-                    );
-                }
+            if let (Some(name), Expr::Fn(fe)) = (static_prop_key_name(&n.key), n.value.as_ref())
+                && fe.ident.is_none()
+            {
+                self.consider(
+                    &name,
+                    fe.function
+                        .body
+                        .as_ref()
+                        .is_some_and(has_use_strict_directive),
+                );
             }
             n.visit_children_with(self);
         }
@@ -1046,7 +1364,10 @@ fn program_has_strict_candidate(program: &Program, target: &str, exclude: Option
             if let Some(name) = static_prop_key_name(&n.key) {
                 self.consider(
                     &name,
-                    n.function.body.as_ref().is_some_and(has_use_strict_directive),
+                    n.function
+                        .body
+                        .as_ref()
+                        .is_some_and(has_use_strict_directive),
                 );
             }
             n.visit_children_with(self);

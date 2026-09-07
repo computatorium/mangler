@@ -5,10 +5,8 @@
 //! Every `emit_*` here takes `&mut Cx` and shares the frame model and the other
 //! construct-family emitters (`stmt`, `expr`) via `use super::*`.
 
-use swc_core::ecma::ast::*;
-
 use super::*;
-use crate::isa::{compound_op_code, Instr};
+use crate::isa::{Instr, compound_op_code};
 
 /// The static string key of a destructuring property name, or `None` for a
 /// computed key (`{[e]: t}`), a lone-surrogate string, or an out-of-range numeric
@@ -38,7 +36,7 @@ pub(crate) fn destructure_key_string(key: &PropName) -> Option<String> {
 /// (slotted by `DeclCollector`), so they pass.
 pub(crate) fn resolve_writable(cx: &mut Cx<'_>, name: &str) -> Option<(u32, bool)> {
     let boxed = cx.is_celled(name);
-    if !cx.is_param_or_local(name) && !boxed {
+    if !cx.is_param_or_local(name) && !boxed && !cx.opts.live_captures {
         cx.bail_with("mutable_capture");
         return None;
     }
@@ -50,7 +48,13 @@ pub(crate) fn resolve_writable(cx: &mut Cx<'_>, name: &str) -> Option<(u32, bool
 /// `StoreLocal`. Leaves the value on the stack (both ops do), then `Pop` it — the
 /// destructuring caller is stack-neutral.
 pub(crate) fn emit_store_writable(cx: &mut Cx<'_>, slot: u32, boxed: bool) {
-    cx.emit(if boxed { Instr::StoreCell(slot) } else { Instr::StoreLocal(slot) });
+    cx.emit(if cx.initializing && cx.lexical_slots.contains_key(&slot) {
+        Instr::InitLocal(slot)
+    } else if boxed {
+        Instr::StoreCell(slot)
+    } else {
+        Instr::StoreLocal(slot)
+    });
     cx.emit(Instr::Pop);
 }
 
@@ -65,7 +69,10 @@ pub(crate) fn emit_value_default(cx: &mut Cx<'_>, default: &Expr) {
     let use_v = cx.code.len();
     cx.emit(Instr::JumpIfFalse(u32::MAX)); // not undefined -> keep v
     cx.emit(Instr::Pop); // drop the undefined value
+    let initializing = cx.initializing;
+    cx.initializing = false;
     emit_expr(cx, default);
+    cx.initializing = initializing;
     let done = cx.code.len();
     cx.emit(Instr::Jump(u32::MAX));
     let merge = cx.here();
@@ -118,6 +125,9 @@ pub(crate) fn emit_bind_target(cx: &mut Cx<'_>, target: &Pat) {
 /// (matching JS `[[Get]]` order); destructuring a `null`/`undefined` source
 /// throws via the first `GetProp`, matching the spec.
 pub(crate) fn emit_destructure_object(cx: &mut Cx<'_>, pat: &ObjectPat, src: u32) {
+    cx.emit(Instr::LoadLocal(src));
+    cx.emit(Instr::RequireObject);
+    cx.emit(Instr::Pop);
     // Static keys consumed by the named props — excluded from any rest copy.
     let mut taken: Vec<String> = Vec::new();
     let mut rest: Option<&Pat> = None;
@@ -164,55 +174,16 @@ pub(crate) fn emit_destructure_object(cx: &mut Cx<'_>, pat: &ObjectPat, src: u32
     }
 }
 
-/// Object-rest `...r = Object.assign({}, src)` minus the statically-taken keys
-/// (design §L6). Uses the captured global `Object`; the named-property getters of
-/// taken keys therefore also fire during the copy, then those keys are deleted —
-/// an accepted divergence for side-effecting getters (the differential corpus
-/// uses plain data properties). The rest target must be a simple binding ident.
+/// Copy only the remaining own enumerable keys, without reading excluded getters.
 pub(crate) fn emit_object_rest(cx: &mut Cx<'_>, src: u32, taken: &[String], rest_target: &Pat) {
-    let rest_name = match rest_target {
-        Pat::Ident(bi) => bi.id.sym.to_string(),
-        Pat::Expr(e) => match &**e {
-            Expr::Ident(id) => id.sym.to_string(),
-            _ => {
-                cx.bail_with("rest_destructure");
-                return;
-            }
-        },
-        _ => {
-            cx.bail_with("rest_destructure");
-            return;
-        }
-    };
-    let (slot, boxed) = match resolve_writable(cx, &rest_name) {
-        Some(s) => s,
-        None => return,
-    };
-    // A boxed rest target reads/writes through its cell (`L[slot][0]`); an unboxed
-    // local reads/writes the slot directly.
-    let load = |cx: &mut Cx| cx.emit(if boxed { Instr::LoadCell(slot) } else { Instr::LoadLocal(slot) });
-
-    // copy = Object.assign({}, src)  (CallResolved: [recv, fn, ...args] -> result).
-    let object_global = cx.resolve("Object");
-    cx.emit(Instr::LoadLocal(object_global)); // receiver
-    cx.emit(Instr::Dup);
-    let assign_key = cx.const_str("assign".to_string());
-    cx.emit(Instr::PushConst(assign_key));
-    cx.emit(Instr::GetProp); // function Object.assign
-    cx.emit(Instr::MakeObject(0)); // arg0 = {}
-    cx.emit(Instr::LoadLocal(src)); // arg1 = src
-    cx.emit(Instr::CallResolved(2));
-    cx.emit(if boxed { Instr::StoreCell(slot) } else { Instr::StoreLocal(slot) });
-    cx.emit(Instr::Pop);
-
-    // Drop the taken keys from the copy so the rest holds only the remainder.
+    cx.emit(Instr::LoadLocal(src));
     for key in taken {
-        load(cx);
-        let ci = cx.const_str(key.clone());
-        cx.emit(Instr::PushConst(ci));
-        cx.emit(Instr::DeleteProp);
-        cx.emit(Instr::Pop);
+        let constant = cx.const_str(key.clone());
+        cx.emit(Instr::PushConst(constant));
     }
+    cx.emit(Instr::MakeArray(taken.len() as u32));
+    cx.emit(Instr::RestProps);
+    emit_bind_target(cx, rest_target);
 }
 
 /// Lower an array destructuring pattern (design §L6 + the iterator mechanism).
@@ -270,6 +241,7 @@ pub(crate) fn emit_destructure_array(cx: &mut Cx<'_>, pat: &ArrayPat) {
     // CLOSE: abrupt path — close iff not exhausted, then resume the completion.
     let close_pc = cx.here();
     patch_handler_fin(cx, ph, close_pc);
+    cx.emit(Instr::BeginFinally);
     emit_arr_close_if_open(cx, it, done);
     cx.emit(Instr::EndFinally);
 
@@ -283,6 +255,13 @@ pub(crate) fn emit_destructure_array(cx: &mut Cx<'_>, pat: &ArrayPat) {
 /// Advance `it` one step, leaving the value (or `undefined` if exhausted) on the
 /// stack and setting `done` when the iterator reports exhaustion.
 pub(crate) fn emit_arr_next(cx: &mut Cx<'_>, it: u32, done: u32) {
+    cx.emit(Instr::LoadLocal(done));
+    let to_step = cx.code.len();
+    cx.emit(Instr::JumpIfFalse(u32::MAX));
+    cx.emit(Instr::PushUndef);
+    let exhausted = cx.code.len();
+    cx.emit(Instr::Jump(u32::MAX));
+    patch(cx, to_step, cx.here());
     cx.emit(Instr::LoadLocal(it));
     cx.emit(Instr::IterStep); // -> [false] (done) | [value, true]
     let to_setdone = cx.code.len();
@@ -298,13 +277,20 @@ pub(crate) fn emit_arr_next(cx: &mut Cx<'_>, it: u32, done: u32) {
     cx.emit(Instr::PushUndef);
     let have = cx.here();
     patch(cx, to_have, have);
+    patch(cx, exhausted, cx.here());
 }
 
 /// Advance `it` one step discarding the value (an array elision/hole), setting
 /// `done` on exhaustion. Stack-neutral.
 pub(crate) fn emit_arr_skip(cx: &mut Cx<'_>, it: u32, done: u32) {
+    cx.emit(Instr::LoadLocal(done));
+    let to_step = cx.code.len();
+    cx.emit(Instr::JumpIfFalse(u32::MAX));
+    let exhausted = cx.code.len();
+    cx.emit(Instr::Jump(u32::MAX));
+    patch(cx, to_step, cx.here());
     cx.emit(Instr::LoadLocal(it));
-    cx.emit(Instr::IterStep);
+    cx.emit(Instr::IterElide);
     let to_setdone = cx.code.len();
     cx.emit(Instr::JumpIfFalse(u32::MAX)); // done -> SETDONE
     cx.emit(Instr::Pop); // not done: drop the value
@@ -318,6 +304,7 @@ pub(crate) fn emit_arr_skip(cx: &mut Cx<'_>, it: u32, done: u32) {
     cx.emit(Instr::Pop);
     let after = cx.here();
     patch(cx, to_after, after);
+    patch(cx, exhausted, cx.here());
 }
 
 /// `if (!done) it.return()` — close a non-exhausted iterator. Stack-neutral.
@@ -481,7 +468,11 @@ pub(crate) fn emit_object_entry(cx: &mut Cx<'_>, prop: &Prop) {
             let ci = cx.const_str(ident.sym.to_string());
             cx.emit(Instr::PushConst(ci));
             let slot = cx.resolve(ident.sym.as_ref());
-            cx.emit(Instr::LoadLocal(slot));
+            cx.emit(if cx.is_celled(ident.sym.as_ref()) {
+                Instr::LoadCell(slot)
+            } else {
+                Instr::LoadLocal(slot)
+            });
         }
         _ => cx.bail(),
     }
@@ -494,45 +485,20 @@ pub(crate) fn emit_object_entry(cx: &mut Cx<'_>, prop: &Prop) {
 /// real `Object.assign` semantics — own-enumerable copy, getters invoked — are
 /// what the original observes in the normal case).
 pub(crate) fn emit_object_spread(cx: &mut Cx<'_>, o: &ObjectLit) {
-    let object = cx.resolve("Object");
-    cx.emit(Instr::LoadLocal(object)); // receiver
-    cx.emit(Instr::Dup);
-    let assign_key = cx.const_str("assign".to_string());
-    cx.emit(Instr::PushConst(assign_key));
-    cx.emit(Instr::GetProp); // [Object, assign]
-    cx.emit(Instr::MakeObject(0)); // target {}
-
-    let mut fixed_in_seg = 0u32;
-    let mut seg_count = 0u32; // source args after the target {}
+    cx.emit(Instr::MakeObject(0));
     for prop in &o.props {
         match prop {
             PropOrSpread::Prop(p) => {
                 emit_object_entry(cx, p);
-                if cx.bailed() {
-                    return;
-                }
-                fixed_in_seg += 1;
+                cx.emit(Instr::MakeObject(1));
             }
-            PropOrSpread::Spread(s) => {
-                if fixed_in_seg > 0 {
-                    cx.emit(Instr::MakeObject(fixed_in_seg));
-                    seg_count += 1;
-                    fixed_in_seg = 0;
-                }
-                emit_expr(cx, &s.expr);
-                if cx.bailed() {
-                    return;
-                }
-                seg_count += 1;
-            }
+            PropOrSpread::Spread(s) => emit_expr(cx, &s.expr),
         }
+        if cx.bailed() {
+            return;
+        }
+        cx.emit(Instr::CopyProps);
     }
-    if fixed_in_seg > 0 {
-        cx.emit(Instr::MakeObject(fixed_in_seg));
-        seg_count += 1;
-    }
-    // args = [{}, seg0, seg1, …]; `Object.assign` mutates and returns the target.
-    cx.emit(Instr::CallResolved(1 + seg_count));
 }
 
 pub(crate) fn emit_assign(cx: &mut Cx<'_>, a: &AssignExpr) {
@@ -543,7 +509,7 @@ pub(crate) fn emit_assign(cx: &mut Cx<'_>, a: &AssignExpr) {
                 // D1: a BOXED capture is writable through its cell; an unboxed
                 // capture is read-only -> bail.
                 let boxed = cx.is_celled(name);
-                if !cx.is_param_or_local(name) && !boxed {
+                if !cx.is_param_or_local(name) && !boxed && !cx.opts.live_captures {
                     // Writing to a captured outer binding: the VM frame write is not
                     // propagated back to the enclosing scope. Skip to stay sound
                     // (read-only capture only).
@@ -552,7 +518,11 @@ pub(crate) fn emit_assign(cx: &mut Cx<'_>, a: &AssignExpr) {
                 }
                 let slot = cx.resolve(name);
                 emit_expr(cx, &a.right);
-                cx.emit(if boxed { Instr::StoreCell(slot) } else { Instr::StoreLocal(slot) });
+                cx.emit(if boxed {
+                    Instr::StoreCell(slot)
+                } else {
+                    Instr::StoreLocal(slot)
+                });
             }
             AssignTarget::Simple(SimpleAssignTarget::Member(m)) => {
                 emit_expr(cx, &m.obj);
@@ -617,17 +587,25 @@ pub(crate) fn emit_assign(cx: &mut Cx<'_>, a: &AssignExpr) {
                 let name = bi.id.sym.as_ref();
                 // D1: a BOXED capture is read-modify-written through its cell.
                 let boxed = cx.is_celled(name);
-                if !cx.is_param_or_local(name) && !boxed {
+                if !cx.is_param_or_local(name) && !boxed && !cx.opts.live_captures {
                     // Compound-assigning a captured outer binding cannot be
                     // written back to the enclosing scope. Skip to stay sound.
                     cx.bail_with("mutable_capture");
                     return;
                 }
                 let slot = cx.resolve(name);
-                cx.emit(if boxed { Instr::LoadCell(slot) } else { Instr::LoadLocal(slot) });
+                cx.emit(if boxed {
+                    Instr::LoadCell(slot)
+                } else {
+                    Instr::LoadLocal(slot)
+                });
                 emit_expr(cx, &a.right);
                 cx.emit(Instr::Bin(code));
-                cx.emit(if boxed { Instr::StoreCell(slot) } else { Instr::StoreLocal(slot) });
+                cx.emit(if boxed {
+                    Instr::StoreCell(slot)
+                } else {
+                    Instr::StoreLocal(slot)
+                });
             }
             _ => cx.bail(),
         }
@@ -645,27 +623,12 @@ pub(crate) fn emit_call(cx: &mut Cx<'_>, c: &CallExpr) {
     let has_spread = c.args.iter().any(|a| a.spread.is_some());
     if let Expr::Member(m) = &**callee {
         if has_spread {
-            // `o.m(...a)` -> `o.m.apply(o, [args])`. Evaluate the receiver once into
-            // a temp, read the method off it, then `method.apply(recv, ARR)`.
             emit_expr(cx, &m.obj);
-            let recv = cx.alloc_temp();
-            cx.emit(Instr::StoreLocal(recv));
-            cx.emit(Instr::Pop);
-            cx.emit(Instr::LoadLocal(recv));
-            emit_member_key(cx, &m.prop);
-            if cx.bailed() {
-                cx.free_temp();
-                return;
-            }
-            cx.emit(Instr::GetProp); // [method]
             cx.emit(Instr::Dup);
-            let apply_key = cx.const_str("apply".to_string());
-            cx.emit(Instr::PushConst(apply_key));
-            cx.emit(Instr::GetProp); // [method, apply]
-            cx.emit(Instr::LoadLocal(recv)); // [method, apply, recv]
-            emit_spread_array(cx, &c.args); // [method, apply, recv, ARR]
-            cx.emit(Instr::CallResolved(2));
-            cx.free_temp(); // recv
+            emit_member_key(cx, &m.prop);
+            cx.emit(Instr::GetProp);
+            emit_spread_array(cx, &c.args);
+            cx.emit(Instr::CallArray);
             return;
         }
         // method call `o.m(args)`. The spec reads the method (`o.m`, GetValue)
@@ -689,15 +652,10 @@ pub(crate) fn emit_call(cx: &mut Cx<'_>, c: &CallExpr) {
         }
         cx.emit(Instr::CallResolved(argc));
     } else if has_spread {
-        // `f(...a)` -> `f.apply(undefined, [args])`.
+        cx.emit(Instr::PushUndef);
         emit_expr(cx, callee);
-        cx.emit(Instr::Dup);
-        let apply_key = cx.const_str("apply".to_string());
-        cx.emit(Instr::PushConst(apply_key));
-        cx.emit(Instr::GetProp); // [f, apply]
-        cx.emit(Instr::PushUndef); // [f, apply, undefined]
-        emit_spread_array(cx, &c.args); // [f, apply, undefined, ARR]
-        cx.emit(Instr::CallResolved(2));
+        emit_spread_array(cx, &c.args);
+        cx.emit(Instr::CallArray);
     } else {
         emit_expr(cx, callee);
         let mut argc = 0u32;
@@ -733,4 +691,3 @@ pub(crate) fn patch_handler_fin(cx: &mut Cx<'_>, idx: usize, target: u32) {
         _ => unreachable!("patch_handler_fin on non-PushHandler"),
     }
 }
-

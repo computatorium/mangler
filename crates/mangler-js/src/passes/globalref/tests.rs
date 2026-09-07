@@ -86,8 +86,16 @@ fn pass_contract() {
     assert_eq!(pass.reads(), &[Resource::property_literals()]);
     assert_eq!(pass.writes(), &[Resource::global_name_literals()]);
 
-    let off = FileConfig::new(resolved(Intensity::Low, GlobalIndirect::Off, false), 1, HashSet::new());
-    let on = FileConfig::new(resolved(Intensity::Medium, GlobalIndirect::Safe, false), 1, HashSet::new());
+    let off = FileConfig::new(
+        resolved(Intensity::Low, GlobalIndirect::Off, false),
+        1,
+        HashSet::new(),
+    );
+    let on = FileConfig::new(
+        resolved(Intensity::Medium, GlobalIndirect::Safe, false),
+        1,
+        HashSet::new(),
+    );
     assert!(!pass.enabled(&off), "Off mode disables the pass");
     assert!(pass.enabled(&on), "Safe mode enables the pass");
 }
@@ -112,28 +120,55 @@ fn writes_global_name_literals_artifact() {
     GlobalRefPass
         .run(&mut ast, &cfg, &mut rng, &mut bus, &mut notes)
         .unwrap();
-    assert!(bus.contains::<GlobalNameLiteralsArtifact>(), "must put the artifact");
+    assert!(
+        bus.contains::<GlobalNameLiteralsArtifact>(),
+        "must put the artifact"
+    );
 }
 
 // ── Anchor + injection ─────────────────────────────────────────────────────
 
 #[test]
-fn injects_globalthis_anchor() {
+fn injects_lexical_accessor_table() {
     let out = safe("var x = Math.PI;");
-    assert!(out.contains("=globalThis"), "anchor `var _G = globalThis` must be injected: {out}");
+    assert!(
+        out.contains("return Math"),
+        "accessor preserves lexical lookup: {out}"
+    );
+    assert!(
+        !out.contains("=globalThis"),
+        "no global-object anchor: {out}"
+    );
 }
 
 #[test]
 fn anchor_only_emitted_once_for_many_globals() {
     let out = safe("var a = Math.PI, b = JSON, c = Object, d = Array;");
-    assert_eq!(out.matches("=globalThis").count(), 1, "exactly one anchor decl expected: {out}");
+    assert_eq!(
+        out.matches("return Math").count(),
+        1,
+        "one accessor per name: {out}"
+    );
+    assert!(
+        !out.contains("=globalThis"),
+        "no global-object anchor: {out}"
+    );
 }
 
 #[test]
 fn live_getter_globals_are_not_allowlisted() {
     // Value-caching live getters would desync from later reads.
-    for name in ["innerWidth", "innerHeight", "scrollX", "scrollY", "devicePixelRatio"] {
-        assert!(!allowlist::is_allowlisted(name), "{name} must not be allowlisted");
+    for name in [
+        "innerWidth",
+        "innerHeight",
+        "scrollX",
+        "scrollY",
+        "devicePixelRatio",
+    ] {
+        assert!(
+            !allowlist::is_allowlisted(name),
+            "{name} must not be allowlisted"
+        );
     }
 }
 
@@ -142,30 +177,54 @@ fn live_getter_globals_are_not_allowlisted() {
 #[test]
 fn safe_indirects_allowlisted_global_read() {
     let out = safe("var s = Math;");
-    assert!(out.contains("\"Math\""), "names/alias literal must carry Math: {out}");
-    assert!(!out.contains("s=Math;"), "bare Math read must be indirected: {out}");
+    assert!(
+        out.contains("\"Math\""),
+        "names/alias literal must carry Math: {out}"
+    );
+    assert!(
+        !out.contains("s=Math;"),
+        "bare Math read must be indirected: {out}"
+    );
 }
 
 #[test]
 fn safe_skips_non_allowlisted_free_global() {
     let out = safe("var s = notARealGlobalXyz;");
-    assert!(out.contains("notARealGlobalXyz"), "non-allowlisted free global preserved in Safe: {out}");
-    assert!(!out.contains("=globalThis"), "no table injected when nothing indirected: {out}");
+    assert!(
+        out.contains("notARealGlobalXyz"),
+        "non-allowlisted free global preserved in Safe: {out}"
+    );
+    assert!(
+        !out.contains("=globalThis"),
+        "no table injected when nothing indirected: {out}"
+    );
 }
 
 #[test]
 fn aggressive_indirects_non_allowlisted_free_global() {
     let out = aggressive("var s = notARealGlobalXyz;");
-    assert!(out.contains("\"notARealGlobalXyz\""), "Aggressive indirects any free global: {out}");
-    assert!(!out.contains("s=notARealGlobalXyz;"), "use site must be the alias: {out}");
+    assert!(
+        out.contains("\"notARealGlobalXyz\""),
+        "Aggressive indirects any free global: {out}"
+    );
+    assert!(
+        !out.contains("s=notARealGlobalXyz;"),
+        "use site must be the alias: {out}"
+    );
 }
 
 #[test]
 fn shadowing_disables_indirection_file_wide() {
     let src = "function g(){ var Math = 1; return Math; } var z = Math.PI;";
     let out = safe(src);
-    assert!(out.contains("Math.PI"), "shadowed Math must stay bare: {out}");
-    assert!(!out.contains("=globalThis"), "no table when the only global is shadowed: {out}");
+    assert!(
+        out.contains("Math.PI"),
+        "shadowed Math must stay bare: {out}"
+    );
+    assert!(
+        !out.contains("=globalThis"),
+        "no table when the only global is shadowed: {out}"
+    );
 }
 
 #[test]
@@ -193,14 +252,23 @@ fn destructuring_binding_shadow_disables() {
 #[test]
 fn eval_bails_entirely() {
     let out = safe("eval('1'); var z = Math.PI;");
-    assert!(!out.contains("globalThis"), "eval must disable all indirection: {out}");
-    assert!(out.contains("Math.PI"), "Math read stays bare after eval bail: {out}");
+    assert!(
+        !out.contains("globalThis"),
+        "eval must disable all indirection: {out}"
+    );
+    assert!(
+        out.contains("Math.PI"),
+        "Math read stays bare after eval bail: {out}"
+    );
 }
 
 #[test]
 fn with_bails_entirely() {
     let out = safe("with(o){ y } var z = Math.PI;");
-    assert!(!out.contains("globalThis"), "with must disable all indirection: {out}");
+    assert!(
+        !out.contains("globalThis"),
+        "with must disable all indirection: {out}"
+    );
 }
 
 // ── Position handling ──────────────────────────────────────────────────────
@@ -208,8 +276,14 @@ fn with_bails_entirely() {
 #[test]
 fn bare_call_is_indirected() {
     let out = safe("requestAnimationFrame(cb);");
-    assert!(!out.contains("requestAnimationFrame(cb)"), "bare global call must be indirected: {out}");
-    assert!(out.contains("\"requestAnimationFrame\""), "literal carries requestAnimationFrame: {out}");
+    assert!(
+        !out.contains("requestAnimationFrame(cb)"),
+        "bare global call must be indirected: {out}"
+    );
+    assert!(
+        out.contains("\"requestAnimationFrame\""),
+        "literal carries requestAnimationFrame: {out}"
+    );
 }
 
 #[test]
@@ -224,48 +298,75 @@ fn member_base_is_indirected() {
 #[test]
 fn new_expr_is_indirected() {
     let out = safe("var d = new Date();");
-    assert!(!out.contains("new Date("), "new Date must indirect to new <alias>: {out}");
+    assert!(
+        !out.contains("new Date("),
+        "new Date must indirect to new <alias>: {out}"
+    );
     assert!(out.contains("\"Date\""), "literal carries Date: {out}");
 }
 
 #[test]
-fn typeof_is_indirected() {
+fn typeof_remains_a_native_lookup() {
     let out = safe("var t = typeof Symbol;");
-    assert!(!out.contains("typeof Symbol"), "typeof <global> must be indirected: {out}");
-    assert!(out.contains("\"Symbol\""), "literal carries Symbol: {out}");
+    assert!(
+        out.contains("typeof Symbol"),
+        "typeof must preserve missing-binding behavior: {out}"
+    );
+    assert!(
+        !out.contains("return Symbol"),
+        "typeof requires no accessor: {out}"
+    );
 }
 
 #[test]
 fn assignment_target_is_not_indirected() {
     let out = safe("fetch = 1;");
-    assert!(out.contains("fetch=1"), "assignment target must stay bare: {out}");
-    assert!(!out.contains("=globalThis"), "no alias hoisted for an assign-only global: {out}");
+    assert!(
+        out.contains("fetch=1"),
+        "assignment target must stay bare: {out}"
+    );
+    assert!(
+        !out.contains("=globalThis"),
+        "no alias hoisted for an assign-only global: {out}"
+    );
 }
 
 #[test]
 fn compound_assignment_target_is_not_indirected() {
     // scrollX is not allowlisted, so use Aggressive to prove the write exclusion.
     let out = aggressive("scrollY += 1;");
-    assert!(out.contains("scrollY+=1"), "compound assign target must stay bare: {out}");
+    assert!(
+        out.contains("scrollY+=1"),
+        "compound assign target must stay bare: {out}"
+    );
 }
 
 #[test]
 fn update_target_is_not_indirected() {
     let out = aggressive("scrollX++;");
-    assert!(out.contains("scrollX++"), "update target must stay bare: {out}");
+    assert!(
+        out.contains("scrollX++"),
+        "update target must stay bare: {out}"
+    );
 }
 
 #[test]
 fn delete_target_is_not_indirected() {
     let out = aggressive("delete navigator;");
-    assert!(out.contains("delete navigator"), "delete target must stay bare: {out}");
+    assert!(
+        out.contains("delete navigator"),
+        "delete target must stay bare: {out}"
+    );
 }
 
 #[test]
 fn assignment_rhs_still_indirected() {
     let out = safe("notDeclaredLhs = Math;");
     assert!(out.contains("notDeclaredLhs="), "LHS stays bare: {out}");
-    assert!(!out.contains("=Math;"), "RHS Math must be indirected: {out}");
+    assert!(
+        !out.contains("=Math;"),
+        "RHS Math must be indirected: {out}"
+    );
 }
 
 // ── Whole-name write-exclusion (correctness-critical) ──────────────────────
@@ -274,8 +375,14 @@ fn assignment_rhs_still_indirected() {
 fn for_of_target_excludes_whole_name() {
     let src = "for (freeGlobalTarget of [1,2,3]) { sink(freeGlobalTarget); } record(typeof freeGlobalTarget);";
     let out = aggressive(src);
-    assert!(out.contains("freeGlobalTarget of"), "for-of head target must stay bare: {out}");
-    assert!(out.contains("typeof freeGlobalTarget"), "read of a written name must stay bare: {out}");
+    assert!(
+        out.contains("freeGlobalTarget of"),
+        "for-of head target must stay bare: {out}"
+    );
+    assert!(
+        out.contains("typeof freeGlobalTarget"),
+        "read of a written name must stay bare: {out}"
+    );
     assert!(
         !out.contains(".freeGlobalTarget") && !out.contains("[\"freeGlobalTarget\"]"),
         "no alias hoisted for a written global: {out}"
@@ -286,8 +393,14 @@ fn for_of_target_excludes_whole_name() {
 fn for_in_target_excludes_whole_name() {
     let src = "for (freeGlobalKey in obj) { sink(freeGlobalKey); } var r = freeGlobalKey;";
     let out = aggressive(src);
-    assert!(out.contains("freeGlobalKey in"), "for-in head target must stay bare: {out}");
-    assert!(out.contains("=freeGlobalKey"), "read of written name stays bare: {out}");
+    assert!(
+        out.contains("freeGlobalKey in"),
+        "for-in head target must stay bare: {out}"
+    );
+    assert!(
+        out.contains("=freeGlobalKey"),
+        "read of written name stays bare: {out}"
+    );
     assert!(
         !out.contains(".freeGlobalKey") && !out.contains("[\"freeGlobalKey\"]"),
         "no alias hoisted for a for-in-written global: {out}"
@@ -298,14 +411,20 @@ fn for_in_target_excludes_whole_name() {
 fn assigned_name_read_is_also_excluded() {
     let out = aggressive("assignedGlobal = 1; var r = assignedGlobal;");
     assert!(out.contains("assignedGlobal=1"), "write stays bare: {out}");
-    assert!(out.contains("=assignedGlobal"), "read of written name must stay bare: {out}");
+    assert!(
+        out.contains("=assignedGlobal"),
+        "read of written name must stay bare: {out}"
+    );
 }
 
 #[test]
 fn update_name_read_is_also_excluded() {
     let out = aggressive("counterGlobal++; var r = counterGlobal;");
     assert!(out.contains("counterGlobal++"), "update stays bare: {out}");
-    assert!(out.contains("=counterGlobal"), "read of updated name must stay bare: {out}");
+    assert!(
+        out.contains("=counterGlobal"),
+        "read of updated name must stay bare: {out}"
+    );
 }
 
 #[test]
@@ -331,7 +450,10 @@ fn paren_update_target_excludes_whole_name() {
 #[test]
 fn paren_delete_target_excludes_whole_name() {
     let out = aggressive("delete (navigator); record(typeof navigator);");
-    assert!(out.contains("navigator"), "the bare name must remain: {out}");
+    assert!(
+        out.contains("navigator"),
+        "the bare name must remain: {out}"
+    );
     assert!(
         !out.contains(".navigator") && !out.contains("[\"navigator\"]"),
         "parenthesized delete operand must exclude the whole name: {out}"
@@ -343,7 +465,10 @@ fn paren_delete_target_excludes_whole_name() {
 #[test]
 fn globalthis_is_never_indirected() {
     let out = safe("var g = globalThis.Math;");
-    assert!(out.contains("globalThis"), "globalThis stays (it is the anchor): {out}");
+    assert!(
+        out.contains("globalThis"),
+        "globalThis stays (it is the anchor): {out}"
+    );
 }
 
 #[test]
@@ -396,7 +521,13 @@ fn decoys_are_injected_and_inert() {
 #[test]
 fn decoy_count_scales_with_intensity() {
     let count_for = |level: Intensity| -> usize {
-        names_array_len(&run_pass("var x = Math.PI;", level, 1, GlobalIndirect::Safe, false))
+        names_array_len(&run_pass(
+            "var x = Math.PI;",
+            level,
+            1,
+            GlobalIndirect::Safe,
+            false,
+        ))
     };
     assert!(
         count_for(Intensity::High) > count_for(Intensity::Medium),
@@ -406,23 +537,22 @@ fn decoy_count_scales_with_intensity() {
 
 #[test]
 fn dispatcher_threshold_is_three() {
-    assert_eq!(super::DISPATCHER_MIN_ENTRIES, 3, "one-hop fallback applies below 3 combined entries");
+    assert_eq!(
+        super::DISPATCHER_MIN_ENTRIES,
+        3,
+        "one-hop fallback applies below 3 combined entries"
+    );
 }
 
 // ── Anchor hardening ───────────────────────────────────────────────────────
 
 #[test]
-fn default_anchor_is_plain_globalthis() {
-    let out = safe("var x = Math.PI;");
-    assert!(out.contains("=globalThis"), "default anchor must be plain globalThis: {out}");
-    assert!(!out.contains("return this"), "default anchor must NOT use IIFE: {out}");
-}
-
-#[test]
-fn hardened_anchor_uses_iife_with_fallback() {
-    let out = run_pass("var x = Math.PI;", Intensity::Medium, 1, GlobalIndirect::Safe, true);
-    assert!(out.contains("return this"), "hardened anchor must use IIFE: {out}");
-    assert!(out.contains("||globalThis"), "hardened anchor must fall back to globalThis: {out}");
+fn anchor_hardening_is_unnecessary_for_lexical_accessors() {
+    let src = "var x = Math.PI;";
+    let normal = run_pass(src, Intensity::High, 1, GlobalIndirect::Safe, false);
+    let hardened = run_pass(src, Intensity::High, 1, GlobalIndirect::Safe, true);
+    assert_eq!(normal, hardened);
+    assert!(!normal.contains("=globalThis"));
 }
 
 // ── Determinism ────────────────────────────────────────────────────────────
@@ -457,17 +587,27 @@ fn dispatcher_index_roundtrips_for_every_entry() {
             let perm = super::dispatcher_involution(n, &mut rng);
 
             for i in 0..n {
-                assert_eq!(perm[perm[i]], i, "perm must be an involution (n={n}, seed={seed})");
+                assert_eq!(
+                    perm[perm[i]], i,
+                    "perm must be an involution (n={n}, seed={seed})"
+                );
             }
             let mut s_sorted = store.clone();
             s_sorted.sort_unstable();
-            assert_eq!(s_sorted, (0..n).collect::<Vec<_>>(), "store must be a permutation");
+            assert_eq!(
+                s_sorted,
+                (0..n).collect::<Vec<_>>(),
+                "store must be a permutation"
+            );
 
             let name_at_pos = super::dispatcher_name_at_pos(&entries, &store);
             for (e, entry) in entries.iter().enumerate() {
                 let k = super::dispatcher_key(&perm, &store, e);
                 let resolved = super::dispatcher_resolve(&name_at_pos, &perm, k);
-                assert_eq!(resolved, *entry, "entry {e} mis-resolved (n={n}, seed={seed})");
+                assert_eq!(
+                    resolved, *entry,
+                    "entry {e} mis-resolved (n={n}, seed={seed})"
+                );
             }
         }
     }
@@ -482,7 +622,11 @@ fn dispatcher_involution_is_self_inverse() {
             assert_eq!(perm.len(), n);
             let mut sorted = perm.clone();
             sorted.sort_unstable();
-            assert_eq!(sorted, (0..n).collect::<Vec<_>>(), "not a permutation (n={n})");
+            assert_eq!(
+                sorted,
+                (0..n).collect::<Vec<_>>(),
+                "not a permutation (n={n})"
+            );
             for i in 0..n {
                 assert_eq!(perm[perm[i]], i, "not an involution (n={n}, seed={seed})");
             }
@@ -521,7 +665,13 @@ fn safe_indirection_round_trips() {
 #[test]
 fn aggressive_indirection_round_trips() {
     for seed in [1u64, 9, 555] {
-        let out = run_pass(SINK_PROGRAM, Intensity::High, seed, GlobalIndirect::Aggressive, false);
+        let out = run_pass(
+            SINK_PROGRAM,
+            Intensity::High,
+            seed,
+            GlobalIndirect::Aggressive,
+            false,
+        );
         assert_behaviorally_equal(SINK_PROGRAM, &out);
     }
 }
@@ -570,4 +720,51 @@ fn bare_call_this_is_preserved() {
     // when surrounding intrinsics are indirected.
     let out = run_pass(src, Intensity::High, 7, GlobalIndirect::Aggressive, false);
     assert_behaviorally_equal(src, &out);
+}
+
+#[test]
+fn commonjs_and_implicit_arguments_are_preserved() {
+    let src = "function f(){return [typeof require,typeof module,typeof exports,__filename,__dirname,arguments[0]];}";
+    for out in [safe(src), aggressive(src)] {
+        for name in [
+            "require",
+            "module",
+            "exports",
+            "__filename",
+            "__dirname",
+            "arguments",
+        ] {
+            assert!(
+                !out.contains(&format!("return {name};")),
+                "wrapper binding accessor: {out}"
+            );
+        }
+    }
+}
+
+#[test]
+fn lexical_accessors_preserve_live_reads_and_failures() {
+    let cases = [
+        "globalThis.parseInt=function(){return 91};globalThis.__out=String(parseInt('3'));",
+        "var hits=0;Object.defineProperty(globalThis,'liveValue',{configurable:true,get:function(){return ++hits}});globalThis.__out=String(liveValue+liveValue)+':'+hits;",
+        "var globalThis={}; globalThis.__out=String(Math.PI);",
+        "globalThis.customGlobal=function(){'use strict';return this===undefined};globalThis.__out=String(customGlobal());",
+        "globalThis.Custom=function(){this.value=1};var a=new Custom();globalThis.Custom=function(){this.value=2};globalThis.__out=String(a.value+(new Custom()).value);",
+        "var result='';try{missingGlobalForMangler}catch(e){result=e.name}globalThis.__out=result+':'+typeof (otherMissingGlobal);",
+        "var before=typeof anotherMissingGlobal;globalThis.anotherMissingGlobal=4;globalThis.__out=before+':'+anotherMissingGlobal;",
+        "function f(){return arguments[0]}globalThis.__out=String(f(7));",
+    ];
+    for src in cases {
+        assert_behaviorally_equal(src, &aggressive(src));
+    }
+}
+
+#[test]
+fn external_lexical_bindings_are_not_global_object_properties() {
+    let prelude = "let sharedExternal=7;";
+    let src = "globalThis.__out=String(sharedExternal);";
+    assert_behaviorally_equal(
+        &format!("{prelude}{src}"),
+        &format!("{prelude}{}", aggressive(src)),
+    );
 }

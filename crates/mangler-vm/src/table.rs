@@ -18,16 +18,16 @@
 //! [`TableBuilder::add`]; it gets back a [`Chunk`] (root table index + frame
 //! metadata for its thunk). When all chunks are registered, [`TableBuilder::finish`]
 //! serializes every chunk under the shared diversity and emits ONE program-table
-//! statement plus the interpreter(s) — a lean interpreter always, and (only if any
-//! chunk needs it) a second EH-shaped interpreter. The strings decode primitive and
+//! statement plus only the strictness/EH interpreter variants required by its
+//! chunks, specialized to their instruction/operator union. The strings decode primitive and
 //! the virtualized function bodies are now literally just two callers of `add`.
 
 use mangler_core::Rng;
 use swc_core::ecma::ast::Stmt;
 
-use crate::chunk::{Chunk, Compiled};
+use crate::chunk::{Chunk, Compiled, InstructionUsage};
 use crate::diversity::VmDiversity;
-use crate::emit::{emit_interpreter, InterpreterSpec};
+use crate::emit::{InterpreterSpec, emit_interpreter};
 use crate::isa::Instr;
 use crate::serialize::{code_array_js, consts_array_js, program_table_js, serialize};
 
@@ -112,10 +112,10 @@ pub struct TableBuilder {
     /// The flat program table: `(code_js, consts_js)` per chunk, children first.
     programs: Vec<(String, String)>,
     /// Which of the four `(needs_eh, is_strict)` interpreter variants some registered
-    /// chunk requires, so `finish` emits ONLY those — a fully-sloppy program emits a
-    /// single lean interpreter, byte-for-byte as before strict support. Indexed by
+    /// chunk requires, so `finish` emits only the needed variants. Indexed by
     /// `[is_strict as usize][needs_eh as usize]`.
     variants: [[bool; 2]; 2],
+    usage: [[InstructionUsage; 2]; 2],
 }
 
 struct RootMeta {
@@ -136,6 +136,7 @@ impl TableBuilder {
             roots: Vec::new(),
             programs: Vec::new(),
             variants: [[false; 2]; 2],
+            usage: Default::default(),
         }
     }
 
@@ -164,6 +165,7 @@ impl TableBuilder {
     pub fn add_strict(&mut self, compiled: Compiled, is_strict: bool) -> Chunk {
         let eh = needs_eh(&compiled);
         self.variants[is_strict as usize][eh as usize] = true;
+        self.usage[is_strict as usize][eh as usize].include(&compiled);
         let captures = compiled.captures.clone();
         let cap_start = compiled.cap_start();
         let pcount = compiled.pcount;
@@ -176,7 +178,9 @@ impl TableBuilder {
             needs_eh: eh,
             is_strict,
         };
-        self.roots.push(RootMeta { chunk: chunk.clone() });
+        self.roots.push(RootMeta {
+            chunk: chunk.clone(),
+        });
         chunk
     }
 
@@ -216,10 +220,9 @@ impl TableBuilder {
 
     /// Emit the shared prologue: the `Reflect.construct`/`Symbol.iterator` aliases,
     /// the interpreter(s), and the program-table `var`, all as AST statements. The
-    /// table `var` is built by reparsing the rendered `[[code,consts],...]` literal
-    /// (the chunks are pre-rendered XOR'd numeric arrays; there is no Rust mirror to
-    /// drift from). A lean interpreter is always emitted; an EH interpreter is added
-    /// only when some chunk needs it.
+    /// table `var` is built by reparsing the rendered `[[code,consts],...]` literal.
+    /// Packed code strings expand once on first execution. Only interpreter variants
+    /// used by a registered root are emitted; each supports its descendants as well.
     pub fn finish(&self, names: &VmNames) -> mangler_core::Result<VmTable> {
         let mut prologue: Vec<Stmt> = Vec::new();
         let any_eh = self.needs_eh_interp();
@@ -232,12 +235,9 @@ impl TableBuilder {
             prologue.push(alias_decl(&names.sy, "Symbol", "iterator")?);
         }
 
-        // Up to FOUR `(needs_eh, is_strict)` interpreter variants, each emitted ONLY
-        // if some chunk requires it, in a fixed order so a fully-sloppy program is
-        // byte-for-byte identical to before strict support: the sloppy-lean and
-        // sloppy-eh interpreters come first, in the same order and shape as the
-        // pre-strict `finish` emitted them (a sloppy spec adds nothing to the body),
-        // then the strict variants. All share the SAME diversity and table name.
+        // Up to four `(needs_eh, is_strict)` interpreter variants, each emitted only
+        // if some chunk requires it, in deterministic order. All share the same
+        // diversity and table name, with a distinct required-instruction union.
         let emit = |name: &str, needs_eh: bool, is_strict: bool| {
             let spec = InterpreterSpec {
                 name,
@@ -247,12 +247,11 @@ impl TableBuilder {
                 needs_eh,
                 is_strict,
                 diversity: &self.diversity,
+                usage: Some(&self.usage[is_strict as usize][needs_eh as usize]),
             };
             emit_interpreter(&spec)
         };
-        // Sloppy lean is always emitted today; keep that for any non-strict program so
-        // the byte-identity guard holds even for the (degenerate) no-chunk case.
-        if !any_strict || self.variants[0][0] {
+        if self.variants[0][0] {
             prologue.push(emit(&names.lean_interp, false, false)?);
         }
         if self.variants[0][1] {
@@ -295,8 +294,8 @@ fn alias_decl(name: &str, obj: &str, prop: &str) -> mangler_core::Result<Stmt> {
 }
 
 /// Parse a single JS statement string into a [`Stmt`] (the table-var declaration).
-/// The input is a rendered numeric array literal with no Rust mirror, so this is a
-/// validated fragment, not a hand-synced template.
+/// The input is the rendered packed-code/constant table. Parsing validates that
+/// string escaping and any native factory expressions form a valid declaration.
 fn parse_one_stmt(src: &str) -> mangler_core::Result<Stmt> {
     use mangler_core::Language;
     use mangler_jsast::lang::{Js, ParseOpts};
@@ -329,7 +328,14 @@ mod tests {
     }
 
     fn leaf(code: Vec<Instr>, consts: Vec<Const>) -> Compiled {
-        Compiled { code, consts, captures: vec![], slots: 2, pcount: 1, children: vec![] }
+        Compiled {
+            code,
+            consts,
+            captures: vec![],
+            slots: 2,
+            pcount: 1,
+            children: vec![],
+        }
     }
 
     #[test]
@@ -337,7 +343,10 @@ mod tests {
         let mut tb = TableBuilder::with_diversity(VmDiversity::baseline(2));
         // "decode" client chunk, then "virtualize" client chunk.
         let a = tb.add(leaf(vec![Instr::LoadLocal(0), Instr::Ret], vec![]));
-        let b = tb.add(leaf(vec![Instr::PushConst(0), Instr::Ret], vec![Const::Num(5.0)]));
+        let b = tb.add(leaf(
+            vec![Instr::PushConst(0), Instr::Ret],
+            vec![Const::Num(5.0)],
+        ));
         assert_eq!(a.index, 0);
         assert_eq!(b.index, 1);
         let vt = tb.finish(&names()).expect("finish ok");
@@ -352,13 +361,13 @@ mod tests {
         tb.add(leaf(vec![Instr::GetIter, Instr::Ret], vec![]));
         assert!(tb.needs_eh_interp());
         let vt = tb.finish(&names()).expect("finish ok");
-        // rc + sy + lean interp + eh interp + table = 5 stmts.
-        assert_eq!(vt.prologue.len(), 5);
+        // rc + sy + eh interp + table; no unused lean interpreter.
+        assert_eq!(vt.prologue.len(), 4);
         assert!(vt.has_eh);
     }
 
-    /// §5a: a fully-sloppy program emits a SINGLE lean interpreter and NO strict
-    /// machinery — byte-for-byte as before strict support. Guarded structurally
+    /// A sloppy lean program emits one lean interpreter and no strict
+    /// machinery. Guarded structurally
     /// (prologue length + no `"use strict"` anywhere in the rendered prologue).
     #[test]
     fn sloppy_only_emits_single_interpreter_no_strict() {
@@ -372,7 +381,10 @@ mod tests {
         assert!(!vt.has_strict);
         assert!(!vt.has_eh);
         let rendered = render_prologue(&vt.prologue);
-        assert!(!rendered.contains("use strict"), "no strict directive:\n{rendered}");
+        assert!(
+            !rendered.contains("use strict"),
+            "no strict directive:\n{rendered}"
+        );
     }
 
     /// §5a 4-way selection table: each `(needs_eh, is_strict)` combination some chunk
@@ -391,7 +403,11 @@ mod tests {
         assert_eq!(vt.prologue.len(), 4);
         assert!(vt.has_strict && !vt.has_eh);
         let rendered = render_prologue(&vt.prologue);
-        assert_eq!(rendered.matches("\"use strict\"").count(), 1, "one strict variant:\n{rendered}");
+        assert_eq!(
+            rendered.matches("\"use strict\"").count(),
+            1,
+            "one strict variant:\n{rendered}"
+        );
 
         // All four variants: rc + sy + 4 interpreters + table = 7 stmts, two strict.
         let mut tb = TableBuilder::with_diversity(VmDiversity::baseline(2));
@@ -403,7 +419,11 @@ mod tests {
         assert_eq!(vt.prologue.len(), 7);
         assert!(vt.has_strict && vt.has_eh);
         let rendered = render_prologue(&vt.prologue);
-        assert_eq!(rendered.matches("\"use strict\"").count(), 2, "two strict variants:\n{rendered}");
+        assert_eq!(
+            rendered.matches("\"use strict\"").count(),
+            2,
+            "two strict variants:\n{rendered}"
+        );
     }
 
     /// `interp_for` implements the documented 4-way routing.
@@ -430,11 +450,11 @@ mod tests {
 
     /// Render a prologue to source so tests can scan for directives / count variants.
     fn render_prologue(prologue: &[Stmt]) -> String {
-        use swc_core::common::sync::Lrc;
         use swc_core::common::SourceMap;
+        use swc_core::common::sync::Lrc;
         use swc_core::ecma::ast::{Program, Script};
-        use swc_core::ecma::codegen::text_writer::JsWriter;
         use swc_core::ecma::codegen::Emitter;
+        use swc_core::ecma::codegen::text_writer::JsWriter;
         let prog = Program::Script(Script {
             span: swc_core::common::DUMMY_SP,
             body: prologue.to_vec(),
@@ -468,14 +488,23 @@ mod tests {
         };
         let root = Compiled {
             code: vec![
-                Instr::MakeClosure { child: 0, is_arrow: false, cap_start: 1, pcount: 0, up_slots: vec![] },
+                Instr::MakeClosure {
+                    child: 0,
+                    is_arrow: false,
+                    cap_start: 1,
+                    pcount: 0,
+                    up_slots: vec![],
+                },
                 Instr::Ret,
             ],
             consts: vec![],
             captures: vec![],
             slots: 2,
             pcount: 1,
-            children: vec![crate::chunk::ChildChunk { compiled: child, is_arrow: false }],
+            children: vec![crate::chunk::ChildChunk {
+                compiled: child,
+                is_arrow: false,
+            }],
         };
         let mut tb = TableBuilder::with_diversity(VmDiversity::baseline(2));
         let chunk = tb.add(root);
@@ -484,5 +513,76 @@ mod tests {
         assert_eq!(tb.programs.len(), 2);
         let vt = tb.finish(&names()).expect("finish ok");
         assert!(!vt.prologue.is_empty());
+    }
+
+    #[test]
+    fn specialized_interpreter_keeps_decoys_and_descendant_instructions() {
+        let mut child = leaf(
+            vec![
+                Instr::PushConst(0),
+                Instr::PushConst(1),
+                Instr::Bin(0),
+                Instr::Ret,
+            ],
+            vec![Const::Num(20.0), Const::Num(22.0)],
+        );
+        child.pcount = 0;
+        let mut root = leaf(
+            vec![
+                Instr::MakeClosure {
+                    child: 0,
+                    is_arrow: false,
+                    cap_start: 0,
+                    pcount: 0,
+                    up_slots: vec![],
+                },
+                Instr::Ret,
+            ],
+            vec![],
+        );
+        root.children.push(crate::chunk::ChildChunk {
+            compiled: child,
+            is_arrow: false,
+        });
+        for seed in [1, 7, 42] {
+            let mut tb = TableBuilder::new(&mut Rng::for_pass(seed, "usage"));
+            let chunk = tb.add(root.clone());
+            let output = render_prologue(&tb.finish(&names()).unwrap().prologue);
+            let code = format!(
+                "{output}globalThis.__out=V(T[{}][0],T[{}][1],[],[],0,0,null)();",
+                chunk.index, chunk.index
+            );
+            mangler_testkit::assert_behaviorally_equal("globalThis.__out=42;", &code);
+            for &label in &tb.diversity.perm[crate::isa::N_OPCODES..] {
+                // Baseline and diversified dispatch can use switch or indexed closures.
+                assert!(
+                    output.contains(&format!("case {label}:"))
+                        || output.contains(&format!("F[{label}]"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unused_handlers_and_operator_cases_are_omitted() {
+        let mut tb = TableBuilder::with_diversity(VmDiversity::baseline(2));
+        tb.add(leaf(
+            vec![Instr::PushConst(0), Instr::Ret],
+            vec![Const::Num(42.0)],
+        ));
+        let output = render_prologue(&tb.finish(&names()).unwrap().prologue);
+        assert!(output.contains("case 0:"));
+        assert!(output.contains("case 18:"));
+        assert!(!output.contains("case 5:"), "unused binary handler emitted");
+        assert!(!output.contains("case 6:"), "unused unary handler emitted");
+        assert!(
+            !output.contains("case 13:"),
+            "unused constructor handler emitted"
+        );
+        assert_eq!(
+            output.matches("case ").count(),
+            4,
+            "two real instructions plus two configured decoys"
+        );
     }
 }

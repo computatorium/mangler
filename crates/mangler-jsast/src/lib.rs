@@ -31,7 +31,9 @@
 
 pub mod analysis;
 pub mod build;
+mod class_scope;
 pub mod codegen;
+pub mod directives;
 pub mod lang;
 pub mod rewrite;
 pub mod span;

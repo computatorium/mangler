@@ -28,9 +28,9 @@ use mangler_jsast::lang::{Js, ParseOpts};
 use swc_core::ecma::ast::Stmt;
 
 use crate::diversity::{
-    bin_mba_expr, DECOY_FORMS, HANDLER_VARIANTS, SKELETON_VARIANTS, VmDiversity,
+    DECOY_FORMS, HANDLER_VARIANTS, SKELETON_VARIANTS, VmDiversity, bin_mba_expr,
 };
-use crate::isa::{bin_expr_js, un_expr_js, N_BIN_OPS, N_OPCODES, N_UN_OPS};
+use crate::isa::{N_BIN_OPS, N_OPCODES, N_UN_OPS, bin_expr_js, un_expr_js};
 
 /// The lean, non-positional description of an interpreter to emit. Replaces the
 /// 13-positional-param `interpreter_src(...)` signature: the diversification seeds
@@ -56,6 +56,7 @@ pub struct InterpreterSpec<'a> {
     pub is_strict: bool,
     /// The per-file diversification (perms, key, seeds, skeleton variant).
     pub diversity: &'a VmDiversity,
+    pub usage: Option<&'a crate::chunk::InstructionUsage>,
 }
 
 // ---------------------------------------------------------------------------
@@ -97,24 +98,40 @@ fn opcode_handler_body(canonical: usize) -> &'static str {
         7 => "k=S.pop();o=S.pop();S.push(o[k]);break;",
         8 => "v=S.pop();k=S.pop();o=S.pop();o[k]=v;S.push(v);break;",
         9 => "n=C[pc++];a=S.splice(S.length-n,n);S.push(a);break;",
-        10 => "n=C[pc++];obj={};base=S.length-2*n;\
-for(i=0;i<n;i++){obj[S[base+2*i]]=S[base+2*i+1];}\
-S.length=base;S.push(obj);break;",
-        11 => "n=C[pc++];a=S.splice(S.length-n,n);f=S.pop();S.push(f.apply(undefined,a));break;",
+        10 => {
+            "n=C[pc++];obj={};base=S.length-2*n;\
+for(i=0;i<n;i++){Object.defineProperty(obj,S[base+2*i],{value:S[base+2*i+1],writable:true,enumerable:true,configurable:true});}\
+S.length=base;S.push(obj);break;"
+        }
+        11 => {
+            "n=C[pc++];a=S.splice(S.length-n,n);f=S.pop();S.push(Reflect.apply(f,undefined,a));break;"
+        }
         12 => "S.push(receiver);break;",
         14 => "pc=C[pc];break;",
         15 => "t=C[pc++];if(!S.pop())pc=t;break;",
         16 => "S.pop();break;",
         17 => "S.push(S[S.length-1]);break;",
         18 => "return S.pop();",
-        19 => "n=C[pc++];a=S.splice(S.length-n,n);f=S.pop();o=S.pop();S.push(f.apply(o,a));break;",
+        19 => {
+            "n=C[pc++];a=S.splice(S.length-n,n);f=S.pop();o=S.pop();S.push(Reflect.apply(f,o,a));break;"
+        }
         25 => "throw S.pop();",
         29 => "n=C[pc++];S.push(Array.prototype.slice.call(args,n));break;",
-        30 => "o=S.pop();a=[];for(k in o)a.push(k);S.push(a);break;",
+        30 => "o=S.pop();S.push((function*(o){for(var k in o)yield k;})(o));break;",
         31 => "k=S.pop();o=S.pop();S.push(delete o[k]);break;",
         32 => "n=C[pc++];L[n]=[L[n]];break;",
         33 => "S.push(L[C[pc++]][0]);break;",
         34 => "n=C[pc++];L[n][0]=S[S.length-1];break;",
+        37 => "o=S.pop();Copy(S[S.length-1],o,[]);break;",
+        38 => "n=C[pc++];Lex(n>>>1,n&1);break;",
+        39 => "n=C[pc++];B[n](S[S.length-1]);break;",
+        40 => "n=C[pc++];v=L[n];Lex(n,B[n].c);B[n](v);break;",
+        41 => "S.push(args);break;",
+        42 => "a=S.pop();f=S.pop();o=S.pop();S.push(Reflect.apply(f,o,a));break;",
+        43 => "a=S.pop();o=S.pop();S.push(Copy({},o,a));break;",
+        44 => {
+            "if(S[S.length-1]==null)throw TypeError('Cannot destructure null or undefined');break;"
+        }
         _ => "",
     }
 }
@@ -144,8 +161,12 @@ fn opcode_handler_variant(canonical: usize, variant: usize) -> Option<&'static s
         (18, 2) => "return S.pop();",
         (15, 1) => "t=C[pc++];a=S.pop();if(!a)pc=t;break;",
         (15, 2) => "t=C[pc++];if(!S.pop())pc=t;break;",
-        (11, 1) => "n=C[pc++];a=S.splice(S.length-n,n);f=S.pop();S.push(f.apply(void 0,a));break;",
-        (11, 2) => "n=C[pc++];a=S.splice(S.length-n,n);f=S.pop();S.push(f.apply(undefined,a));break;",
+        (11, 1) => {
+            "n=C[pc++];a=S.splice(S.length-n,n);f=S.pop();S.push(Reflect.apply(f,void 0,a));break;"
+        }
+        (11, 2) => {
+            "n=C[pc++];a=S.splice(S.length-n,n);f=S.pop();S.push(Reflect.apply(f,undefined,a));break;"
+        }
         (9, 1) => "n=C[pc++];a=S.splice(S.length-n,n);S.push(a);break;",
         (9, 2) => "n=C[pc++];o=S.splice(S.length-n,n);S.push(o);break;",
         (1, 1) => "S.push(void 0);break;",
@@ -160,15 +181,23 @@ fn opcode_handler_variant(canonical: usize, variant: usize) -> Option<&'static s
 /// `GetIter` (20) is emitted by [`build_handlers`] (it interpolates the `sy` alias).
 fn eh_handler_body(canonical: usize) -> &'static str {
     match canonical {
-        21 => "it=S.pop();r=it.next();if(r.done){S.push(false);}else{S.push(r.value);S.push(true);}break;",
+        21 => {
+            "it=S.pop();r=it.next();if(r.done){S.push(false);}else{S.push(r.value);S.push(true);}break;"
+        }
         22 => "it=S.pop();m=it.return;if(m!=null)m.call(it);break;",
-        23 => "a=C[pc++];b=C[pc++];H.push([a>2e9?-1:a,b>2e9?-1:b,S.length]);break;",
+        23 => "a=C[pc++];b=C[pc++];H.push([a>2e9?-1:a,b>2e9?-1:b,S.length,P.length]);break;",
         24 => "H.pop();break;",
-        26 => "if(comp.t===1){throw comp.v;}\
+        26 => {
+            "comp=P.pop();if(comp.t===1){throw comp.v;}\
 else if(comp.t===2){if(!unwind(0)){v=comp.v;comp=NORMAL;return v;}}\
-else if(comp.t===3){if(!unwind(comp.f)){pc=comp.v;comp=NORMAL;}}break;",
+else if(comp.t===3){if(!unwind(comp.f)){pc=comp.v;comp=NORMAL;}}break;"
+        }
         27 => "comp={t:2,v:S.pop(),f:0};if(!unwind(0)){v=comp.v;comp=NORMAL;return v;}break;",
         28 => "a=C[pc++];b=C[pc++];comp={t:3,v:a,f:b};if(!unwind(b)){pc=a;comp=NORMAL;}break;",
+        45 => "P.push(comp);comp=NORMAL;break;",
+        46 => {
+            "it=S.pop();r=it.next();if(r.done){S.push(false);}else{S.push(undefined);S.push(true);}break;"
+        }
         _ => "",
     }
 }
@@ -182,8 +211,10 @@ fn junk_case_body(form: usize) -> &'static str {
         2 => "n=C[pc++];L[n]=S.length;break;",
         3 => "b=S.pop();a=S.pop();S.push(a-b);break;",
         4 => "pc=C[pc];break;",
-        5 => "n=C[pc++];cl_n=C[pc++];cl_u=[];for(j=0;j<cl_n;j++)cl_u.push(C[pc++]);\
-S.push(Mk(n,0,cl_n,cl_n,cl_u,L,receiver));break;",
+        5 => {
+            "n=C[pc++];cl_n=C[pc++];cl_u=[];for(j=0;j<cl_n;j++)cl_u.push(C[pc++]);\
+S.push(Mk(n,0,cl_n,cl_n,cl_u,L,receiver));break;"
+        }
         6 => "a=S.pop();S.push(Sd([a&65535]));break;",
         _ => "a=S.pop();b=S.pop();o=S.pop();S.push(b);S.push(a);S.push(o);break;",
     }
@@ -192,14 +223,24 @@ S.push(Mk(n,0,cl_n,cl_n,cl_u,L,receiver));break;",
 /// Build the `Bin` opcode body with per-file-permuted inner case labels, applying
 /// the Stage-3b MBA tangle on the proven-exact integer-domain ops. Operator
 /// expressions come from the ONE ISA table.
-fn bin_switch_body(div: &VmDiversity) -> String {
+fn bin_switch_body(div: &VmDiversity, usage: Option<&crate::chunk::InstructionUsage>) -> String {
     let mut s = String::from("op=C[pc++];b=S.pop();a=S.pop();switch(op){");
     for k in 0..N_BIN_OPS {
+        if usage.is_some_and(|u| !u.binary(k)) {
+            continue;
+        }
         let rendered = match div.bin_mba(k) {
-            Some(form) => bin_mba_expr(k, form),
-            None => bin_expr_js(k),
+            Some(form) => format!(
+                "typeof a==='number'&&typeof b==='number'?({}):({})",
+                bin_mba_expr(k, form),
+                bin_expr_js(k)
+            ),
+            None => bin_expr_js(k).to_string(),
         };
-        s.push_str(&format!("case {}:S.push({rendered});break;", div.bin_perm[k]));
+        s.push_str(&format!(
+            "case {}:S.push({rendered});break;",
+            div.bin_perm[k]
+        ));
     }
     s.push_str("}break;");
     s
@@ -207,10 +248,13 @@ fn bin_switch_body(div: &VmDiversity) -> String {
 
 /// Build the `Un` opcode body with per-file-permuted inner case labels. Operator
 /// expressions come from the ONE ISA table.
-fn un_switch_body(div: &VmDiversity) -> String {
+fn un_switch_body(div: &VmDiversity, usage: Option<&crate::chunk::InstructionUsage>) -> String {
     let mut s = String::from("uop=C[pc++];a=S.pop();switch(uop){");
-    for k in 0..N_UN_OPS {
-        s.push_str(&format!("case {}:S.push({});break;", div.un_perm[k], un_expr_js(k)));
+    for (k, opcode) in div.un_perm.iter().enumerate().take(N_UN_OPS) {
+        if usage.is_some_and(|u| !u.unary(k)) {
+            continue;
+        }
+        s.push_str(&format!("case {opcode}:S.push({});break;", un_expr_js(k)));
     }
     s.push_str("}break;");
     s
@@ -244,6 +288,9 @@ fn build_handlers(spec: &InterpreterSpec) -> Vec<(usize, String)> {
     let div = spec.diversity;
     let mut handlers: Vec<(usize, String)> = Vec::new();
     for (k, &label) in div.perm.iter().enumerate().take(N_OPCODES) {
+        if spec.usage.is_some_and(|u| !u.opcode(k)) {
+            continue;
+        }
         if k == 13 {
             handlers.push((
                 label,
@@ -255,11 +302,11 @@ fn build_handlers(spec: &InterpreterSpec) -> Vec<(usize, String)> {
             continue;
         }
         if k == 5 {
-            handlers.push((label, bin_switch_body(div)));
+            handlers.push((label, bin_switch_body(div, spec.usage)));
             continue;
         }
         if k == 6 {
-            handlers.push((label, un_switch_body(div)));
+            handlers.push((label, un_switch_body(div, spec.usage)));
             continue;
         }
         if spec.needs_eh && k == 20 {
@@ -286,8 +333,8 @@ S.push(Mk(n,cl_a,cl_s,cl_p,cl_u,L,receiver));break;"
             handlers.push((
                 label,
                 "n=C[pc++];cl_a=C[pc++];cl_n=C[pc++];\
-cl_u=[];for(j=0;j<cl_n;j++){t=C[pc++];cl_u.push(t===2147483646?receiver:L[t]);}\
-S.push(consts[n].apply(null,cl_u));break;"
+cl_u=[];for(j=0;j<cl_n;j++){t=C[pc++];cl_u.push(t===2147483646?receiver:Object.defineProperty({},0,Ref(L,t)));}\
+S.push(Reflect.apply(consts[n],null,cl_u));break;"
                     .to_string(),
             ));
             continue;
@@ -328,32 +375,46 @@ fn decode_init(spec: &InterpreterSpec) -> String {
     let sd_decl = format!(
         "function Sd(a){{return String.fromCharCode.apply(null,a.map(function(c){{return c^{ck};}}));}}"
     );
-    let mk_decl = format!(
-        "function Mk(idx,ar,cs,pcnt,sl,PL,prcv){{var clo=function(){{var up=[],q;\
-for(q=0;q<sl.length;q++)up.push(sl[q]===2147483647?clo:PL[sl[q]]);\
-return {name}({table}[idx][0],{table}[idx][1],arguments,up,cs,pcnt,ar?prcv:this);}};return clo;}}"
-    );
+    let used = |opcode| spec.usage.is_none_or(|usage| usage.opcode(opcode));
+    // Decoys remain emitted even when real handlers specialize away, so retain
+    // the closure helper if a decoy references it.
+    let needs_mk = used(35)
+        || div.perm[N_OPCODES..]
+            .iter()
+            .any(|&label| div.decoy_form(label) == 5);
+    let mut mk_decl = String::new();
+    if used(37) || used(43) {
+        mk_decl.push_str("function Copy(target,source,skip){if(source!=null){for(var key of Reflect.ownKeys(Object(source))){if(skip.indexOf(key)>=0)continue;var d=Object.getOwnPropertyDescriptor(source,key);if(d&&d.enumerable)Object.defineProperty(target,key,{value:source[key],writable:true,enumerable:true,configurable:true});}}return target;}");
+    }
+    if needs_mk || used(36) {
+        mk_decl.push_str("function Ref(P,n){var d=Object.getOwnPropertyDescriptor(P,n);return d&&d.get?d:{get:function(){return P[n];},set:function(v){P[n]=v;}};}");
+    }
+    if used(38) || used(40) {
+        mk_decl.push_str("function Lex(n,c){var x,ready=false;B[n]=function(v){x=v;ready=true;};B[n].c=c;Object.defineProperty(L,n,{configurable:true,get:function(){if(!ready)throw ReferenceError('Uninitialized lexical binding');return x;},set:function(v){if(!ready)throw ReferenceError('Uninitialized lexical binding');if(c)throw TypeError('Assignment to constant variable');x=v;}});}");
+    }
+    if needs_mk {
+        mk_decl.push_str(&format!(
+            "function Mk(idx,ar,cs,pcnt,sl,PL,prcv){{var up=[],q,clo;for(q=0;q<sl.length;q++)up.push(sl[q]===2147483647?{{get:function(){{return clo;}}}}:Ref(PL,sl[q]));\
+clo=ar?((...a)=>{name}({table}[idx][0],{table}[idx][1],a,up,cs,pcnt,prcv,true)):function(){{return {name}({table}[idx][0],{table}[idx][1],arguments,up,cs,pcnt,this,true);}};return clo;}}"
+        ));
+    }
     let sd_expr = format!(
         "var Sd=function(a){{return String.fromCharCode.apply(null,a.map(function(c){{return c^{ck};}}));}};"
-    );
-    let mk_expr = format!(
-        "var Mk=function(idx,ar,cs,pcnt,sl,PL,prcv){{var clo=function(){{var up=[],q;\
-for(q=0;q<sl.length;q++)up.push(sl[q]===2147483647?clo:PL[sl[q]]);\
-return {name}({table}[idx][0],{table}[idx][1],arguments,up,cs,pcnt,ar?prcv:this);}};return clo;}};"
     );
     let helpers = match variant {
         0 => format!("{sd_decl}{mk_decl}"),
         1 => format!("{mk_decl}{sd_decl}"),
-        _ => format!("{sd_expr}{mk_expr}"),
+        _ => format!("{sd_expr}{mk_decl}"),
     };
+    let code_decode = crate::serialize::code_decode_js(key);
     format!(
         "{helpers}\
-if(!code.d){{for(i=0;i<code.length;i++)code[i]^={key};code.d=1;}}C=code;\
+{code_decode}\
 if(!consts.d){{for(i=0;i<consts.length;i++){{t=consts[i];\
 if(Array.isArray(t))consts[i]=Sd(t);\
 else if(t&&t.q){{a=t.q.map(function(e){{return Array.isArray(e)?Sd(e):undefined;}});a.raw=Object.freeze(t.w.map(Sd));consts[i]=Object.freeze(a);}}}}consts.d=1;}}\
 for(i=0;i<args.length&&i<pcount;i++)L[i]=args[i];\
-for(i=0;i<caps.length;i++)L[capStart+i]=caps[i];"
+for(i=0;i<caps.length;i++){{if(live)Object.defineProperty(L,capStart+i,caps[i]);else L[capStart+i]=caps[i];}}"
     )
 }
 
@@ -368,7 +429,11 @@ pub(crate) fn interpreter_src(spec: &InterpreterSpec) -> String {
     // §5a case 2: a strict interpreter carries a leading `"use strict"` so its
     // `Store*` opcodes throw on non-writable/getter-only/frozen targets. For a sloppy
     // interpreter this is the empty string, leaving the body byte-for-byte unchanged.
-    let strict = if spec.is_strict { "\"use strict\";" } else { "" };
+    let strict = if spec.is_strict {
+        "\"use strict\";"
+    } else {
+        ""
+    };
 
     // The switch-case block (used by the switch shape AND whenever needs_eh).
     let mut cases = String::new();
@@ -382,10 +447,10 @@ pub(crate) fn interpreter_src(spec: &InterpreterSpec) -> String {
             format!("try{{{inner}}}catch(e){{comp={{t:1,v:e,f:0}};if(!unwind(0))throw e;}}");
         let outer = loop_frame(variant, &outer_body);
         format!(
-            "function {name}(code,consts,args,caps,capStart,pcount,receiver){{{strict}\
-var L=[],S=[],C=[],pc=0,i,a,b,o,k,v,f,n,t,obj,op,uop,base,r,it,m,j,cl_a,cl_s,cl_p,cl_n,cl_u,H=[],comp={{t:0,v:0,f:0}},NORMAL={{t:0,v:0,f:0}},h;\
+            "function {name}(code,consts,args,caps,capStart,pcount,receiver,live){{{strict}\
+var L=[],B=[],S=[],C=[],pc=0,i,a,b,o,k,v,f,n,t,obj,op,uop,base,r,it,m,j,cl_a,cl_s,cl_p,cl_n,cl_u,H=[],P=[],comp={{t:0,v:0,f:0}},NORMAL={{t:0,v:0,f:0}},h;\
 {decode_init}\
-function unwind(floor){{while(H.length>floor){{h=H.pop();S.length=h[2];\
+function unwind(floor){{while(H.length>floor){{h=H.pop();S.length=h[2];P.length=h[3];\
 if(comp.t===1&&h[0]>=0){{S.push(comp.v);pc=h[0];comp=NORMAL;return true;}}\
 if(h[1]>=0){{pc=h[1];return true;}}}}return false;}}\
 {outer}\
@@ -393,26 +458,15 @@ if(h[1]>=0){{pc=h[1];return true;}}}}return false;}}\
         )
     } else if div.dispatch_shape(spec.needs_eh) == 1 {
         // Stage-1a: array-of-closures dispatch (lean-only).
-        let mk_inline = format!(
-            "var mi=C[pc++],ma=C[pc++],ms=C[pc++],mp=C[pc++],mn=C[pc++],msl=[],mq,mc;\
-for(mq=0;mq<mn;mq++)msl.push(C[pc++]);\
-mc=function(){{var up=[],uq;for(uq=0;uq<msl.length;uq++)up.push(msl[uq]===2147483647?mc:L[msl[uq]]);\
-return {name}({}[mi][0],{}[mi][1],arguments,up,ms,mp,ma?receiver:this);}};S.push(mc);",
-            spec.table, spec.table
-        );
         let mut build = String::from("var F=[],dn=0,rv;");
         for (label, body) in &handlers {
-            let cb = if body.contains("Mk(n,cl_a,cl_s,cl_p,cl_u,L,receiver)") {
-                mk_inline.clone()
-            } else {
-                to_closure_body(body, "dn", "rv")
-            };
+            let cb = to_closure_body(body, "dn", "rv");
             build.push_str(&format!("F[{label}]=function(){{{cb}}};"));
         }
         let lean = loop_frame(variant, "F[C[pc++]]();if(dn)return rv;");
         format!(
-            "function {name}(code,consts,args,caps,capStart,pcount,receiver){{{strict}\
-var L=[],S=[],C=[],pc=0,i,a,b,o,k,v,f,n,t,obj,op,uop,base,j,cl_a,cl_s,cl_p,cl_n,cl_u;\
+            "function {name}(code,consts,args,caps,capStart,pcount,receiver,live){{{strict}\
+var L=[],B=[],S=[],C=[],pc=0,i,a,b,o,k,v,f,n,t,obj,op,uop,base,j,cl_a,cl_s,cl_p,cl_n,cl_u;\
 {decode_init}\
 {build}\
 {lean}\
@@ -421,8 +475,8 @@ var L=[],S=[],C=[],pc=0,i,a,b,o,k,v,f,n,t,obj,op,uop,base,j,cl_a,cl_s,cl_p,cl_n,
     } else {
         let lean = loop_frame(variant, &format!("switch(C[pc++]){{{cases}}}"));
         format!(
-            "function {name}(code,consts,args,caps,capStart,pcount,receiver){{{strict}\
-var L=[],S=[],C=[],pc=0,i,a,b,o,k,v,f,n,t,obj,op,uop,base,j,cl_a,cl_s,cl_p,cl_n,cl_u;\
+            "function {name}(code,consts,args,caps,capStart,pcount,receiver,live){{{strict}\
+var L=[],B=[],S=[],C=[],pc=0,i,a,b,o,k,v,f,n,t,obj,op,uop,base,j,cl_a,cl_s,cl_p,cl_n,cl_u;\
 {decode_init}\
 {lean}\
 }}"
@@ -444,14 +498,14 @@ pub fn emit_interpreter(spec: &InterpreterSpec) -> mangler_core::Result<Stmt> {
     let program = ast.into_program();
     let stmt = match program {
         swc_core::ecma::ast::Program::Script(s) => s.body.into_iter().next(),
-        swc_core::ecma::ast::Program::Module(m) => {
-            m.body.into_iter().find_map(|it| match it {
-                swc_core::ecma::ast::ModuleItem::Stmt(s) => Some(s),
-                _ => None,
-            })
-        }
+        swc_core::ecma::ast::Program::Module(m) => m.body.into_iter().find_map(|it| match it {
+            swc_core::ecma::ast::ModuleItem::Stmt(s) => Some(s),
+            _ => None,
+        }),
     };
-    stmt.ok_or_else(|| mangler_core::Error::transform("vm-emit", "interpreter produced no statement"))
+    stmt.ok_or_else(|| {
+        mangler_core::Error::transform("vm-emit", "interpreter produced no statement")
+    })
 }
 
 #[cfg(test)]
@@ -460,27 +514,57 @@ mod tests {
     use crate::diversity::VmDiversity;
 
     fn spec_for<'a>(div: &'a VmDiversity, needs_eh: bool) -> InterpreterSpec<'a> {
-        InterpreterSpec { name: "V", table: "T", rc: "rc", sy: "sy", needs_eh, is_strict: false, diversity: div }
+        InterpreterSpec {
+            name: "V",
+            table: "T",
+            rc: "rc",
+            sy: "sy",
+            needs_eh,
+            is_strict: false,
+            diversity: div,
+            usage: None,
+        }
     }
 
     fn spec_for_strict<'a>(div: &'a VmDiversity, needs_eh: bool) -> InterpreterSpec<'a> {
-        InterpreterSpec { name: "V", table: "T", rc: "rc", sy: "sy", needs_eh, is_strict: true, diversity: div }
+        InterpreterSpec {
+            name: "V",
+            table: "T",
+            rc: "rc",
+            sy: "sy",
+            needs_eh,
+            is_strict: true,
+            diversity: div,
+            usage: None,
+        }
     }
 
     #[test]
     fn lean_interpreter_reparses_and_has_no_eh() {
         let div = VmDiversity::baseline(2);
         let src = interpreter_src(&spec_for(&div, false));
-        assert!(!src.contains("catch") && !src.contains("H=[]"), "lean has no EH:\n{src}");
-        assert!(Js::reparse(&src, &ParseOpts::default()).is_ok(), "lean reparses:\n{src}");
+        assert!(
+            !src.contains("catch") && !src.contains("H=[]"),
+            "lean has no EH:\n{src}"
+        );
+        assert!(
+            Js::reparse(&src, &ParseOpts::default()).is_ok(),
+            "lean reparses:\n{src}"
+        );
     }
 
     #[test]
     fn eh_interpreter_reparses_and_has_eh() {
         let div = VmDiversity::baseline(2);
         let src = interpreter_src(&spec_for(&div, true));
-        assert!(src.contains("catch") && src.contains("H=[]"), "EH carries machinery");
-        assert!(Js::reparse(&src, &ParseOpts::default()).is_ok(), "EH reparses:\n{src}");
+        assert!(
+            src.contains("catch") && src.contains("H=[]"),
+            "EH carries machinery"
+        );
+        assert!(
+            Js::reparse(&src, &ParseOpts::default()).is_ok(),
+            "EH reparses:\n{src}"
+        );
     }
 
     /// Every skeleton/dispatch variant the diversity space can select must reparse.
@@ -517,7 +601,10 @@ mod tests {
                     &sloppy[brace + 1..]
                 );
                 assert_eq!(strict, expected, "seed {seed} eh {needs_eh}");
-                assert!(strict.contains("\"use strict\""), "strict carries the directive");
+                assert!(
+                    strict.contains("\"use strict\""),
+                    "strict carries the directive"
+                );
                 assert!(
                     Js::reparse(&strict, &ParseOpts::default()).is_ok(),
                     "strict reparses:\n{strict}"

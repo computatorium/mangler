@@ -8,8 +8,10 @@ description = "Intent-vs-tuning config split, single-source clap+serde flags, de
 clap = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
-rand = { workspace = true }
 glob = { workspace = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+rand = { workspace = true, features = ["thread_rng"] }
 
 [dev-dependencies]
 toml = { workspace = true }

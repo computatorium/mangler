@@ -14,3 +14,4 @@ swc_core = { workspace = true }
 
 [dev-dependencies]
 mangler-testkit = { workspace = true }
+serde_json = { workspace = true }

@@ -220,11 +220,9 @@ pub struct VirtualizeConfig {
     pub target: Option<String>,
     /// Protection gate: every matching source function must be virtualized.
     pub required: Option<String>,
-    /// NEW (Phase 1): wrap the ENTIRE top-level program body as one synthetic VM
-    /// chunk (all-or-nothing — if it compiles the whole top level is virtualized,
-    /// else the program is left native). Opt-in; never a preset default. When set,
-    /// `target` is ignored. Bail-to-safe: a program that cannot compile (or that
-    /// contains `import`/`export`) is left entirely native.
+    /// Virtualize top-level execution while retaining native binding and module
+    /// boundaries. When set, `target` is ignored; `required` still enforces source
+    /// function coverage.
     pub whole_program: bool,
     /// Glob matching function names to KEEP NATIVE (exclude from virtualization).
     /// `None` = no exclusions. Evaluated after `target`: a function must match

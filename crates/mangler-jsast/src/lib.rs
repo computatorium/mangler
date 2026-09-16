@@ -1,13 +1,9 @@
 //! `mangler-jsast` — the JS/TS Language implementation over swc, plus the ONE
 //! reusable traversal/rewrite layer and the ONE AST-builder codegen discipline.
 //!
-//! This crate exists to kill two recurring sources of churn in the legacy code:
-//! ~19 bespoke `VisitMut` visitors (each re-deriving post-order descent and the
-//! `inside_core_init` protected-subtree guard), and the string-template /
-//! Rust-mirror sync problem (runtime JS written as `format!` templates kept by
-//! hand in lockstep with their Rust mirrors). Everything WP4 (vm) and WP6 (passes)
-//! emit is built through this crate; no pass hand-rolls a visitor or a node-builder
-//! again.
+//! Shared parsing, binding analysis, AST construction, traversal and final
+//! code generation. Compiler passes use these mechanisms to preserve source
+//! identity, resolver contexts and runtime provenance across transformations.
 //!
 //! ## Module map
 //!
@@ -26,16 +22,26 @@
 //!   `assign`, `ternary`, …).
 //! * [`codegen`] — the typed runtime-code builder (function/loop builders) and the
 //!   canonical [`djb2_fn`](codegen::djb2_fn) emitted from one place.
+//! * [`deep`] — heap-backed cloning and traversal of generated expression chains.
 //! * [`span`] — the single [`injected_span`](span::injected_span) seam.
 //! * [`analysis`] — the shared scope/binding/eligibility predicates.
 
 pub mod analysis;
+mod annex_b;
+pub mod assignment_target;
 pub mod build;
+mod callable_names;
 mod class_scope;
 pub mod codegen;
+mod compression_guards;
+pub mod deep;
 pub mod directives;
 pub mod lang;
+mod pattern_elisions;
 pub mod rewrite;
+mod scope_bindings;
 pub mod span;
+mod switch_scope;
+pub use switch_scope::SuspensionDeclarations as SwitchSuspensionDeclarations;
 
-pub use lang::{Ast, Js, ParseOpts};
+pub use lang::{Ast, Js, ParseGoal, ParseOpts};

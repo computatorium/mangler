@@ -62,6 +62,7 @@ pub mod config;
 pub mod opaque;
 pub mod passes;
 pub mod runner;
+pub mod runtime_frontend;
 pub mod seed;
 pub mod selfdefend;
 

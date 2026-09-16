@@ -125,8 +125,10 @@ impl Pass<Js, FileConfig> for IdNamesPass {
         let mut reserved = ReservedNames {
             keep: &keep,
             names: HashSet::new(),
+            bindings: HashSet::new(),
         };
         ast.program().visit_with(&mut reserved);
+        let preserved = reserved.bindings;
         let mut reserved: Vec<String> = reserved.names.into_iter().collect();
         reserved.sort();
 
@@ -137,6 +139,7 @@ impl Pass<Js, FileConfig> for IdNamesPass {
             unresolved_mark,
             top_level_mark,
             &keep_globs,
+            &preserved,
         );
 
         // The terminal codegen reads this to decide swc-mangle on/off and which
@@ -164,6 +167,7 @@ fn rename(
     unresolved_mark: Mark,
     top_level_mark: Mark,
     keep_globs: &[String],
+    preserved: &HashSet<Id>,
 ) -> bool {
     let scheme = match cfg.resolved().passes.mangle.naming {
         // `Short` defers to swc's built-in short-name mangle.
@@ -189,6 +193,7 @@ fn rename(
         reserved: HashSet::new(),
         eval_or_with: false,
         keep: &keep,
+        preserved,
     };
     program.visit_with(&mut collector);
 
@@ -261,9 +266,84 @@ impl KeepSet {
 struct ReservedNames<'a> {
     keep: &'a KeepSet,
     names: HashSet<String>,
+    bindings: HashSet<Id>,
+}
+
+fn anonymous_definition(expression: &Expr) -> bool {
+    match expression {
+        Expr::Arrow(_)
+        | Expr::Fn(FnExpr { ident: None, .. })
+        | Expr::Class(ClassExpr { ident: None, .. }) => true,
+        Expr::Paren(parenthesized) => anonymous_definition(&parenthesized.expr),
+        _ => false,
+    }
+}
+
+impl ReservedNames<'_> {
+    fn preserve(&mut self, identifier: &Ident) {
+        self.names.insert(identifier.sym.to_string());
+        self.bindings.insert(identifier.to_id());
+    }
 }
 
 impl Visit for ReservedNames<'_> {
+    fn visit_fn_decl(&mut self, function: &FnDecl) {
+        self.preserve(&function.ident);
+        function.visit_children_with(self);
+    }
+    fn visit_fn_expr(&mut self, function: &FnExpr) {
+        if let Some(name) = &function.ident {
+            self.preserve(name);
+        }
+        function.visit_children_with(self);
+    }
+    fn visit_class_decl(&mut self, class: &ClassDecl) {
+        self.preserve(&class.ident);
+        class.visit_children_with(self);
+    }
+    fn visit_class_expr(&mut self, class: &ClassExpr) {
+        if let Some(name) = &class.ident {
+            self.preserve(name);
+        }
+        class.visit_children_with(self);
+    }
+    fn visit_var_declarator(&mut self, declaration: &VarDeclarator) {
+        if let (Pat::Ident(binding), Some(value)) = (&declaration.name, &declaration.init)
+            && anonymous_definition(value)
+        {
+            self.preserve(&binding.id);
+        }
+        declaration.visit_children_with(self);
+    }
+    fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
+        if matches!(
+            assignment.op,
+            AssignOp::Assign | AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign
+        ) && anonymous_definition(&assignment.right)
+            && let AssignTarget::Simple(SimpleAssignTarget::Ident(binding)) = &assignment.left
+        {
+            self.preserve(&binding.id);
+        }
+        assignment.visit_children_with(self);
+    }
+    fn visit_assign_pat(&mut self, pattern: &AssignPat) {
+        if anonymous_definition(&pattern.right)
+            && let Pat::Ident(binding) = &*pattern.left
+        {
+            self.preserve(&binding.id);
+        }
+        pattern.visit_children_with(self);
+    }
+    fn visit_assign_pat_prop(&mut self, pattern: &AssignPatProp) {
+        if pattern
+            .value
+            .as_ref()
+            .is_some_and(|value| anonymous_definition(value))
+        {
+            self.preserve(&pattern.key.id);
+        }
+        pattern.visit_children_with(self);
+    }
     fn visit_ident(&mut self, ident: &Ident) {
         if self.keep.matches(ident.sym.as_ref()) {
             self.names.insert(ident.sym.to_string());
@@ -325,6 +405,8 @@ struct Collector<'a> {
     /// Names to PRESERVE (`--keep-names`): a local whose symbol matches a keep
     /// glob is never collected for renaming, so it keeps its source name.
     keep: &'a KeepSet,
+    /// Bindings whose spelling supplies an observable function or class name.
+    preserved: &'a HashSet<Id>,
 }
 
 impl Visit for Collector<'_> {
@@ -355,7 +437,9 @@ impl Visit for Collector<'_> {
         self.reserved.insert(n.sym.clone());
         // A --keep-names match is preserved: reserve its name (so other renamed
         // locals avoid it) but never collect it as a rename target.
-        if !self.keep.is_empty() && self.keep.matches(n.sym.as_ref()) {
+        if self.preserved.contains(&n.to_id())
+            || (!self.keep.is_empty() && self.keep.matches(n.sym.as_ref()))
+        {
             return;
         }
         if is_local(n.ctxt, self.unresolved_mark, self.top_level_mark) {

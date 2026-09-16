@@ -1,0 +1,20 @@
+[package]
+name = "mangler-eval"
+version = "0.2.0"
+edition = "2024"
+description = "Optional synchronous WebAssembly frontend for the shared Mangler VM compiler."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "mangler-eval-runtime"
+path = "src/main.rs"
+
+[dependencies]
+mangler-core = { workspace = true }
+mangler-jsast = { workspace = true }
+mangler-js = { workspace = true }
+mangler-vm = { workspace = true }
+swc_core = { workspace = true }
+serde_json = "1"

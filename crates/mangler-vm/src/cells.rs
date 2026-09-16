@@ -53,6 +53,18 @@ use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 use mangler_jsast::analysis::{binding_names, is_direct_eval_callee};
 
+fn walk_binary_chain_mut<V: VisitMut>(binary: &mut BinExpr, visitor: &mut V) {
+    let mut pending: Vec<&mut Expr> = vec![&mut binary.right, &mut binary.left];
+    while let Some(expr) = pending.pop() {
+        if let Expr::Bin(binary) = expr {
+            pending.push(&mut binary.right);
+            pending.push(&mut binary.left);
+        } else {
+            expr.visit_mut_with(visitor);
+        }
+    }
+}
+
 /// Returns true if `name` matches `glob`. Invalid globs match nothing. (Ported
 /// from the legacy `matcher::matches`; the VM's only consumer of glob matching.)
 fn glob_matches(glob: &str, name: &str) -> bool {
@@ -63,31 +75,20 @@ fn glob_matches(glob: &str, name: &str) -> bool {
 
 /// True if a block body begins with its own `"use strict"` directive. Mirrors the
 /// legacy `virtualize::has_use_strict_directive`, kept local to the VM crate.
-fn has_use_strict_directive(body: &BlockStmt) -> bool {
-    for s in &body.stmts {
-        match s {
-            Stmt::Expr(es) => match &*es.expr {
-                Expr::Lit(Lit::Str(lit)) => {
-                    if lit.value.as_str() == Some("use strict") {
-                        return true;
-                    }
-                    // another directive (e.g. "use asm") — keep scanning the prologue
-                }
-                _ => return false, // first non-string-literal expr ends the prologue
-            },
-            _ => return false, // first non-expr statement ends the prologue
-        }
-    }
-    false
+fn has_use_strict_directive(body: &FunctionBody) -> bool {
+    mangler_jsast::directives::has_use_strict(&body.stmts)
 }
 
 /// True if `body` introduces dynamic scope the rewrite cannot model — a `with`
 /// statement or a direct `eval(...)` anywhere in it (including nested functions,
 /// which could `eval` into F's scope). Mirrors `analysis::has_dynamic_scope` but
 /// operates on a `BlockStmt` (the shared predicate takes a whole `Program`).
-fn block_has_dynamic_scope(body: &BlockStmt) -> bool {
+fn block_has_dynamic_scope(body: &FunctionBody) -> bool {
     struct V(bool);
     impl Visit for V {
+        fn visit_bin_expr(&mut self, n: &BinExpr) {
+            crate::compile::walk_binary_chain(n, self);
+        }
         fn visit_with_stmt(&mut self, n: &WithStmt) {
             self.0 = true;
             n.visit_children_with(self);
@@ -132,7 +133,10 @@ impl BoxPlan {
 /// consider boxing for inner functions the pass will actually virtualize.
 pub fn plan_and_rewrite(program: &mut Program, glob: &str) -> BoxPlan {
     let mut plan = BoxPlan::default();
-    let mut v = Driver { glob, plan: &mut plan };
+    let mut v = Driver {
+        glob,
+        plan: &mut plan,
+    };
     program.visit_mut_with(&mut v);
     plan
 }
@@ -146,6 +150,9 @@ struct Driver<'a> {
 }
 
 impl VisitMut for Driver<'_> {
+    fn visit_mut_bin_expr(&mut self, n: &mut BinExpr) {
+        walk_binary_chain_mut(n, self);
+    }
     fn visit_mut_function(&mut self, f: &mut Function) {
         // Analyze this function AS AN ENCLOSING scope first (so a boxed binding's
         // own body is rewritten), then recurse so deeper nestings are handled too.
@@ -158,7 +165,7 @@ impl VisitMut for Driver<'_> {
     // is handled the same way when it is a block. (An expression-bodied arrow has
     // no statements to rewrite and no `var`/`let` to box, so it is skipped.)
     fn visit_mut_arrow_expr(&mut self, a: &mut ArrowExpr) {
-        if let BlockStmtOrExpr::BlockStmt(body) = &mut *a.body {
+        if let ArrowFunctionBody::FunctionBody(body) = &mut *a.body {
             // Arrows have their own param list (`Pat`, not `Param`); D1 does not box
             // params, so an empty param slice keeps the param-exclusion conservative.
             analyze_enclosing(&[], body, self.glob, self.plan);
@@ -170,7 +177,7 @@ impl VisitMut for Driver<'_> {
 /// Analyze one enclosing function body `F` and, if any of its bindings are
 /// safely boxable, rewrite the body in place and record the per-inner-fn boxed
 /// sets in `plan`.
-fn analyze_enclosing(params: &[Param], body: &mut BlockStmt, glob: &str, plan: &mut BoxPlan) {
+fn analyze_enclosing(params: &[Param], body: &mut FunctionBody, glob: &str, plan: &mut BoxPlan) {
     // 0. Dynamic scope (with / direct eval) anywhere in F defeats static reasoning.
     if block_has_dynamic_scope(body) {
         return;
@@ -211,7 +218,9 @@ fn analyze_enclosing(params: &[Param], body: &mut BlockStmt, glob: &str, plan: &
 
         // 3. Names written somewhere F can see them: F's own body writes + inner-fn
         //    writes. (Read-only captures are never boxed.)
-        let mut writes = WriteScan { written: HashSet::new() };
+        let mut writes = WriteScan {
+            written: HashSet::new(),
+        };
         body.visit_with(&mut writes);
 
         // 4. Decide the boxed set for F. A candidate name `x` is boxed iff:
@@ -264,7 +273,12 @@ fn analyze_enclosing(params: &[Param], body: &mut BlockStmt, glob: &str, plan: &
             .virt
             .iter()
             .filter(|g| !g.captures.is_disjoint(&boxed))
-            .map(|g| (g.body_pos, g.captures.intersection(&boxed).cloned().collect()))
+            .map(|g| {
+                (
+                    g.body_pos,
+                    g.captures.intersection(&boxed).cloned().collect(),
+                )
+            })
             .collect();
         let mut verify = CompileVerify {
             want: &consumer_boxed,
@@ -317,11 +331,13 @@ struct DeclScan {
 }
 
 impl DeclScan {
-    fn scan_body_top_level(&mut self, body: &BlockStmt) {
+    fn scan_body_top_level(&mut self, body: &FunctionBody) {
         // `var` is function-scoped: collect from the whole body (including nested
         // blocks, but NOT nested functions). `let`/`const` only at the body's top
         // statement level (a nested-block `let` is a different scope we don't box).
-        let mut vars = VarScan { names: HashSet::new() };
+        let mut vars = VarScan {
+            names: HashSet::new(),
+        };
         body.visit_with(&mut vars);
         self.var_names = vars.names;
 
@@ -383,6 +399,9 @@ impl ShadowScan<'_> {
     }
 }
 impl Visit for ShadowScan<'_> {
+    fn visit_bin_expr(&mut self, n: &BinExpr) {
+        crate::compile::walk_binary_chain(n, self);
+    }
     fn visit_block_stmt(&mut self, b: &BlockStmt) {
         let prev = self.top_level;
         self.top_level = false;
@@ -437,6 +456,9 @@ struct VarScan {
     names: HashSet<String>,
 }
 impl Visit for VarScan {
+    fn visit_bin_expr(&mut self, n: &BinExpr) {
+        crate::compile::walk_binary_chain(n, self);
+    }
     fn visit_var_decl(&mut self, v: &VarDecl) {
         if matches!(v.kind, VarDeclKind::Var) {
             for d in &v.decls {
@@ -507,7 +529,7 @@ impl InnerScan {
 
     /// Collect a function's body free-name refs/writes (its capture set), with its
     /// own params+locals excluded.
-    fn scan_fn_refs(params: &[Param], body: &BlockStmt) -> FreeRefScan {
+    fn scan_fn_refs(params: &[Param], body: &FunctionBody) -> FreeRefScan {
         let mut cap = FreeRefScan::new(params);
         cap.collect_locals(body);
         body.visit_with(&mut cap);
@@ -516,6 +538,9 @@ impl InnerScan {
 }
 
 impl Visit for InnerScan {
+    fn visit_bin_expr(&mut self, n: &BinExpr) {
+        crate::compile::walk_binary_chain(n, self);
+    }
     // `InnerScan` looks ONLY at the functions directly nested in F (one level); it
     // does NOT recurse into their bodies, because the `Driver` visits every function
     // as a candidate enclosing scope in its own right (so a doubly-nested candidate
@@ -526,8 +551,7 @@ impl Visit for InnerScan {
         let name = n.ident.sym.to_string();
         let Some(body) = &n.function.body else { return };
         let cap = Self::scan_fn_refs(&n.function.params, body);
-        if InnerScan::is_virtualizable(Some(&name), &n.function)
-            && glob_matches(&self.glob, &name)
+        if InnerScan::is_virtualizable(Some(&name), &n.function) && glob_matches(&self.glob, &name)
         {
             self.virt.push(VirtFn {
                 body_pos: body.span.lo,
@@ -541,11 +565,9 @@ impl Visit for InnerScan {
         let name = n.ident.as_ref().map(|i| i.sym.to_string());
         let Some(body) = &n.function.body else { return };
         let cap = Self::scan_fn_refs(&n.function.params, body);
-        let virt = name
-            .as_deref()
-            .is_some_and(|nm| {
-                InnerScan::is_virtualizable(Some(nm), &n.function) && glob_matches(&self.glob, nm)
-            });
+        let virt = name.as_deref().is_some_and(|nm| {
+            InnerScan::is_virtualizable(Some(nm), &n.function) && glob_matches(&self.glob, nm)
+        });
         if virt {
             self.virt.push(VirtFn {
                 body_pos: body.span.lo,
@@ -560,11 +582,11 @@ impl Visit for InnerScan {
         let mut cap = FreeRefScan::new(&[]);
         cap.collect_arrow_params(&n.params);
         match &*n.body {
-            BlockStmtOrExpr::BlockStmt(body) => {
+            ArrowFunctionBody::FunctionBody(body) => {
                 cap.collect_locals(body);
                 body.visit_with(&mut cap);
             }
-            BlockStmtOrExpr::Expr(e) => e.visit_with(&mut cap),
+            ArrowFunctionBody::Expr(e) => e.visit_with(&mut cap),
         }
         self.non_virt_refs.extend(cap.refs);
     }
@@ -573,7 +595,8 @@ impl Visit for InnerScan {
     // intercepted above before this fires.)
     fn visit_function(&mut self, f: &Function) {
         if let Some(body) = &f.body {
-            self.non_virt_refs.extend(Self::scan_fn_refs(&f.params, body).refs);
+            self.non_virt_refs
+                .extend(Self::scan_fn_refs(&f.params, body).refs);
         }
     }
 }
@@ -598,6 +621,9 @@ impl CompileVerify<'_> {
     }
 }
 impl Visit for CompileVerify<'_> {
+    fn visit_bin_expr(&mut self, n: &BinExpr) {
+        crate::compile::walk_binary_chain(n, self);
+    }
     fn visit_function(&mut self, f: &Function) {
         self.check(f);
         f.visit_children_with(self);
@@ -625,7 +651,10 @@ impl FreeRefScan {
                 local.insert(id.sym.to_string());
             });
         }
-        FreeRefScan { local, refs: HashSet::new() }
+        FreeRefScan {
+            local,
+            refs: HashSet::new(),
+        }
     }
     fn note_ref(&mut self, name: &str) {
         if !self.local.contains(name) {
@@ -641,8 +670,10 @@ impl FreeRefScan {
     /// conservatively treating every locally-declared name as non-free). This runs
     /// before the ref walk so an assignment to a local is not mistaken for a
     /// capture write.
-    fn collect_locals(&mut self, body: &BlockStmt) {
-        let mut d = LocalDeclScan { names: std::mem::take(&mut self.local) };
+    fn collect_locals(&mut self, body: &FunctionBody) {
+        let mut d = LocalDeclScan {
+            names: std::mem::take(&mut self.local),
+        };
         body.visit_with(&mut d);
         self.local = d.names;
     }
@@ -658,6 +689,9 @@ impl FreeRefScan {
 }
 
 impl Visit for FreeRefScan {
+    fn visit_bin_expr(&mut self, n: &BinExpr) {
+        crate::compile::walk_binary_chain(n, self);
+    }
     fn visit_assign_expr(&mut self, n: &AssignExpr) {
         match &n.left {
             AssignTarget::Simple(SimpleAssignTarget::Ident(bi)) => {
@@ -772,6 +806,9 @@ struct LocalDeclScan {
     names: HashSet<String>,
 }
 impl Visit for LocalDeclScan {
+    fn visit_bin_expr(&mut self, n: &BinExpr) {
+        crate::compile::walk_binary_chain(n, self);
+    }
     fn visit_var_decl(&mut self, v: &VarDecl) {
         for d in &v.decls {
             binding_names(&d.name, &mut |id| {
@@ -837,6 +874,9 @@ impl WriteScan {
     }
 }
 impl Visit for WriteScan {
+    fn visit_bin_expr(&mut self, n: &BinExpr) {
+        crate::compile::walk_binary_chain(n, self);
+    }
     fn visit_assign_expr(&mut self, n: &AssignExpr) {
         match &n.left {
             AssignTarget::Simple(SimpleAssignTarget::Ident(bi)) => {
@@ -900,7 +940,7 @@ impl Visit for WriteScan {
 /// nested scope shadows (the boxed name is F's; the rewrite is keyed by name and we
 /// have already bailed on any same-name shadow, so a bare `x` everywhere in F's own
 /// statements unambiguously refers to the boxed binding).
-fn rewrite_boxed(body: &mut BlockStmt, boxed: &HashSet<String>) {
+fn rewrite_boxed(body: &mut FunctionBody, boxed: &HashSet<String>) {
     let mut rw = CellRewriter { boxed };
     body.visit_mut_with(&mut rw);
 }
@@ -928,6 +968,9 @@ impl CellRewriter<'_> {
 }
 
 impl VisitMut for CellRewriter<'_> {
+    fn visit_mut_bin_expr(&mut self, n: &mut BinExpr) {
+        walk_binary_chain_mut(n, self);
+    }
     // Stop at a nested function/arrow: its body is a different scope. A virtualized
     // inner captures the cell via the bare name (handled by the thunk), and a
     // non-virtualized inner referencing a boxed name was already bailed out of the
@@ -942,14 +985,20 @@ impl VisitMut for CellRewriter<'_> {
         if let Pat::Ident(bi) = &d.name
             && self.boxed.contains(bi.id.sym.as_ref())
         {
-            let init = d.init.take().unwrap_or_else(|| Box::new(undef_expr(bi.id.span)));
+            let init = d
+                .init
+                .take()
+                .unwrap_or_else(|| Box::new(undef_expr(bi.id.span)));
             // Rewrite inside the initializer FIRST (it runs in F's scope and may
             // reference other boxed names), then wrap it in a one-element array.
             let mut init = init;
             init.visit_mut_with(self);
             d.init = Some(Box::new(Expr::Array(ArrayLit {
                 span: bi.id.span,
-                elems: vec![Some(ExprOrSpread { spread: None, expr: init })],
+                elems: vec![Some(ExprOrSpread {
+                    spread: None,
+                    expr: init,
+                })],
             })));
             return;
         }
@@ -1056,9 +1105,9 @@ mod tests {
     use swc_core::common::sync::Lrc;
     use swc_core::common::{FileName, SourceMap};
     use swc_core::ecma::ast::EsVersion;
-    use swc_core::ecma::codegen::text_writer::JsWriter;
     use swc_core::ecma::codegen::Emitter;
-    use swc_core::ecma::parser::{lexer::Lexer, EsSyntax, Parser, StringInput, Syntax};
+    use swc_core::ecma::codegen::text_writer::JsWriter;
+    use swc_core::ecma::parser::{EsSyntax, Parser, StringInput, Syntax, lexer::Lexer};
 
     fn parse(src: &str) -> Program {
         let cm: Lrc<SourceMap> = Default::default();
@@ -1104,7 +1153,10 @@ mod tests {
             "inc",
         );
         assert!(boxed >= 1, "`c` must be boxed: {out}");
-        assert!(out.contains("var c = [") || out.contains("var c=["), "decl cell-ified: {out}");
+        assert!(
+            out.contains("var c = [") || out.contains("var c=["),
+            "decl cell-ified: {out}"
+        );
         assert!(out.contains("c[0]"), "reads/writes cell-ified: {out}");
     }
 
@@ -1133,10 +1185,7 @@ mod tests {
     #[test]
     fn top_level_binding_not_boxed() {
         // A module-top-level `var c` is never rewritten (externally referenceable).
-        let (_out, boxed) = run(
-            "var c=0; function inc(){ c=c+1; return c; }",
-            "inc",
-        );
+        let (_out, boxed) = run("var c=0; function inc(){ c=c+1; return c; }", "inc");
         assert_eq!(boxed, 0, "top-level binding must never be boxed");
     }
 
@@ -1149,7 +1198,10 @@ mod tests {
              function other(){ return c; } return inc()+other(); }",
             "inc",
         );
-        assert_eq!(boxed, 0, "a non-virtualized sibling capture must block boxing");
+        assert_eq!(
+            boxed, 0,
+            "a non-virtualized sibling capture must block boxing"
+        );
     }
 
     #[test]

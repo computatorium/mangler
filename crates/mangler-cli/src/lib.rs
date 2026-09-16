@@ -18,6 +18,7 @@
 pub mod config;
 pub mod engine;
 pub mod io;
+pub mod syntax;
 
 pub use engine::{Engine, Input, Output, Stats};
 pub use mangler_config::{ConfigFlags, ResolvedConfig};
@@ -83,6 +84,11 @@ pub struct Cli {
     #[arg(long)]
     pub keep_going: bool,
 
+    /// Check one JS input with the exact Script or Module grammar and emit a
+    /// JSON diagnostic. No transforms or source execution are performed.
+    #[arg(long, value_enum, conflicts_with_all = ["output", "in_place", "config", "keep_going"])]
+    pub check_syntax: Option<syntax::SyntaxGoal>,
+
     /// The shared obfuscation flags (also settable via --config TOML).
     #[command(flatten)]
     pub flags: ConfigFlags,
@@ -134,6 +140,9 @@ where
 /// the size report, and writing outputs. Inputs and outputs are held only for a
 /// worker-sized batch; the engine owns the single parallel scheduling mechanism.
 fn try_run(cli: Cli) -> anyhow::Result<bool> {
+    if let Some(goal) = cli.check_syntax {
+        return syntax::run(&cli, goal);
+    }
     let config = config::resolve(cli.flags.clone(), cli.config.as_deref())?;
     if cli.jobs == Some(0) {
         anyhow::bail!("--jobs must be at least 1");

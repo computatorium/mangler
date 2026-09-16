@@ -176,7 +176,7 @@ mod tests {
             ctxt: SyntaxContext::empty(),
             stmts,
         };
-        emit_block(&b)
+        emit_block(&b.stmts)
     }
 
     fn helpers_for(seed: u64) -> TdzHelpers {

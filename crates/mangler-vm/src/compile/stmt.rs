@@ -13,8 +13,9 @@ use mangler_jsast::analysis::binding_names;
 
 pub(crate) fn emit_block_scope(cx: &mut Cx<'_>, stmts: &[Stmt]) {
     cx.push_scope();
-    let lows = direct_block_bindings(stmts);
-    bind_lows_in_scope(cx, &lows);
+    let bindings = direct_block_bindings(stmts);
+    bind_declarations_in_scope(cx, &bindings);
+    emit_block_function_declarations(cx, stmts);
     for s in stmts {
         emit_stmt(cx, s);
         if cx.bailed() {
@@ -30,7 +31,7 @@ pub(crate) fn emit_stmt(cx: &mut Cx<'_>, stmt: &Stmt) {
     }
     match stmt {
         Stmt::Block(b) => emit_block_scope(cx, &b.stmts),
-        Stmt::Empty(_) => {}
+        Stmt::Empty(_) | Stmt::Debugger(_) => {}
         Stmt::Decl(Decl::Var(v)) => {
             let was_initializing = cx.initializing;
             cx.initializing = false;
@@ -49,12 +50,22 @@ pub(crate) fn emit_stmt(cx: &mut Cx<'_>, stmt: &Stmt) {
                             // (`const render = () => …`) so the native-closure divert
                             // can match the exclude glob.
                             cx.pending_fn_name = Some(name.to_string());
+                            let dynamic = v.kind == VarDeclKind::Var && binding_has_with(cx, name);
+                            if dynamic {
+                                emit_binding_ref(cx, name);
+                                cx.emit(Instr::ResolveRef);
+                            }
                             if let Some(init) = &d.init {
                                 emit_expr(cx, init);
                             } else {
                                 cx.emit(Instr::PushUndef);
                             }
                             cx.pending_fn_name = None;
+                            if dynamic {
+                                cx.emit(Instr::PutRef);
+                                cx.emit(Instr::Pop);
+                                continue;
+                            }
                             cx.emit(if v.kind != VarDeclKind::Var {
                                 Instr::InitLocal(slot)
                             } else if celled {
@@ -118,12 +129,34 @@ pub(crate) fn emit_stmt(cx: &mut Cx<'_>, stmt: &Stmt) {
         Stmt::Expr(es) => {
             emit_expr_stmt(cx, &es.expr);
         }
-        // D5: a top-level `function f(){…}` declaration was already hoisted (its
-        // closure built and stored into `f`'s slot) before the body emission loop —
-        // see the fn-decl hoisting prologue in `compile_body_inner`. So at its
-        // textual position it is a no-op. (A block-nested fn-decl never reaches here:
-        // `check_no_nested_block_fn_decls` bailed the whole function.)
-        Stmt::Decl(Decl::Fn(_)) => {}
+        Stmt::Decl(Decl::Fn(declaration)) => {
+            let key = DeclarationKey::of(&declaration.ident);
+            if let Some(&slot) = cx.decl_slots.get(&key) {
+                // Annex B permits a declaration as an if/label body. Give that
+                // statement the same lexical initialization as an explicit block.
+                if cx.lookup(declaration.ident.sym.as_ref()) != Some(slot) {
+                    emit_block_scope(cx, std::slice::from_ref(stmt));
+                    return;
+                }
+                if let Some(&alias) = cx.block_fn_aliases.get(&key) {
+                    cx.emit(Instr::LoadLocal(slot));
+                    // The lexical declaration and its Annex B variable alias
+                    // share a spelling, but may have different storage kinds.
+                    let boxed = if alias < cx.cap_floor {
+                        cx.boxed_locals.contains(declaration.ident.sym.as_ref())
+                            && !cx.lexical_slots.contains_key(&alias)
+                    } else {
+                        cx.boxed_caps.contains(declaration.ident.sym.as_ref())
+                    };
+                    cx.emit(if boxed {
+                        Instr::StoreCell(alias)
+                    } else {
+                        Instr::StoreLocal(alias)
+                    });
+                    cx.emit(Instr::Pop);
+                }
+            }
+        }
         Stmt::Return(r) => {
             match &r.arg {
                 Some(a) => emit_expr(cx, a),
@@ -169,7 +202,7 @@ pub(crate) fn emit_stmt(cx: &mut Cx<'_>, stmt: &Stmt) {
             cx.emit(Instr::JumpIfFalse(u32::MAX));
             cx.frames.push(Frame {
                 kind: FrameKind::Loop,
-                label: cx.pending_label.take(),
+                labels: std::mem::take(&mut cx.pending_labels),
                 handler_depth: cx.handler_depth,
                 continue_handler_depth: cx.handler_depth,
                 break_jumps: Vec::new(),
@@ -192,12 +225,12 @@ pub(crate) fn emit_stmt(cx: &mut Cx<'_>, stmt: &Stmt) {
             // frame holding the head's let/const bindings so the init store, test,
             // body and update all resolve `i` to its own slot (shadowing any outer
             // `i`). A `var`/expression head adds nothing and the frame stays empty.
-            let head_lows = match &f.init {
+            let head_bindings = match &f.init {
                 Some(VarDeclOrExpr::VarDecl(v)) => for_var_decl_block_bindings(v),
                 _ => Vec::new(),
             };
             cx.push_scope();
-            bind_lows_in_scope(cx, &head_lows);
+            bind_declarations_in_scope(cx, &head_bindings);
             // init
             if let Some(init) = &f.init {
                 match init {
@@ -209,8 +242,8 @@ pub(crate) fn emit_stmt(cx: &mut Cx<'_>, stmt: &Stmt) {
                     }
                 }
             }
-            for (_, lo) in &head_lows {
-                if let Some(&slot) = cx.decl_slots.get(lo) {
+            for (_, declaration) in &head_bindings {
+                if let Some(&slot) = cx.decl_slots.get(declaration) {
                     cx.emit(Instr::CloneLexical(slot));
                 }
             }
@@ -226,7 +259,7 @@ pub(crate) fn emit_stmt(cx: &mut Cx<'_>, stmt: &Stmt) {
             cx.emit(Instr::JumpIfFalse(u32::MAX));
             cx.frames.push(Frame {
                 kind: FrameKind::Loop,
-                label: cx.pending_label.take(),
+                labels: std::mem::take(&mut cx.pending_labels),
                 handler_depth: cx.handler_depth,
                 continue_handler_depth: cx.handler_depth,
                 break_jumps: Vec::new(),
@@ -234,8 +267,8 @@ pub(crate) fn emit_stmt(cx: &mut Cx<'_>, stmt: &Stmt) {
             });
             emit_stmt(cx, &f.body);
             let update_pc = cx.here();
-            for (_, lo) in &head_lows {
-                if let Some(&slot) = cx.decl_slots.get(lo) {
+            for (_, declaration) in &head_bindings {
+                if let Some(&slot) = cx.decl_slots.get(declaration) {
                     cx.emit(Instr::CloneLexical(slot));
                 }
             }
@@ -259,7 +292,7 @@ pub(crate) fn emit_stmt(cx: &mut Cx<'_>, stmt: &Stmt) {
             let start = cx.here();
             cx.frames.push(Frame {
                 kind: FrameKind::Loop,
-                label: cx.pending_label.take(),
+                labels: std::mem::take(&mut cx.pending_labels),
                 handler_depth: cx.handler_depth,
                 continue_handler_depth: cx.handler_depth,
                 break_jumps: Vec::new(),
@@ -321,33 +354,47 @@ pub(crate) fn emit_stmt(cx: &mut Cx<'_>, stmt: &Stmt) {
             // A `for (let k in …)` head opens a per-loop lexical scope (D3). Push it
             // around the whole lowering so the binding resolves to its own slot even
             // when it shadows an outer name; `var`/pattern heads add nothing.
-            let lows = for_head_block_bindings(&s.left);
+            let bindings = for_head_block_bindings(&s.left);
             cx.push_scope();
-            bind_lows_in_scope(cx, &lows);
+            bind_declarations_in_scope(cx, &bindings);
             emit_for_in(cx, s);
             cx.pop_scope();
         }
         Stmt::ForOf(s) => {
-            let lows = for_head_block_bindings(&s.left);
+            let bindings = for_head_block_bindings(&s.left);
             cx.push_scope();
-            bind_lows_in_scope(cx, &lows);
+            bind_declarations_in_scope(cx, &bindings);
             emit_for_of(cx, s);
             cx.pop_scope();
         }
         Stmt::Try(t) => emit_try(cx, t),
+        Stmt::With(statement) => {
+            emit_expr(cx, &statement.obj);
+            let object = cx.alloc_temp();
+            cx.emit(Instr::EnterWith(object));
+            cx.with_scopes.push((cx.scopes.len(), object));
+            emit_stmt(cx, &statement.body);
+            cx.with_scopes.pop();
+            cx.free_temp();
+        }
         Stmt::Labeled(l) => {
-            let name = l.label.sym.to_string();
-            match &*l.body {
+            let mut names = vec![l.label.sym.to_string()];
+            let mut body = &*l.body;
+            while let Stmt::Labeled(inner) = body {
+                names.push(inner.label.sym.to_string());
+                body = &inner.body;
+            }
+            match body {
                 // A labeled loop: stash the label so the loop arm consumes it
-                // into its own `Frame.label` (so `break/continue label` resolve
+                // into its own `Frame.labels` (so `break/continue label` resolve
                 // to that loop). Do NOT push a Block frame here.
                 Stmt::While(_)
                 | Stmt::For(_)
                 | Stmt::DoWhile(_)
                 | Stmt::ForIn(_)
                 | Stmt::ForOf(_) => {
-                    cx.pending_label = Some(name);
-                    emit_stmt(cx, &l.body);
+                    cx.pending_labels = names;
+                    emit_stmt(cx, body);
                 }
                 // A labeled non-loop (e.g. a block): push a `Block` frame so that
                 // `break label` can target the construct's end. `continue label`
@@ -356,13 +403,13 @@ pub(crate) fn emit_stmt(cx: &mut Cx<'_>, stmt: &Stmt) {
                 _ => {
                     cx.frames.push(Frame {
                         kind: FrameKind::Block,
-                        label: Some(name),
+                        labels: names,
                         handler_depth: cx.handler_depth,
                         continue_handler_depth: cx.handler_depth,
                         break_jumps: Vec::new(),
                         continue_jumps: Vec::new(),
                     });
-                    emit_stmt(cx, &l.body);
+                    emit_stmt(cx, body);
                     let end = cx.here();
                     let frame = cx.frames.pop().unwrap();
                     for j in frame.break_jumps {
@@ -398,12 +445,15 @@ pub(crate) fn emit_switch(cx: &mut Cx<'_>, s: &SwitchStmt) {
     }
 
     // The discriminant is evaluated before entering the switch lexical scope.
-    let mut lows = Vec::new();
+    let mut bindings = Vec::new();
     for case in &s.cases {
-        lows.extend(direct_block_bindings(&case.cons));
+        bindings.extend(direct_block_bindings(&case.cons));
     }
     cx.push_scope();
-    bind_lows_in_scope(cx, &lows);
+    bind_declarations_in_scope(cx, &bindings);
+    for case in &s.cases {
+        emit_block_function_declarations(cx, &case.cons);
+    }
 
     // 2. Compare chain, in source order. For each NON-default case we record the
     //    body-jump instruction index to patch once the body's start PC is known.
@@ -449,7 +499,7 @@ pub(crate) fn emit_switch(cx: &mut Cx<'_>, s: &SwitchStmt) {
     //    switch has NO continue target).
     cx.frames.push(Frame {
         kind: FrameKind::Switch,
-        label: cx.pending_label.take(),
+        labels: std::mem::take(&mut cx.pending_labels),
         handler_depth: cx.handler_depth,
         continue_handler_depth: cx.handler_depth,
         break_jumps: Vec::new(),
@@ -520,9 +570,13 @@ pub(crate) fn for_head_target<'a>(cx: &mut Cx<'_>, head: &'a ForHead) -> Option<
                 return None;
             }
             match &v.decls[0].name {
-                // A `for (var x …)` head declares a fresh function-local `x` — never
-                // a boxed capture (the loop var is a local binding of this body).
-                Pat::Ident(bi) => Some(ForHeadTarget::Slot(cx.resolve(bi.id.sym.as_ref()), false)),
+                Pat::Ident(bi) => {
+                    let name = bi.id.sym.as_ref();
+                    if v.kind == VarDeclKind::Var && binding_has_with(cx, name) {
+                        return Some(ForHeadTarget::Pat(&v.decls[0].name));
+                    }
+                    Some(ForHeadTarget::Slot(cx.resolve(name), cx.is_celled(name)))
+                }
                 p @ (Pat::Array(_) | Pat::Object(_)) => Some(ForHeadTarget::Pat(p)),
                 _ => {
                     cx.bail_with("for_head_destructure");
@@ -533,6 +587,9 @@ pub(crate) fn for_head_target<'a>(cx: &mut Cx<'_>, head: &'a ForHead) -> Option<
         ForHead::Pat(p) => match &**p {
             Pat::Ident(bi) => {
                 let name = bi.id.sym.as_ref();
+                if binding_needs_ref(cx, name) {
+                    return Some(ForHeadTarget::Pat(p));
+                }
                 // D1: `for (x of …)` where `x` is a boxed capture stores per
                 // iteration through the cell; an unboxed capture is read-only -> bail.
                 let boxed = cx.is_celled(name);
@@ -576,6 +633,16 @@ pub(crate) fn emit_for_head_bind(cx: &mut Cx<'_>, target: &ForHeadTarget) {
 /// Suspend native enumeration between iterations, preserving deletion and
 /// prototype behavior while the VM executes each loop body. Uses one iterator slot.
 pub(crate) fn emit_for_in(cx: &mut Cx<'_>, s: &ForInStmt) {
+    // Annex B permits an initializer on a sloppy `var` for-in head. It runs
+    // once, before evaluating the enumerated expression, even for an empty object.
+    if let ForHead::VarDecl(declaration) = &s.left
+        && declaration
+            .decls
+            .iter()
+            .any(|binding| binding.init.is_some())
+    {
+        emit_stmt(cx, &Stmt::Decl(Decl::Var(declaration.clone())));
+    }
     let Some(target) = for_head_target(cx, &s.left) else {
         return;
     };
@@ -594,7 +661,7 @@ pub(crate) fn emit_for_in(cx: &mut Cx<'_>, s: &ForInStmt) {
     cx.initializing = false;
     cx.frames.push(Frame {
         kind: FrameKind::Loop,
-        label: cx.pending_label.take(),
+        labels: std::mem::take(&mut cx.pending_labels),
         handler_depth: cx.handler_depth,
         continue_handler_depth: cx.handler_depth,
         break_jumps: Vec::new(),
@@ -615,9 +682,9 @@ pub(crate) fn emit_for_in(cx: &mut Cx<'_>, s: &ForInStmt) {
 }
 
 fn initialize_for_head(cx: &mut Cx<'_>, head: &ForHead) {
-    let lows = for_head_block_bindings(head);
-    cx.initializing = !lows.is_empty();
-    bind_lows_in_scope(cx, &lows);
+    let bindings = for_head_block_bindings(head);
+    cx.initializing = !bindings.is_empty();
+    bind_declarations_in_scope(cx, &bindings);
 }
 
 /// Lower a `for (x of ITER)` via the iterator opcodes + a close-on-abrupt handler
@@ -628,10 +695,9 @@ fn initialize_for_head(cx: &mut Cx<'_>, head: &ForHead) {
 ///
 /// ```text
 /// eval ITER; GetIter; ->it
-/// PushHandler(absent, CLOSE)             ; finally-only handler -> IterClose
-/// LOOP: LoadLocal(it); IterStep; JumpIfFalse NORMALEXIT
-///   ->x; BODY; CONT: Jump LOOP
-/// NORMALEXIT: PopHandler; Jump EXIT      ; exhausted -> drop handler, NO close
+/// LOOP: LoadLocal(it); IterStep; JumpIfFalse EXIT
+///   ->value; PushHandler(absent, CLOSE); value ->x; BODY
+/// CONT: PopHandler; Jump LOOP
 /// CLOSE: LoadLocal(it); IterClose; EndFinally
 /// EXIT:
 /// ```
@@ -656,30 +722,33 @@ pub(crate) fn emit_for_of(cx: &mut Cx<'_>, s: &ForOfStmt) {
     cx.emit(Instr::StoreLocal(it_temp));
     cx.emit(Instr::Pop);
 
-    // Close handler (finally-only) active across the loop body.
+    // IteratorStep runs outside the close handler: a throwing next()/done/value
+    // accessor terminates iteration without IteratorClose. Binding and body
+    // evaluation run inside it and do close on abrupt completion.
     let outer_depth = cx.handler_depth;
-    let ph = cx.code.len();
-    cx.emit(Instr::PushHandler(u32::MAX, u32::MAX)); // catch absent; CLOSE patched
-    cx.handler_depth += 1;
-
-    // `break` unwinds the close handler (handler_depth = outer); `continue` stays
-    // inside it (continue_handler_depth = current = outer + 1), so a `continue`
-    // does not close the iterator but still unwinds any deeper handlers.
     cx.frames.push(Frame {
         kind: FrameKind::Loop,
-        label: cx.pending_label.take(),
+        labels: std::mem::take(&mut cx.pending_labels),
         handler_depth: outer_depth,
-        continue_handler_depth: cx.handler_depth,
+        continue_handler_depth: outer_depth + 1,
         break_jumps: Vec::new(),
         continue_jumps: Vec::new(),
     });
-
-    // LOOP: x = step(it); exit when done.
     let loop_pc = cx.here();
     cx.emit(Instr::LoadLocal(it_temp));
     cx.emit(Instr::IterStep);
     let normal_exit_j = cx.code.len();
     cx.emit(Instr::JumpIfFalse(u32::MAX));
+    // Establish the handler at the surrounding expression stack depth, without
+    // retaining an iteration value when a binding or body completes abruptly.
+    let value = cx.alloc_temp();
+    cx.emit(Instr::StoreLocal(value));
+    cx.emit(Instr::Pop);
+    let ph = cx.code.len();
+    cx.emit(Instr::PushHandler(u32::MAX, u32::MAX));
+    cx.handler_depth += 1;
+    cx.emit(Instr::LoadLocal(value));
+    cx.free_temp();
     // Bind the value: a plain store, or a per-iteration destructure (whose own
     // close handler nests inside this loop's, then balances before the body).
     initialize_for_head(cx, &s.left);
@@ -693,17 +762,11 @@ pub(crate) fn emit_for_of(cx: &mut Cx<'_>, s: &ForOfStmt) {
     // BODY.
     emit_stmt(cx, &s.body);
 
-    // CONT (continue target): loop back.
+    // Continuing normally removes this iteration's handler before stepping.
     let cont_pc = cx.here();
-    cx.emit(Instr::Jump(loop_pc));
-
-    // NORMALEXIT: exhausted -> drop the handler (no close), jump past CLOSE.
-    let normal_exit = cx.here();
-    patch(cx, normal_exit_j, normal_exit);
     cx.emit(Instr::PopHandler);
     cx.handler_depth -= 1;
-    let exit_j = cx.code.len();
-    cx.emit(Instr::Jump(u32::MAX));
+    cx.emit(Instr::Jump(loop_pc));
 
     // CLOSE: the finally body that closes the iterator on abrupt completion.
     let close_pc = cx.here();
@@ -715,7 +778,7 @@ pub(crate) fn emit_for_of(cx: &mut Cx<'_>, s: &ForOfStmt) {
 
     // EXIT: patch normal-exit jump + frame break/continue jumps.
     let exit = cx.here();
-    patch(cx, exit_j, exit);
+    patch(cx, normal_exit_j, exit);
     let lp = cx.frames.pop().unwrap();
     for j in lp.break_jumps {
         patch(cx, j, exit);
@@ -793,9 +856,9 @@ pub(crate) fn emit_try_catch(cx: &mut Cx<'_>, block: &BlockStmt, handler: &Catch
     patch_handler_catch(cx, ph, catch_pc);
     cx.push_scope();
     if let Some(p) = &handler.param {
-        let mut lows = Vec::new();
-        collect_pat_binding_lows(p, &mut lows);
-        bind_lows_in_scope(cx, &lows);
+        let mut bindings = Vec::new();
+        collect_pattern_bindings(p, &mut bindings);
+        bind_declarations_in_scope(cx, &bindings);
     }
     cx.initializing = true;
     bind_catch_param(cx, handler);
@@ -842,9 +905,9 @@ pub(crate) fn bind_catch_param(cx: &mut Cx<'_>, handler: &CatchClause) {
 /// normal, so `EndFinally` continues to `AFTER`. An abrupt completion (throw /
 /// return / break / continue) is routed to `FIN` by `unwind` with `comp` set, and
 /// `EndFinally` re-performs that pending completion after the finally body runs.
-/// The finally body is emitted at the OUTER handler depth (this try's handler is
-/// already gone by the time `F` runs), so a `return`/`break` inside `F` routes
-/// through any still-active enclosing handlers.
+/// The original handler is gone when `F` runs. A completion-scope handler inside
+/// `emit_finally_body` discards the saved completion on an abrupt exit before
+/// routing through still-active enclosing handlers.
 pub(crate) fn emit_try_finally(cx: &mut Cx<'_>, block: &BlockStmt, fin: &BlockStmt) {
     let ph = cx.code.len();
     cx.emit(Instr::PushHandler(u32::MAX, u32::MAX)); // no catch; finally PC patched
@@ -862,11 +925,24 @@ pub(crate) fn emit_try_finally(cx: &mut Cx<'_>, block: &BlockStmt, fin: &BlockSt
     // FIN: reached by normal fall-through (comp normal) or by `unwind` (comp set).
     let fin_pc = cx.here();
     patch_handler_fin(cx, ph, fin_pc);
+    emit_finally_body(cx, fin);
+}
+
+/// A source finally body owns one pending completion. Its synthetic handler
+/// snapshots the pending stack before BeginFinally saves that completion. Any
+/// abrupt exit crosses this handler and discards that saved completion through
+/// the existing unwind mechanism; a local break/continue keeps it. Normal exit
+/// pops the guard without unwinding and EndFinally resumes the saved completion.
+fn emit_finally_body(cx: &mut Cx<'_>, fin: &BlockStmt) {
+    cx.emit(Instr::PushHandler(u32::MAX, u32::MAX));
+    cx.handler_depth += 1;
     cx.emit(Instr::BeginFinally);
     emit_block_scope(cx, &fin.stmts);
+    cx.handler_depth -= 1;
     if cx.bailed() {
         return;
     }
+    cx.emit(Instr::PopHandler);
     cx.emit(Instr::EndFinally);
 }
 
@@ -893,50 +969,12 @@ pub(crate) fn emit_try_catch_finally(
 
     let fin_pc = cx.here();
     patch_handler_fin(cx, ph, fin_pc);
-    cx.emit(Instr::BeginFinally);
-    emit_block_scope(cx, &fin.stmts);
-    if cx.bailed() {
-        return;
-    }
-    cx.emit(Instr::EndFinally);
+    emit_finally_body(cx, fin);
 }
 
-/// Emit an expression statement, special-casing UpdateExpr (i++, --i, ...).
+/// Expression statements use the same lowering as value-producing expressions,
+/// then discard the result. This keeps member updates and coercion order identical.
 pub(crate) fn emit_expr_stmt(cx: &mut Cx<'_>, expr: &Expr) {
-    if let Expr::Update(u) = expr {
-        // target must be a slot ident.
-        if let Expr::Ident(id) = &*u.arg {
-            let name = id.sym.as_ref();
-            // D1: a BOXED capture is writable via its cell; a non-local, non-boxed
-            // capture is read-only -> bail (the write would be lost).
-            let boxed = cx.is_celled(name);
-            if !cx.is_param_or_local(name) && !boxed && !cx.opts.live_captures {
-                // ++/-- on a captured outer binding cannot be written back to
-                // the enclosing scope. Skip to stay sound.
-                cx.bail_with("mutable_capture");
-                return;
-            }
-            let slot = cx.resolve(name);
-            cx.emit(if boxed {
-                Instr::LoadCell(slot)
-            } else {
-                Instr::LoadLocal(slot)
-            });
-            cx.emit(Instr::Un(match u.op {
-                UpdateOp::PlusPlus => crate::isa::UN_INCREMENT,
-                UpdateOp::MinusMinus => crate::isa::UN_DECREMENT,
-            }));
-            cx.emit(if boxed {
-                Instr::StoreCell(slot)
-            } else {
-                Instr::StoreLocal(slot)
-            });
-            cx.emit(Instr::Pop);
-        } else {
-            cx.bail();
-        }
-        return;
-    }
     emit_expr(cx, expr);
     cx.emit(Instr::Pop);
 }
@@ -946,316 +984,96 @@ pub(crate) fn emit_expr_stmt(cx: &mut Cx<'_>, expr: &Expr) {
 // emit a `MakeClosure` that builds the JS closure, threading upvalue cells.
 // ---------------------------------------------------------------------------
 
-/// D5: compute the set of THIS body's own function-frame locals that must be boxed
-/// into in-VM cells because a nested closure captures-and-mutates them. A name is
-/// boxed iff it is (a) a function-frame binding of this body (param / `var` /
-/// body-top-level `let`/`const` / fn-decl name), (b) referenced free by some nested
-/// function/arrow (a capture), and (c) written somewhere (this body or a nested fn).
-/// Read-only captures stay by-value (no cell, no regression). A captured-mutated name
-/// that is NOT a function-frame binding here (e.g. a deeper block `let`) is not boxed
-/// — the child's write then bails `mutable_capture`, bailing the parent (sound, just
-/// less coverage).
+/// Captured bindings are shared from function entry, including bindings whose
+/// initializer runs after a closure is created. Declaration initialization is a
+/// write too: capturing `var x` by value would freeze its initial `undefined`.
+/// This scan intentionally over-approximates shadowed names; the compiler's slot
+/// resolver determines actual captures, and an unused cell is harmless.
 pub(crate) fn compute_boxed_locals(
     params: &[Param],
-    body: &BlockStmt,
+    body: &FunctionBody,
 ) -> std::collections::HashSet<String> {
-    // (a) function-frame local names.
-    let mut locals: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for p in params {
-        binding_names(&p.pat, &mut |id| {
+    let mut locals = std::collections::HashSet::new();
+    for param in params {
+        binding_names(&param.pat, &mut |id| {
             locals.insert(id.sym.to_string());
         });
     }
-    // `var` (function-scoped, any depth but not nested fns) + fn-decl names.
-    {
-        struct L<'a>(&'a mut std::collections::HashSet<String>);
-        impl Visit for L<'_> {
-            fn visit_var_decl(&mut self, v: &VarDecl) {
-                if matches!(v.kind, VarDeclKind::Var) {
-                    for d in &v.decls {
-                        binding_names(&d.name, &mut |id| {
-                            self.0.insert(id.sym.to_string());
-                        });
-                    }
-                }
-                v.visit_children_with(self);
-            }
-            fn visit_fn_decl(&mut self, n: &FnDecl) {
-                self.0.insert(n.ident.sym.to_string());
-            }
-            fn visit_function(&mut self, _: &Function) {}
-            fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
+    struct Locals<'a>(&'a mut std::collections::HashSet<String>);
+    impl Visit for Locals<'_> {
+        fn visit_bin_expr(&mut self, node: &BinExpr) {
+            walk_binary_chain(node, self);
         }
-        let mut l = L(&mut locals);
-        body.visit_with(&mut l);
-    }
-    // body-top-level `let`/`const`.
-    for stmt in &body.stmts {
-        if let Stmt::Decl(Decl::Var(v)) = stmt
-            && matches!(v.kind, VarDeclKind::Let | VarDeclKind::Const)
-        {
-            for d in &v.decls {
-                binding_names(&d.name, &mut |id| {
-                    locals.insert(id.sym.to_string());
+        fn visit_var_decl(&mut self, declaration: &VarDecl) {
+            for binding in &declaration.decls {
+                binding_names(&binding.name, &mut |id| {
+                    self.0.insert(id.sym.to_string());
                 });
             }
+            declaration.visit_children_with(self);
+        }
+        fn visit_fn_decl(&mut self, function: &FnDecl) {
+            self.0.insert(function.ident.sym.to_string());
+        }
+        fn visit_function(&mut self, _: &Function) {}
+        fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
+    }
+    body.visit_with(&mut Locals(&mut locals));
+    let mut references = std::collections::HashSet::new();
+    struct Closures<'a>(&'a mut std::collections::HashSet<String>);
+    impl Visit for Closures<'_> {
+        fn visit_bin_expr(&mut self, node: &BinExpr) {
+            walk_binary_chain(node, self);
+        }
+        fn visit_function(&mut self, function: &Function) {
+            function.visit_with(&mut NestedReferenceScan { refs: self.0 });
+        }
+        fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+            arrow.visit_with(&mut NestedReferenceScan { refs: self.0 });
         }
     }
-
-    // (b) names captured (referenced free) by a nested function/arrow.
-    let mut nested_caps: std::collections::HashSet<String> = std::collections::HashSet::new();
-    {
-        struct N<'a>(&'a mut std::collections::HashSet<String>);
-        impl N<'_> {
-            fn note_fn(&mut self, locals: std::collections::HashSet<String>, body: &BlockStmt) {
-                let mut d = BodyLocalDecls { names: locals };
-                body.visit_with(&mut d);
-                let mut s = NestedFreeScan {
-                    local: d.names,
-                    refs: self.0,
-                };
-                body.visit_with(&mut s);
-            }
-        }
-        impl Visit for N<'_> {
-            fn visit_fn_decl(&mut self, n: &FnDecl) {
-                let Some(b) = &n.function.body else { return };
-                let mut l = std::collections::HashSet::new();
-                l.insert(n.ident.sym.to_string());
-                for p in &n.function.params {
-                    binding_names(&p.pat, &mut |id| {
-                        l.insert(id.sym.to_string());
-                    });
-                }
-                self.note_fn(l, b);
-            }
-            fn visit_fn_expr(&mut self, n: &FnExpr) {
-                let Some(b) = &n.function.body else { return };
-                let mut l = std::collections::HashSet::new();
-                if let Some(id) = &n.ident {
-                    l.insert(id.sym.to_string());
-                }
-                for p in &n.function.params {
-                    binding_names(&p.pat, &mut |id| {
-                        l.insert(id.sym.to_string());
-                    });
-                }
-                self.note_fn(l, b);
-            }
-            fn visit_arrow_expr(&mut self, n: &ArrowExpr) {
-                let mut l = std::collections::HashSet::new();
-                for p in &n.params {
-                    binding_names(p, &mut |id| {
-                        l.insert(id.sym.to_string());
-                    });
-                }
-                match &*n.body {
-                    BlockStmtOrExpr::BlockStmt(b) => self.note_fn(l, b),
-                    BlockStmtOrExpr::Expr(e) => {
-                        let mut s = NestedFreeScan {
-                            local: l,
-                            refs: self.0,
-                        };
-                        e.visit_with(&mut s);
-                    }
-                }
-            }
-        }
-        let mut n = N(&mut nested_caps);
-        body.visit_with(&mut n);
-    }
-
-    // (c) names written anywhere in this body OR a nested fn (reuse WriteScan-style).
-    let written = collect_all_writes(body);
-
+    body.visit_with(&mut Closures(&mut references));
+    locals.retain(|name| references.contains(name));
     locals
-        .into_iter()
-        .filter(|n| nested_caps.contains(n) && written.contains(n))
-        .collect()
 }
 
-/// Add every name `body` binds locally (`var`/fn-decl/`let`/`const`/`catch`/
-/// destructuring leaves, NOT descending into nested fns) into `out`. Phase 3 uses
-/// this to know which names the native fn binds itself (so a same-named enclosing
-/// upvalue is shadowed, not rewritten).
-/// Collects every name a function body binds locally (params seeded by the caller):
-/// `var`, fn-decl, `let`/`const`, `catch` params, destructuring leaves — at any
-/// nesting WITHIN this function (NOT descending into nested functions, whose bindings
-/// are their own scope). Used to exclude locals from a free-ref scan.
-struct BodyLocalDecls {
-    names: std::collections::HashSet<String>,
-}
-impl Visit for BodyLocalDecls {
-    fn visit_var_decl(&mut self, v: &VarDecl) {
-        for d in &v.decls {
-            binding_names(&d.name, &mut |id| {
-                self.names.insert(id.sym.to_string());
-            });
-        }
-        v.visit_children_with(self);
-    }
-    fn visit_fn_decl(&mut self, n: &FnDecl) {
-        self.names.insert(n.ident.sym.to_string());
-    }
-    fn visit_catch_clause(&mut self, c: &CatchClause) {
-        if let Some(p) = &c.param {
-            binding_names(p, &mut |id| {
-                self.names.insert(id.sym.to_string());
-            });
-        }
-        c.body.visit_with(self);
-    }
-    fn visit_function(&mut self, _: &Function) {}
-    fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
-}
-
-/// Free-name collector for a nested function body, excluding its own locals. A name
-/// not bound locally and not `arguments`/`undefined` is a capture. Descends into
-/// deeper nested fns (their free names are this body's captures too, transitively) —
-/// the conservative over-approximation only ever boxes MORE candidates, and a name
-/// boxed but not actually captured is harmless (its cell is simply never threaded).
-struct NestedFreeScan<'a> {
-    local: std::collections::HashSet<String>,
+/// Conservative reference scan. Block-local declarations cannot exclude a name
+/// from the whole function: references outside that block may still capture it.
+struct NestedReferenceScan<'a> {
     refs: &'a mut std::collections::HashSet<String>,
 }
-impl Visit for NestedFreeScan<'_> {
+impl Visit for NestedReferenceScan<'_> {
+    fn visit_bin_expr(&mut self, node: &BinExpr) {
+        walk_binary_chain(node, self);
+    }
     fn visit_ident(&mut self, id: &Ident) {
-        let n = id.sym.as_ref();
-        if !self.local.contains(n) && n != "arguments" && n != "undefined" {
-            self.refs.insert(n.to_string());
+        self.refs.insert(id.sym.to_string());
+    }
+    fn visit_member_expr(&mut self, member: &MemberExpr) {
+        member.obj.visit_with(self);
+        if let MemberProp::Computed(key) = &member.prop {
+            key.visit_with(self);
         }
     }
-    fn visit_member_expr(&mut self, m: &MemberExpr) {
-        m.obj.visit_with(self);
-        if let MemberProp::Computed(c) = &m.prop {
-            c.visit_with(self);
-        }
-    }
-    fn visit_prop_name(&mut self, p: &PropName) {
-        if let PropName::Computed(c) = p {
-            c.visit_with(self);
+    fn visit_prop_name(&mut self, name: &PropName) {
+        if let PropName::Computed(key) = name {
+            key.visit_with(self);
         }
     }
 }
 
-/// Collect every name WRITTEN (assign / `++`/`--` / compound / for-head /
-/// destructuring target) anywhere in `body`, INCLUDING nested functions (a boxed
-/// local may be written by an inner closure). Reuses the same target shapes as the
-/// D1 `cells::WriteScan`, kept local to the compiler module.
-pub(crate) fn collect_all_writes(body: &BlockStmt) -> std::collections::HashSet<String> {
-    struct W(std::collections::HashSet<String>);
-    impl W {
-        fn pat(&mut self, pat: &Pat) {
-            match pat {
-                Pat::Ident(bi) => {
-                    self.0.insert(bi.id.sym.to_string());
-                }
-                Pat::Expr(e) => {
-                    if let Expr::Ident(id) = &**e {
-                        self.0.insert(id.sym.to_string());
-                    }
-                }
-                Pat::Assign(ap) => self.pat(&ap.left),
-                Pat::Array(arr) => {
-                    for el in arr.elems.iter().flatten() {
-                        self.pat(el);
-                    }
-                }
-                Pat::Object(obj) => {
-                    for prop in &obj.props {
-                        match prop {
-                            ObjectPatProp::KeyValue(kv) => self.pat(&kv.value),
-                            ObjectPatProp::Assign(a) => {
-                                self.0.insert(a.key.id.sym.to_string());
-                            }
-                            ObjectPatProp::Rest(r) => self.pat(&r.arg),
-                        }
-                    }
-                }
-                Pat::Rest(r) => self.pat(&r.arg),
-                Pat::Invalid(_) => {}
-            }
-        }
-    }
-    impl Visit for W {
-        fn visit_assign_expr(&mut self, n: &AssignExpr) {
-            match &n.left {
-                AssignTarget::Simple(SimpleAssignTarget::Ident(bi)) => {
-                    self.0.insert(bi.id.sym.to_string());
-                }
-                AssignTarget::Pat(AssignTargetPat::Array(arr)) => {
-                    for el in arr.elems.iter().flatten() {
-                        self.pat(el);
-                    }
-                }
-                AssignTarget::Pat(AssignTargetPat::Object(obj)) => {
-                    for prop in &obj.props {
-                        match prop {
-                            ObjectPatProp::KeyValue(kv) => self.pat(&kv.value),
-                            ObjectPatProp::Assign(a) => {
-                                self.0.insert(a.key.id.sym.to_string());
-                            }
-                            ObjectPatProp::Rest(r) => self.pat(&r.arg),
-                        }
-                    }
-                }
-                _ => {}
-            }
-            n.visit_children_with(self);
-        }
-        fn visit_update_expr(&mut self, n: &UpdateExpr) {
-            if let Expr::Ident(id) = &*n.arg {
-                self.0.insert(id.sym.to_string());
-            }
-            n.visit_children_with(self);
-        }
-        fn visit_for_in_stmt(&mut self, n: &ForInStmt) {
-            if let ForHead::Pat(p) = &n.left {
-                self.pat(p);
-            }
-            n.visit_children_with(self);
-        }
-        fn visit_for_of_stmt(&mut self, n: &ForOfStmt) {
-            if let ForHead::Pat(p) = &n.left {
-                self.pat(p);
-            }
-            n.visit_children_with(self);
-        }
-    }
-    let mut w = W(std::collections::HashSet::new());
-    body.visit_with(&mut w);
-    w.0
-}
-
-/// The free names a nested function/arrow body references (its capture candidates),
-/// excluding its own params/locals and `self_name`. Used by `emit_nested_closure` to
-/// decide which of the child's captures the parent holds as cells (so the child reads
-/// them through cells). A conservative over-approximation is harmless: a name the
-/// child does not actually capture is never installed, and an unboxed mutated capture
-/// bails the child (then the parent), never miscompiling.
+/// Candidate captured names, including parameter-default references. The actual
+/// compiler resolves lexical scope and records the authoritative capture list;
+/// this conservative set only determines which parent cells may be threaded.
 pub(crate) fn nested_free_names(
     params: &[Pat],
-    body: &BlockStmt,
-    self_name: Option<&str>,
+    body: &FunctionBody,
+    _self_name: Option<&str>,
 ) -> std::collections::HashSet<String> {
-    let mut local = std::collections::HashSet::new();
-    for p in params {
-        binding_names(p, &mut |id| {
-            local.insert(id.sym.to_string());
-        });
-    }
-    if let Some(n) = self_name {
-        local.insert(n.to_string());
-    }
-    // Exclude the body's own declared locals.
-    let mut d = BodyLocalDecls { names: local };
-    body.visit_with(&mut d);
     let mut refs = std::collections::HashSet::new();
-    let mut s = NestedFreeScan {
-        local: d.names,
-        refs: &mut refs,
-    };
-    body.visit_with(&mut s);
+    let mut scan = NestedReferenceScan { refs: &mut refs };
+    params.visit_with(&mut scan);
+    body.visit_with(&mut scan);
     refs
 }
 
@@ -1268,7 +1086,7 @@ pub(crate) fn nested_free_names(
 pub(crate) fn emit_nested_closure(
     cx: &mut Cx<'_>,
     params: &[Pat],
-    body: &BlockStmt,
+    body: &FunctionBody,
     is_arrow: bool,
     is_async: bool,
     is_generator: bool,
@@ -1281,6 +1099,27 @@ pub(crate) fn emit_nested_closure(
     let pending = cx.pending_fn_name.take();
     let inferred_name = self_name.map(|s| s.to_string()).or(pending);
 
+    // The class preparation pass marks its structural factory with a reserved
+    // span. All original class behavior has already become VM entry callbacks;
+    // this exact factory retains native private-brand and class construction
+    // semantics. Ordinary source functions never take this path.
+    let class_factory = self_name.is_none()
+        && body.span.lo.0 == 0
+        && body.span.hi.0 == 1
+        && matches!(
+            body.stmts.as_slice(),
+            [Stmt::Return(ReturnStmt { arg: Some(_), .. })]
+        );
+    let generated_factory = self_name.is_none()
+        && is_arrow
+        && !is_async
+        && !is_generator
+        && mangler_jsast::span::is_generated_factory_span(body.span);
+    if class_factory || generated_factory {
+        emit_native_closure(cx, params, body, is_arrow, is_async, is_generator, None);
+        return;
+    }
+
     // §4.1 divert decision. A nested function is diverted to a NATIVE closure when:
     //   (a) its inferred name matches `--virtualize-exclude`; or
     //   (b) `divert_ineligible` is set AND the fn cannot be virtualized (async /
@@ -1292,8 +1131,6 @@ pub(crate) fn emit_nested_closure(
     };
     let structurally_ineligible = is_async
         || is_generator
-        || has_use_strict_directive_block(body)
-        || (is_arrow && uses_arguments(body))
         || matches!(
             crate::eligibility::classify_body(
                 &params
@@ -1319,24 +1156,12 @@ pub(crate) fn emit_nested_closure(
             is_generator,
             self_name,
         );
+        emit_closure_name(cx, inferred_name.as_deref());
         return;
     }
 
     if is_async || is_generator {
         cx.bail_with("nested_async_generator");
-        return;
-    }
-    // An arrow has no own `this`/`arguments`; we thread the enclosing `this`
-    // lexically (via the closure's captured `receiver`), but cannot model a lexical
-    // `arguments` — bail an arrow that references it. (A regular nested function has
-    // its own `arguments`, handled by the chunk's D2 materialization, so only the
-    // arrow case is restricted here.)
-    if is_arrow && uses_arguments(body) {
-        cx.bail_with("arrow_uses_arguments");
-        return;
-    }
-    if has_use_strict_directive_block(body) {
-        cx.bail_with("nested_use_strict");
         return;
     }
     // Wrap the arrow params (`Pat`) as `Param`s for the shared compiler, which keys
@@ -1373,15 +1198,26 @@ pub(crate) fn emit_nested_closure(
     // A free name the child captures and writes that is NOT celled in the parent is
     // left unboxed — the child then bails `mutable_capture` (a write to a read-only
     // capture), bailing the parent (sound).
-    let child_free = nested_free_names(params, body, self_name);
+    let mut child_free = nested_free_names(params, body, self_name);
+    child_free.extend(super::environment::metadata_capture_names(
+        &wrapped, body, cx.opts,
+    ));
+    let child_dynamic: std::collections::HashSet<String> = child_free
+        .iter()
+        .filter(|name| binding_needs_ref(cx, name))
+        .cloned()
+        .collect();
     let mut child_boxed: std::collections::HashSet<String> = child_free
         .iter()
-        .filter(|n| cx.is_celled(n))
+        .filter(|n| cx.is_celled(n) && !child_dynamic.contains(*n))
         .cloned()
         .collect();
     if let Some(p) = cx.box_plan {
         child_boxed.extend(p.boxed_for(body.span.lo));
     }
+    // Dynamic references already dereference their lexical cell fallback; the
+    // child receives a value descriptor regardless of the enclosing box plan.
+    child_boxed.retain(|name| !child_dynamic.contains(name));
 
     // Recursively compile the child chunk WITH the same plan AND options so
     // grandchildren box + divert correctly too. On an `Err`: if the divert-ineligible
@@ -1395,6 +1231,20 @@ pub(crate) fn emit_nested_closure(
         cx.box_plan,
         CompileOptions {
             native_parameters: false,
+            dynamic_captures: Some(&child_dynamic),
+            eval_context: false,
+            lexical_entry: mangler_jsast::span::is_suspension_entry_span(body.span),
+            source_context: if is_arrow || mangler_jsast::span::is_suspension_entry_span(body.span)
+            {
+                cx.opts.source_context
+            } else {
+                crate::eval::SourceContext::Function
+            },
+            external_var_bindings: None,
+            self_binding: self_name,
+            lexical_arguments: is_arrow || mangler_jsast::span::is_suspension_entry_span(body.span),
+            strict: cx.opts.strict || has_use_strict_directive_block(body),
+            live_captures: true,
             ..cx.opts
         },
     ) {
@@ -1410,6 +1260,7 @@ pub(crate) fn emit_nested_closure(
                     is_generator,
                     self_name,
                 );
+                emit_closure_name(cx, inferred_name.as_deref());
             } else {
                 cx.bail_with(r);
             }
@@ -1425,9 +1276,16 @@ pub(crate) fn emit_nested_closure(
     let cap_start = compiled.slots - compiled.captures.len() as u32;
     let pcount = compiled.pcount;
     let mut up_slots: Vec<u32> = Vec::with_capacity(compiled.captures.len());
+    let mut capture_temps = 0;
     for cap in &compiled.captures {
         if Some(cap.as_str()) == self_name {
             up_slots.push(SELF_UPVALUE);
+        } else if binding_has_with(cx, cap) || binding_has_environment(cx, cap) {
+            emit_binding_ref(cx, cap);
+            let slot = cx.alloc_temp();
+            cx.emit(Instr::CaptureRef(slot));
+            up_slots.push(slot);
+            capture_temps += 1;
         } else {
             // Resolve the capture name in the enclosing frame. If it is a parent
             // local/param it yields that slot; if free in the parent too, the parent
@@ -1438,7 +1296,20 @@ pub(crate) fn emit_nested_closure(
     }
 
     let child_index = cx.children.len() as u32;
-    cx.children.push(ChildChunk { compiled, is_arrow });
+    cx.children.push(ChildChunk {
+        compiled,
+        is_arrow,
+        is_strict: has_use_strict_directive_block(body),
+        suspension: cx
+            .opts
+            .suspensions
+            .and_then(|kinds| kinds.get(&body.span.lo.0))
+            .copied(),
+    });
+    if cx.needs_environment {
+        let snapshot = environment_snapshot(cx);
+        cx.emit(Instr::CaptureClosureEnvironment(snapshot));
+    }
     cx.emit(Instr::MakeClosure {
         child: child_index,
         is_arrow,
@@ -1446,6 +1317,22 @@ pub(crate) fn emit_nested_closure(
         pcount,
         up_slots,
     });
+    for _ in 0..capture_temps {
+        cx.emit(Instr::ClearRef(cx.temp_top - 1));
+        cx.free_temp();
+    }
+    let function_length = params
+        .iter()
+        .take_while(|param| !matches!(param, Pat::Assign(_) | Pat::Rest(_)))
+        .count() as u32;
+    cx.emit(Instr::SetFunctionLength(function_length));
+    emit_closure_name(cx, inferred_name.as_deref());
+}
+
+fn emit_closure_name(cx: &mut Cx<'_>, name: Option<&str>) {
+    let name = cx.const_str(name.unwrap_or_default().to_owned());
+    cx.emit(Instr::PushConst(name));
+    cx.emit(Instr::SetFunctionName);
 }
 
 /// §4: emit a NATIVE closure for an excluded / ineligible nested function. The
@@ -1464,7 +1351,7 @@ pub(crate) fn emit_nested_closure(
 pub(crate) fn emit_native_closure(
     cx: &mut Cx<'_>,
     params: &[Pat],
-    body: &BlockStmt,
+    body: &FunctionBody,
     is_arrow: bool,
     is_async: bool,
     is_generator: bool,
@@ -1487,6 +1374,7 @@ pub(crate) fn emit_native_closure(
     }
     let mut upvalues: Vec<Upvalue> = Vec::new();
     let mut up_slots: Vec<u32> = Vec::new();
+    let mut capture_temps = 0;
 
     for name in &free {
         // §4.4: capturing the enclosing frame's implicit `arguments` cannot be
@@ -1497,14 +1385,21 @@ pub(crate) fn emit_native_closure(
         }
         // Live root captures also include native wrapper parameters that have not
         // otherwise been referenced yet. Ref descriptors defer the read until use.
-        let slot = if cx.opts.live_captures {
+        let dynamic = binding_has_with(cx, name) || binding_has_environment(cx, name);
+        let slot = if dynamic {
+            emit_binding_ref(cx, name);
+            let slot = cx.alloc_temp();
+            cx.emit(Instr::CaptureRef(slot));
+            capture_temps += 1;
+            slot
+        } else if cx.opts.live_captures {
             cx.resolve(name)
         } else if let Some(slot) = cx.lookup(name) {
             slot
         } else {
-            continue; // native module global
+            continue;
         };
-        let celled = cx.is_celled(name);
+        let celled = !dynamic && cx.is_celled(name);
         upvalues.push(Upvalue {
             name: Some(name.clone()),
             celled,
@@ -1532,6 +1427,7 @@ pub(crate) fn emit_native_closure(
         is_async,
         is_generator,
         self_name,
+        cx.opts.strict,
         &upvalues,
     ) else {
         // Codegen / reparse failure (never expected) — bail to native subtree.
@@ -1550,6 +1446,10 @@ pub(crate) fn emit_native_closure(
         is_arrow,
         up_slots,
     });
+    for _ in 0..capture_temps {
+        cx.emit(Instr::ClearRef(cx.temp_top - 1));
+        cx.free_temp();
+    }
 }
 
 /// Free names a nested fn references (its own params/locals/self-name excluded), in
@@ -1558,7 +1458,7 @@ pub(crate) fn emit_native_closure(
 /// thus the serialized bytecode + factory params — is byte-stable for a given seed.
 fn ordered_nested_free_names(
     params: &[Pat],
-    body: &BlockStmt,
+    body: &FunctionBody,
     self_name: Option<&str>,
 ) -> Vec<String> {
     super::native::free_names(params, body, self_name)
@@ -1567,19 +1467,6 @@ fn ordered_nested_free_names(
 /// True if a block body begins with its own `"use strict"` directive. Mirrors
 /// `crate::cells::has_use_strict_directive` (private) but is reachable from the compiler (which only
 /// imports `bytecode`'s module). Kept tiny and local.
-pub(crate) fn has_use_strict_directive_block(body: &BlockStmt) -> bool {
-    for s in &body.stmts {
-        match s {
-            Stmt::Expr(es) => match &*es.expr {
-                Expr::Lit(Lit::Str(lit)) => {
-                    if lit.value.as_str() == Some("use strict") {
-                        return true;
-                    }
-                }
-                _ => return false,
-            },
-            _ => return false,
-        }
-    }
-    false
+pub(crate) fn has_use_strict_directive_block(body: &FunctionBody) -> bool {
+    mangler_jsast::directives::has_use_strict(&body.stmts)
 }

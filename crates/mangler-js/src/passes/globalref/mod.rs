@@ -551,6 +551,7 @@ fn build_dispatcher_decl(gd_name: &str, anchor_name: &str, gn_name: &str, perm_n
     let body_expr = index(ident_expr(anchor_name), gn_idx);
 
     let func = Function {
+        this_param: None,
         params: vec![Param {
             span: DUMMY_SP,
             decorators: vec![],
@@ -562,9 +563,8 @@ fn build_dispatcher_decl(gd_name: &str, anchor_name: &str, gn_name: &str, perm_n
         decorators: vec![],
         span: DUMMY_SP,
         ctxt: SyntaxContext::empty(),
-        body: Some(BlockStmt {
+        body: Some(FunctionBody {
             span: DUMMY_SP,
-            ctxt: SyntaxContext::empty(),
             stmts: vec![Stmt::Return(ReturnStmt {
                 span: DUMMY_SP,
                 arg: Some(Box::new(body_expr)),
@@ -700,7 +700,7 @@ fn build_alias_decl(anchor_name: &str, alias: &str, gname: &str) -> Stmt {
 /// `var <name> = <init>;`
 fn single_var_decl(name: &str, init: Expr) -> Stmt {
     Stmt::Decl(Decl::Var(Box::new(VarDecl {
-        span: DUMMY_SP,
+        span: mangler_jsast::span::runtime_span(),
         ctxt: SyntaxContext::empty(),
         kind: VarDeclKind::Var,
         declare: false,

@@ -111,7 +111,10 @@ fn nums(v: &[u32]) -> String {
 /// Comma-join a string slice into a JS array body of double-quoted base64 literals
 /// (inputs are base64, no escaping needed).
 fn strs(v: &[String]) -> String {
-    v.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(",")
+    v.iter()
+        .map(|s| format!("\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The per-index decode primitive, authored as a FLAT, VM-eligible function
@@ -229,11 +232,8 @@ pub const VM_DECODE_PRIMITIVE: &str = r#"function(i, maskedB64, partArrs, lutP, 
 /// ONLY when the flag is on; the flag-off path embeds the unmodified primitive, so
 /// strings-in-VM output stays byte-identical to a build without Stage 5.
 pub fn vm_decode_primitive_with_trace() -> String {
-    let with_params = VM_DECODE_PRIMITIVE.replacen(
-        "selfDelta) {",
-        "selfDelta, traceExpected, traceByte) {",
-        1,
-    );
+    let with_params =
+        VM_DECODE_PRIMITIVE.replacen("selfDelta) {", "selfDelta, traceExpected, traceByte) {", 1);
     let acc = "  var _xa = (2166136261 ^ (keyOn ? 1 : 0)) >>> 0;\n  \
         var _xi = 0;\n  \
         while (_xi < bk.length) {\n    \
@@ -435,7 +435,9 @@ fn render_vm_decode_one(
     // body adds newlines, raising `_pd` to the tamper byte (ORs into the in-VM `_td`).
     let (probe_decl, probe_arg) = if tamper {
         (
-            format!("  var _pd=0; try{{ if(((\"\"+decodeOne).split(\"\\n\").length-1)>=3) _pd={tamper_byte}; }}catch(e){{}}\n"),
+            format!(
+                "  var _pd=0; try{{ if(((\"\"+decodeOne).split(\"\\n\").length-1)>=3) _pd={tamper_byte}; }}catch(e){{}}\n"
+            ),
             "_pd",
         )
     } else {
@@ -591,8 +593,8 @@ fn skip_string(bytes: &[u8], start: usize) -> Option<usize> {
 ///
 /// Computes `expected = djb2(""+interp) ^ djb2(normalize(""+decodeOne))` over the EXACT
 /// emitted source — the byte-faithful mirror of the runtime fold — then rewrites the
-/// unique [`SELF_COUPLED_SLOT`] token. A no-op (returns `output` unchanged) if the
-/// interpreter or the slot cannot be located (fail-safe).
+/// unique [`SELF_COUPLED_SLOT`] token. Missing source or hash metadata is a
+/// transformation error; an unpatched protection artifact is never returned.
 ///
 /// The interpreter + decode wrapper live INSIDE the protected `core` IIFE, so codegen
 /// may have RENAMED the interpreter local. We therefore locate the decode wrapper by
@@ -601,12 +603,18 @@ fn skip_string(bytes: &[u8], start: usize) -> Option<usize> {
 /// generated `interp_name` if that fails. Both spans are read from the FINAL output, so
 /// the hashes match the runtime `""+interp` / `""+decodeOne` exactly regardless of how
 /// the locals were renamed.
-pub fn patch_self_coupled_expected(output: String, interp_name: &str) -> String {
-    use mangler_core::hash::djb2_utf16;
+pub fn patch_self_coupled_expected(
+    output: String,
+    interp_name: &str,
+) -> mangler_core::Result<String> {
+    use mangler_core::{Error, hash::djb2_utf16};
 
     // The decode wrapper: the SMALLEST function span containing the unique slot token.
     let Some(slot_pos) = output.find(SELF_COUPLED_SLOT) else {
-        return output;
+        return Err(Error::transform(
+            "strings",
+            "Self-coupled decoder hash slot is missing",
+        ));
     };
     let mut decode_range: Option<std::ops::Range<usize>> = None;
     let mut search = 0usize;
@@ -627,7 +635,10 @@ pub fn patch_self_coupled_expected(output: String, interp_name: &str) -> String 
         search = fstart + "function".len();
     }
     let Some(decode_range) = decode_range else {
-        return output;
+        return Err(Error::transform(
+            "strings",
+            "Self-coupled decoder function could not be located",
+        ));
     };
     let wrapper_src = &output[decode_range.clone()];
 
@@ -635,18 +646,19 @@ pub fn patch_self_coupled_expected(output: String, interp_name: &str) -> String 
     // `return <interp>(<table>[…` — robust to the interpreter local being renamed —
     // and fall back to the generated name.
     let resolved_interp = interp_callee_in_wrapper(wrapper_src).unwrap_or(interp_name);
-    let interp_decl = format!("function {resolved_interp}(");
-    let Some(ip) = output.find(&interp_decl) else {
-        return output;
-    };
-    let Some(interp_range) = function_span(&output, ip) else {
-        return output;
+    let Some(interp_range) =
+        super::source_function::resolve(&output, resolved_interp, decode_range.clone())
+    else {
+        return Err(Error::transform(
+            "strings",
+            "Self-coupled interpreter source could not be resolved",
+        ));
     };
     let interp_src = &output[interp_range.clone()];
 
     let decode_src = normalize_self_coupled(&output[decode_range]);
     let expected = djb2_utf16(interp_src) ^ djb2_utf16(&decode_src);
-    output.replacen(SELF_COUPLED_SLOT, &self_coupled_token(expected), 1)
+    Ok(output.replacen(SELF_COUPLED_SLOT, &self_coupled_token(expected), 1))
 }
 
 /// Recover the interpreter callee name from a decode-wrapper source by finding its
@@ -701,7 +713,10 @@ fn render_core(params: &StubParams, n: usize) -> String {
     let decoy_block = if params.decoys.is_empty() {
         String::new()
     } else {
-        format!("try{{Object.freeze([{}]);}}catch(e){{}}\n", strs(&params.decoys))
+        format!(
+            "try{{Object.freeze([{}]);}}catch(e){{}}\n",
+            strs(&params.decoys)
+        )
     };
 
     // Anti-tamper (B4): when on, fold a DJB2-hash integrity delta `_td` into every
@@ -778,8 +793,10 @@ function __sh{k}(slot){{\n\
             sl = nums(&slot_to_logical),
         ));
     }
-    let shards_list =
-        (0..shard_count).map(|k| format!("__sh{k}")).collect::<Vec<_>>().join(",");
+    let shards_list = (0..shard_count)
+        .map(|k| format!("__sh{k}"))
+        .collect::<Vec<_>>()
+        .join(",");
 
     // VM path: both the `bk` base64+mask reconstruction AND the `rk` keystream
     // derivation move INTO the bytecode primitive, so the JS IIFE emits nothing.
@@ -836,7 +853,10 @@ pub fn render_stub(params: &StubParams) -> String {
                 ));
             }
             2 => {
-                let perm = params.shim_perm.as_ref().expect("shim_perm required for shim 2");
+                let perm = params
+                    .shim_perm
+                    .as_ref()
+                    .expect("shim_perm required for shim 2");
                 shim_decls.push_str(&format!("var {name}_perm = [{p}];\n", p = nums(perm)));
                 shim_decls.push_str(&format!(
                     "var {name} = function(i){{ return {core}({name}_perm[i]); }};\n",
@@ -880,6 +900,28 @@ mod tests {
             exec_trace_byte: 0,
             exec_trace_expected: 0,
         }
+    }
+
+    #[test]
+    fn optimized_raw_decoder_keeps_distinct_byte_and_text_buffers() {
+        use mangler_core::Language;
+        let mut params = base_params();
+        // One real encoded "next" entry. Use the raw generated decoder here so
+        // intrinsic isolation cannot accidentally conceal inlining collisions.
+        params.partitions = vec![vec!["BWh2mYlIBF1DNHgLPHCmHm1Ac/bA/OY=".into()]];
+        params.lut_p = vec![0];
+        params.lut_s = vec![0];
+        params.refs = vec![0];
+        params.base_key_b64 = "N4MK67+TFfItFH+a91Rf0R4=".into();
+        let source = format!("{}globalThis.__out=__core(0);", render_stub(&params));
+        let expected = "globalThis.__out='next';";
+        mangler_testkit::assert_behaviorally_equal(expected, &source);
+        let output = Js::with_globals(|| {
+            let mut ast = Js.parse(&source, &ParseOpts::default()).unwrap();
+            let marks = Js::resolve(&mut ast);
+            Js::print_optimized(ast, marks, false, &[])
+        });
+        mangler_testkit::assert_behaviorally_equal(expected, &output);
     }
 
     #[test]

@@ -368,17 +368,22 @@ globalThis.__out = greeting + "|" + obj["key name"] + "|" + f("Z") + "|" + tpl +
         // The patched sentinel binds the decode key to the interpreter + decode-wrapper
         // source. Tamper by inserting a harmless no-op at the top of the INTERPRETER
         // body: this changes `("" + interp)` → the runtime self-hash mismatches → every
-        // key byte is poisoned. The interpreter is the `function …(…){…}` declaration
-        // emitted immediately after the hoisted `var <rc>=Reflect.construct;` alias.
-        let alias = out
-            .find("=Reflect.construct;function ")
-            .expect("rc alias + interpreter");
-        // Advance to the interpreter body's opening brace (skip its param list).
-        let after_alias = alias + "=Reflect.construct;function ".len();
-        let brace = out[after_alias..]
-            .find('{')
-            .expect("interpreter body brace")
-            + after_alias;
+        // key byte is poisoned. Locate the generated interpreter by its entry
+        // ABI rather than a neighboring intrinsic alias that may be renamed.
+        struct InterpreterBody(Option<usize>);
+        impl swc_core::ecma::visit::Visit for InterpreterBody {
+            fn visit_fn_decl(&mut self, f: &swc_core::ecma::ast::FnDecl) {
+                if f.function.params.len() >= 9 {
+                    self.0 = f.function.body.as_ref().map(|body| body.span.lo.0 as usize - 1);
+                }
+                swc_core::ecma::visit::VisitWith::visit_children_with(f, self);
+            }
+        }
+        let ast = mangler_core::Language::parse(&Js, &out, &ParseOpts::default()).unwrap();
+        let mut finder = InterpreterBody(None);
+        swc_core::ecma::visit::VisitWith::visit_with(ast.program(), &mut finder);
+        let brace = finder.0.expect("generated interpreter entry");
+        assert_eq!(out.as_bytes()[brace], b'{');
         let mut tampered = String::with_capacity(out.len() + 8);
         tampered.push_str(&out[..=brace]);
         tampered.push_str("void 0;");
@@ -418,5 +423,18 @@ fn static_import_and_reexport_attributes_remain_literals() {
             !out.contains("encoded"),
             "ordinary strings must still encode"
         );
+    }
+}
+
+#[test]
+fn optimized_decoder_preserves_scopes_with_reserved_names() {
+    // The decoder's byte buffer and its UTF-8 helper's string accumulator both
+    // use `out`. Inlining must retain distinct bindings when names are reserved.
+    let src = r#"globalThis.__out = "next";"#;
+    for level in [Intensity::Medium, Intensity::High, Intensity::Max] {
+        let mut config = crate::test_support::resolved(level, 42);
+        config.engine.keep_names = vec!["*".into()];
+        let (out, _) = crate::process(src, &ParseOpts::default(), &config).unwrap();
+        mangler_testkit::assert_behaviorally_equal(src, &out);
     }
 }

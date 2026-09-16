@@ -7,7 +7,7 @@
 //! possible bug, so the safety net is "run the compiled program and compare its
 //! observable result to the original under `Object.is` semantics".
 
-use std::collections::HashSet;
+mod support;
 
 use mangler_core::Rng;
 use mangler_testkit::eval::{CaptureMode, assert_behaviorally_equal_with, eval_same_value_with};
@@ -22,7 +22,7 @@ use swc_core::ecma::parser::{EsSyntax, Parser, StringInput, Syntax, lexer::Lexer
 /// Parse a function-expression source into `(name, params, body)`. `name` is the
 /// function's own identifier (a named function expression like `function fac(){…}`),
 /// or `None` for an anonymous one.
-fn parse_fn_named(src: &str) -> (Option<String>, Vec<Param>, BlockStmt) {
+fn parse_fn_named(src: &str) -> (Option<String>, Vec<Param>, FunctionBody) {
     let cm: Lrc<SourceMap> = Default::default();
     let wrapped = format!("var __f = ({src});");
     let fm = cm.new_source_file(Lrc::new(FileName::Custom("t.js".into())), wrapped);
@@ -58,7 +58,7 @@ fn parse_fn_named(src: &str) -> (Option<String>, Vec<Param>, BlockStmt) {
 }
 
 /// Parse a function-expression source into `(params, body)`.
-fn parse_fn(src: &str) -> (Vec<Param>, BlockStmt) {
+fn parse_fn(src: &str) -> (Vec<Param>, FunctionBody) {
     let cm: Lrc<SourceMap> = Default::default();
     let wrapped = format!("var __f = ({src});");
     let fm = cm.new_source_file(Lrc::new(FileName::Custom("t.js".into())), wrapped);
@@ -117,7 +117,7 @@ fn render(stmts: Vec<Stmt>) -> String {
 /// Build a complete program that defines `f` as a VM-virtualized thunk for the given
 /// function-expression source, drawing diversification from `seed`. Returns `None` if
 /// the body bails (unsupported construct) — a bail is never a miscompile, the caller
-/// just skips that body. `pcount`/`caps` are threaded into the thunk's call.
+/// just skips that body. The shared entry helper supplies native arguments metadata.
 fn virtualize(src: &str, seed: u64) -> Option<String> {
     let (own_name, params, body) = parse_fn_named(src);
     let compiled = mangler_vm::compile_body(&params, &body).ok()?;
@@ -137,27 +137,15 @@ fn virtualize(src: &str, seed: u64) -> Option<String> {
     };
     let vt = tb.finish(&names).expect("finish");
 
-    // The thunk replaces the BODY of the (possibly named) function, keeping its own
-    // name `f` (or the source's name) so a named-fn-expr self-reference capture
-    // resolves to the thunk itself — exactly as the real pass replaces a function's
-    // body in place. `function f(<params>){ return <interp>(T[i][0],T[i][1],arguments,[caps],capStart,pcount,this); }`
     let fn_name = own_name.as_deref().unwrap_or("f");
-    let interp = if chunk.needs_eh {
-        &names.eh_interp
-    } else {
-        &names.lean_interp
-    };
     let caps = format!("[{}]", chunk.captures.join(","));
-    let param_src: Vec<String> = (0..chunk.pcount).map(|i| format!("p{i}")).collect();
-    let thunk = format!(
-        "function {fn_name}({}){{return {interp}({}[{}][0],{}[{}][1],arguments,{caps},{},{},this);}}\nvar f={fn_name};",
-        param_src.join(","),
-        names.table,
-        chunk.index,
-        names.table,
-        chunk.index,
-        chunk.cap_start,
-        chunk.pcount,
+    let thunk = support::entry(
+        &names.table,
+        &chunk,
+        fn_name,
+        &caps,
+        false,
+        support::function_length(&params),
     );
 
     let prologue = render(vt.prologue);
@@ -331,11 +319,9 @@ fn deterministic_same_seed_same_bytes() {
     assert_eq!(v1, v2, "same seed must produce byte-identical VM output");
 }
 
-/// Transform a complete fuzz program: find `function f(a,b,c){…}`, virtualize its
-/// body, and re-emit the program with the VM prologue prepended and the function's
-/// body replaced by a thunk. If the body bails, return the program UNCHANGED (a bail
-/// is never a miscompile — the function simply stays un-virtualized). This mirrors
-/// what the real virtualize pass does in-place.
+/// Transform a complete fuzz program's top-level `f` with the shared VM entry
+/// wrapper. Its native factory owns arguments and parameter references, as it does
+/// for VM-created closures. An unsupported body leaves the program unchanged.
 fn fuzz_virtualize(program: &str, seed: u64) -> String {
     fuzz_virtualize_mode(program, seed, false)
 }
@@ -349,89 +335,74 @@ fn fuzz_virtualize_strict(program: &str, seed: u64) -> String {
 fn fuzz_virtualize_mode(program: &str, seed: u64, strict: bool) -> String {
     use mangler_core::Language;
     use mangler_jsast::lang::{Js, ParseOpts};
-    use swc_core::ecma::visit::{VisitMut, VisitMutWith};
 
     let mut ast = match Js.parse(program, &ParseOpts::default()) {
-        Ok(a) => a,
+        Ok(ast) => ast,
         Err(_) => return program.to_string(),
     };
-
-    // Find the `f` function, compile its body, build the shared table, and replace
-    // the body with a thunk. We collect the prologue out of the visitor.
-    struct V {
-        seed: u64,
-        strict: bool,
-        prologue: Option<Vec<Stmt>>,
-    }
-    impl VisitMut for V {
-        fn visit_mut_fn_decl(&mut self, n: &mut FnDecl) {
-            if n.ident.sym.as_ref() != "f" || self.prologue.is_some() {
-                return;
-            }
-            let Some(body) = n.function.body.clone() else {
-                return;
-            };
-            let params = n.function.params.clone();
-            let Ok(compiled) = mangler_vm::compile_body(&params, &body) else {
-                return;
-            };
-
-            let div = VmDiversity::draw(&mut Rng::for_pass(self.seed, "vm"));
-            let mut tb = TableBuilder::with_diversity(div);
-            let chunk = tb.add_strict(compiled, self.strict);
-            let names = VmNames {
-                lean_interp: "Vv".into(),
-                eh_interp: "Dd".into(),
-                lean_interp_strict: "Vs".into(),
-                eh_interp_strict: "Ds".into(),
-                table: "Tt".into(),
-                rc: "rcc".into(),
-                sy: "syy".into(),
-            };
-            let vt = tb.finish(&names).expect("finish");
-            let interp = names.interp_for(chunk.needs_eh, chunk.is_strict);
-            let caps = format!("[{}]", chunk.captures.join(","));
-            let directive = if self.strict { "\"use strict\";" } else { "" };
-            let thunk_src = format!(
-                "{directive}return {interp}({}[{}][0],{}[{}][1],arguments,{caps},{},{},this);",
-                names.table, chunk.index, names.table, chunk.index, chunk.cap_start, chunk.pcount,
-            );
-            // Parse the thunk body and install it.
-            let wrapped = Js
-                .parse(
-                    &format!("function _(){{{thunk_src}}}"),
-                    &ParseOpts::default(),
-                )
-                .unwrap();
-            let new_body = match wrapped.into_program() {
-                Program::Script(s) => match s.body.into_iter().next().unwrap() {
-                    Stmt::Decl(Decl::Fn(fd)) => fd.function.body.unwrap(),
-                    _ => return,
-                },
-                _ => return,
-            };
-            n.function.body = Some(new_body);
-            self.prologue = Some(vt.prologue);
-        }
-        fn visit_mut_arrow_expr(&mut self, _: &mut ArrowExpr) {}
-    }
-
-    let mut v = V {
-        seed,
-        strict,
-        prologue: None,
+    let Program::Script(script) = ast.program_mut() else {
+        return program.to_string();
     };
-    ast.program_mut().visit_mut_with(&mut v);
-    let Some(prologue) = v.prologue else {
-        return program.to_string(); // f not found or bailed
+    let Some(index) = script
+        .body
+        .iter()
+        .position(|stmt| matches!(stmt, Stmt::Decl(Decl::Fn(f)) if f.ident.sym == "f"))
+    else {
+        return program.to_string();
     };
-
-    // Prepend the prologue at module scope.
-    if let Program::Script(s) = ast.program_mut() {
-        let mut new_body = prologue;
-        new_body.append(&mut s.body);
-        s.body = new_body;
-    }
+    let Stmt::Decl(Decl::Fn(declaration)) = &script.body[index] else {
+        unreachable!()
+    };
+    let Some(body) = &declaration.function.body else {
+        return program.to_string();
+    };
+    let params = &declaration.function.params;
+    let Ok(compiled) = mangler_vm::compile_body_with_opts(
+        params,
+        body,
+        mangler_vm::CompileOptions {
+            strict,
+            ..Default::default()
+        },
+    ) else {
+        return program.to_string();
+    };
+    let div = VmDiversity::draw(&mut Rng::for_pass(seed, "vm"));
+    let mut tb = TableBuilder::with_diversity(div);
+    let chunk = tb.add_strict(compiled, strict);
+    let names = VmNames {
+        lean_interp: "Vv".into(),
+        eh_interp: "Dd".into(),
+        lean_interp_strict: "Vs".into(),
+        eh_interp_strict: "Ds".into(),
+        table: "Tt".into(),
+        rc: "rcc".into(),
+        sy: "syy".into(),
+    };
+    let vt = tb.finish(&names).expect("finish");
+    let caps = format!("[{}]", chunk.captures.join(","));
+    let entry = support::entry(
+        &names.table,
+        &chunk,
+        "f",
+        &caps,
+        false,
+        support::function_length(params),
+    );
+    let Program::Script(mut wrapper) = Js
+        .parse(&entry, &ParseOpts::default())
+        .unwrap()
+        .into_program()
+    else {
+        unreachable!()
+    };
+    script.body.remove(index);
+    // The replacement is initialized before the source program, preserving the
+    // original declaration's availability even for calls preceding its text.
+    let mut statements = vt.prologue;
+    statements.append(&mut wrapper.body);
+    statements.append(&mut script.body);
+    script.body = statements;
     Js.print(&ast)
 }
 
@@ -464,12 +435,19 @@ fn fuzz_across_vm_seeds() {
 
 /// Build a program that defines `f` as a VM thunk for an anonymous function-expression
 /// `src`, virtualized under the given strictness. When `is_strict`, the chunk is
-/// registered strict (routing to a strict interpreter variant) and the thunk carries a
-/// leading `"use strict"` so a plain call forwards the un-coerced (`undefined`)
-/// receiver. Returns `None` on a compile bail.
+/// registered strict and the shared entry factory forwards the un-coerced
+/// (`undefined`) receiver of a plain call. Returns `None` on a compile bail.
 fn virtualize_with_strict(src: &str, seed: u64, is_strict: bool) -> Option<String> {
     let (params, body) = parse_fn(src);
-    let compiled = mangler_vm::compile_body(&params, &body).ok()?;
+    let compiled = mangler_vm::compile_body_with_opts(
+        &params,
+        &body,
+        mangler_vm::CompileOptions {
+            strict: is_strict,
+            ..Default::default()
+        },
+    )
+    .ok()?;
 
     let div = VmDiversity::draw(&mut Rng::for_pass(seed, "vm"));
     let mut tb = TableBuilder::with_diversity(div);
@@ -485,19 +463,14 @@ fn virtualize_with_strict(src: &str, seed: u64, is_strict: bool) -> Option<Strin
         sy: "syy".into(),
     };
     let vt = tb.finish(&names).expect("finish");
-    let interp = names.interp_for(chunk.needs_eh, chunk.is_strict);
     let caps = format!("[{}]", chunk.captures.join(","));
-    let param_src: Vec<String> = (0..chunk.pcount).map(|i| format!("p{i}")).collect();
-    let directive = if is_strict { "\"use strict\";" } else { "" };
-    let thunk = format!(
-        "function f({}){{{directive}return {interp}({}[{}][0],{}[{}][1],arguments,{caps},{},{},this);}}",
-        param_src.join(","),
-        names.table,
-        chunk.index,
-        names.table,
-        chunk.index,
-        chunk.cap_start,
-        chunk.pcount,
+    let thunk = support::entry(
+        &names.table,
+        &chunk,
+        "f",
+        &caps,
+        false,
+        support::function_length(&params),
     );
     let prologue = render(vt.prologue);
     Some(format!("{prologue}\n{thunk}"))
@@ -587,10 +560,9 @@ fn strict_store_to_getter_only_throws() {
     }
 }
 
-/// §5a case 3: reading `arguments.callee` is an irreducible divergence → the body must
-/// BAIL eligibility (stay native), so the VM never miscompiles it.
+/// Native arguments retain callee/caller semantics without reconstruction.
 #[test]
-fn arguments_callee_bails() {
+fn arguments_callee_uses_native_object() {
     for src in [
         "function(){ return arguments.callee; }",
         "function(){ return arguments.caller; }",
@@ -600,9 +572,9 @@ fn arguments_callee_bails() {
         assert!(
             matches!(
                 mangler_vm::classify_body(&params, &body),
-                mangler_vm::Eligibility::Skip("arguments_callee")
+                mangler_vm::Eligibility::Eligible
             ),
-            "`{src}` must bail arguments_callee"
+            "`{src}` retains native arguments descriptors"
         );
     }
     // Plain `arguments` use (no callee/caller) stays eligible.
@@ -683,22 +655,14 @@ fn virtualize_opts(
         sy: "syy".into(),
     };
     let vt = tb.finish(&names).expect("finish");
-    let interp = if chunk.needs_eh {
-        &names.eh_interp
-    } else {
-        &names.lean_interp
-    };
     let caps = format!("[{}]", chunk.captures.join(","));
-    let param_src: Vec<String> = (0..chunk.pcount).map(|i| format!("p{i}")).collect();
-    let thunk = format!(
-        "function f({}){{return {interp}({}[{}][0],{}[{}][1],arguments,{caps},{},{},this);}}",
-        param_src.join(","),
-        names.table,
-        chunk.index,
-        names.table,
-        chunk.index,
-        chunk.cap_start,
-        chunk.pcount,
+    let thunk = support::entry(
+        &names.table,
+        &chunk,
+        "f",
+        &caps,
+        false,
+        support::function_length(&params),
     );
     let prologue = render(vt.prologue);
     Some(format!("{prologue}\n{thunk}"))
@@ -709,25 +673,56 @@ fn virtualize_opts(
 fn assert_opts_equiv(src: &str, call_args: &str, exclude: Option<&str>, divert: bool) {
     let orig = original_program(src, call_args);
     for seed in [1u64, 7, 42] {
-        let Some(v) = virtualize_opts(src, seed, exclude, divert) else {
-            return; // bailed: never a miscompile
-        };
+        let v = virtualize_opts(src, seed, exclude, divert)
+            .unwrap_or_else(|| panic!("supported fixture must virtualize: {src}"));
         let prog = format!("{v}\nglobalThis.__out=JSON.stringify(f({call_args}));");
         assert_behaviorally_equal_with(&orig, &prog, &CaptureMode::sink());
     }
 }
 
-/// An excluded nested `function render` inside a virtualized body stays native: the
-/// rendered output carries its body byte-for-byte (a `function render` literal, not a
-/// thunk/bytecode), AND it behaves identically.
+/// Verify exclusion through the compiler's native-closure instruction and factory,
+/// independently of printer choices for naming that function.
+fn assert_excluded_native_factory(source: &str, exclude: &str) {
+    let (params, body) = parse_fn(source);
+    let compiled = mangler_vm::compile_body_with_opts(
+        &params,
+        &body,
+        mangler_vm::CompileOptions {
+            exclude: Some(exclude),
+            ..Default::default()
+        },
+    )
+    .expect("excluded closure compiles");
+    let factories: Vec<_> = compiled
+        .code
+        .iter()
+        .filter_map(|instruction| {
+            if let mangler_vm::isa::Instr::MakeNativeClosure { const_idx, .. } = instruction {
+                Some(*const_idx as usize)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        factories.len(),
+        1,
+        "the excluded source body must be a native closure"
+    );
+    assert!(matches!(
+        &compiled.consts[factories[0]],
+        mangler_vm::chunk::Const::NativeFactory(_)
+    ));
+    assert!(
+        compiled.children.is_empty(),
+        "excluded body must not become a bytecode child"
+    );
+}
+
 #[test]
 fn excluded_function_decl_stays_native() {
-    let src = "function(n){ function render(){ return n * 3; } return render() + 1; }";
-    let v = virtualize_opts(src, 7, Some("render"), false).expect("compiles");
-    assert!(
-        v.contains("function render("),
-        "excluded `render` must appear as native source, not bytecode:\n{v}"
-    );
+    let src = "function(n){function render(){return n*3}return [render()+1,render.name]}";
+    assert_excluded_native_factory(src, "render");
     assert_opts_equiv(src, "5", Some("render"), false);
 }
 
@@ -759,15 +754,8 @@ fn excluded_arrow_and_member_binding_stay_native() {
 /// enclosing local through a cell: the written value is observed after the calls.
 #[test]
 fn excluded_mutable_capture_native_closure() {
-    // `tick` captures-and-mutates `count`; excluded → native closure over the cell.
-    let src = "function(){ var count=0; function tick(){ count = count + 1; return count; } \
-               tick(); tick(); return tick() + count; }";
-    let v = virtualize_opts(src, 7, Some("tick"), false).expect("compiles");
-    assert!(
-        v.contains("function tick("),
-        "excluded `tick` stays native:\n{v}"
-    );
-    // 1,2,3 → returns 3 + count(=3) = 6.
+    let src = "function(){var count=0;function tick(){count=count+1;return count}tick();tick();return [tick()+count,tick.name]}";
+    assert_excluded_native_factory(src, "tick");
     assert_opts_equiv(src, "", Some("tick"), false);
 }
 
@@ -786,54 +774,66 @@ fn excluded_arrow_lexical_this_native_closure() {
     assert_behaviorally_equal_with(&orig, &prog, &CaptureMode::sink());
 }
 
-/// Coverage (§4.1): async / generator / `with` / `"use strict"` nested functions
-/// divert to native closures under `divert_ineligible`, and the whole program still
-/// runs identically (instead of failing the parent compile).
+/// Low-level clients may explicitly divert suspension bodies that have not yet
+/// passed through the JS frontend's state-machine lowering.
 #[test]
-fn ineligible_nested_diverts_to_native() {
-    // generator
-    let g = "function(){ function* gen(){ yield 1; yield 2; } var it=gen(); return it.next().value + it.next().value; }";
-    let v = virtualize_opts(g, 7, None, true).expect("compiles with divert");
-    assert!(v.contains("function*"), "generator stays native:\n{v}");
-    assert_opts_equiv(g, "", None, true);
-
-    // async (observed via a sync wrapper that checks the returned value is a Promise)
-    let a = "function(){ async function af(){ return 5; } return typeof af().then; }";
-    let v2 = virtualize_opts(a, 7, None, true).expect("compiles with divert");
-    assert!(v2.contains("async"), "async stays native:\n{v2}");
-    assert_opts_equiv(a, "", None, true);
-
-    // A native factory cannot reproduce dynamic lookup of hidden VM locals.
-    for (source, reason) in [
+fn unprepared_suspension_requires_lowering_or_explicit_diversion() {
+    for (source, args) in [
         (
-            "function(o){ function rd(){ with(o){ return x + y; } } return rd(); }",
-            "native_with",
+            "function(){function* gen(){yield 1;yield 2}var it=gen();return it.next().value+it.next().value}",
+            "",
         ),
         (
-            "function(x){ function rd(){ return eval('x'); } return rd(); }",
-            "native_direct_eval",
+            "function(){async function af(){return 5}return typeof af().then}",
+            "",
         ),
     ] {
         let (params, body) = parse_fn(source);
-        let result = mangler_vm::compile_body_with_opts(
+        assert_eq!(
+            mangler_vm::compile_body(&params, &body).unwrap_err(),
+            "nested_async_generator"
+        );
+        assert_opts_equiv(source, args, None, true);
+    }
+}
+
+#[test]
+fn supported_nested_scopes_compile_as_bytecode_even_with_diversion_enabled() {
+    let with = "function(o){var x=1,y=2;function rd(){with(o){return x+y}}return rd()}";
+    assert_opts_equiv(with, "{x:3,y:4}", None, true);
+    let strict = "function(){function st(){'use strict';return typeof this}return st()}";
+    assert_opts_equiv(strict, "", None, true);
+    let eval = "function(x){function rd(){return eval('x')}return rd()}";
+    for source in [with, strict, eval] {
+        let (params, body) = parse_fn(source);
+        let compiled = mangler_vm::compile_body_with_opts(
             &params,
             &body,
             mangler_vm::CompileOptions {
                 divert_ineligible: true,
                 ..Default::default()
             },
+        )
+        .expect("supported nested scope compiles");
+        assert_eq!(
+            compiled.children.len(),
+            1,
+            "supported source closure must be bytecode"
         );
-        assert_eq!(result.unwrap_err(), reason);
+        assert!(!compiled.code.iter().any(|instruction| matches!(
+            instruction,
+            mangler_vm::isa::Instr::MakeNativeClosure { .. }
+        )));
+        if source == eval {
+            assert!(
+                compiled.children[0]
+                    .compiled
+                    .code
+                    .iter()
+                    .any(|instruction| matches!(instruction, mangler_vm::isa::Instr::EvalCall(_)))
+            );
+        }
     }
-
-    // own `"use strict"` nested fn diverts to native.
-    let s = "function(){ function st(){ \"use strict\"; return typeof this; } return st(); }";
-    let v4 = virtualize_opts(s, 7, None, true).expect("compiles with divert");
-    assert!(
-        v4.contains("use strict"),
-        "strict nested fn stays native:\n{v4}"
-    );
-    assert_opts_equiv(s, "", None, true);
 }
 
 /// A native closure that reads a module GLOBAL leaves it untouched (resolved at
@@ -861,19 +861,15 @@ fn native_closure_deterministic_same_seed_same_bytes() {
 }
 
 #[test]
-fn bail_leaves_no_output() {
-    // `with` is a permanent structural bail; the compiler returns Err, so virtualize
-    // returns None (the caller leaves the function un-virtualized — never a
-    // miscompile). Confirm classify_body agrees.
-    let (params, body) = parse_fn("function(o){ with(o){ return x; } }");
+fn with_scope_has_mandatory_vm_coverage() {
+    let source = "function(o){var x=1;with(o){x=x+2;return [x,o.x]}}";
+    let (params, body) = parse_fn(source);
     assert!(matches!(
         mangler_vm::classify_body(&params, &body),
-        mangler_vm::Eligibility::Skip(_)
+        mangler_vm::Eligibility::Eligible
     ));
-    let mut used = HashSet::new();
-    used.insert("x".to_string());
-    // The compiler also bails directly.
-    assert!(mangler_vm::compile_body(&params, &body).is_err());
+    assert_vm_required_equiv(source, "{x:5}");
+    assert_vm_required_equiv(source, "{}");
 }
 
 /// These regressions must compile; silently bailing would hide lost coverage.
@@ -1046,4 +1042,47 @@ fn destructuring_stops_advancing_after_iterator_exhaustion() {
             &CaptureMode::sink(),
         );
     }
+}
+
+#[test]
+fn behavioral_entries_use_native_arguments_and_parameter_references() {
+    let source = "function f(a){a=7;return [arguments[0],arguments.callee===f]}";
+    let expected = original_program(source, "1");
+    for seed in [1, 7, 42] {
+        let output = virtualized_program(source, "1", seed).expect("native arguments compile");
+        assert_behaviorally_equal_with(&expected, &output, &CaptureMode::sink());
+
+        let strict = "function(a){'use strict';a=7;return arguments[0]}";
+        let output = virtualize_with_strict(strict, seed, true).expect("strict arguments compile");
+        assert_behaviorally_equal_with(
+            &original_program(strict, "1"),
+            &format!("{output};globalThis.__out=JSON.stringify(f(1));"),
+            &CaptureMode::sink(),
+        );
+
+        let source = "function(a=2){a=7;return [arguments[0],f.length]}";
+        let output = virtualize_opts(source, seed, None, false).expect("default arguments compile");
+        assert_behaviorally_equal_with(
+            &original_program(source, ""),
+            &format!("{output};globalThis.__out=JSON.stringify(f());"),
+            &CaptureMode::sink(),
+        );
+
+        let program = "function f(a){a=7;return JSON.stringify([arguments[0],arguments.callee===f])}globalThis.__out=f(1);";
+        let output = fuzz_virtualize(program, seed);
+        assert_ne!(program, output, "fuzz entry must compile this fixture");
+        assert_behaviorally_equal_with(program, &output, &CaptureMode::sink());
+    }
+}
+
+#[test]
+fn escaped_use_strict_keeps_sloppy_receiver_and_argument_aliases() {
+    assert_vm_required_equiv(
+        r"function(a){'use\x20strict';a=7;return [typeof this,arguments[0]]}",
+        "1",
+    );
+    assert_vm_required_equiv(
+        r"function(){function inner(a){'use\u0020strict';a=7;return [typeof this,arguments[0]]}return inner(1)}",
+        "",
+    );
 }

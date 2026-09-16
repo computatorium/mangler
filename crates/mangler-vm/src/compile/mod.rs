@@ -1,42 +1,33 @@
-//! AST → bytecode compiler (bail-to-safe), decomposed per construct family.
+//! JavaScript function bodies to executable VM bytecode.
 //!
-//! Compiles one eligible function body into a [`Compiled`] chunk — a flat
-//! stack-machine program ([`Instr`] stream + [`Const`] pool) that the generated
-//! interpreter ([`crate::emit`]) executes. The entry points are [`compile_body`] /
-//! [`compile_body_boxed`] / [`compile_body_with_plan`]; each returns `Err(reason)`
-//! to bail (the function then stays un-virtualized — **a bail is never a
-//! miscompile**).
+//! A frame has positional input slots, parameter and body bindings, a bounded
+//! scratch pool, and a final contiguous capture segment. Non-simple parameter
+//! lists initialize in source order using temporal-dead-zone descriptors. Their
+//! parameter-expression environment stays distinct from body var declarations;
+//! simple duplicate parameters retain the final positional binding.
 //!
-//! ## Flat-slot frame model
-//! The VM has no scope objects: every binding lives in a numbered slot of a single
-//! flat local array `L`. The slot layout for a frame is contiguous and ordered:
-//!   * params and body locals (`var` / hoisted fn-decl / block-scoped `let`/`const`)
-//!     occupy slots `< cap_floor`;
-//!   * an anonymous temp pool (`temp_base..cap_floor`) sits after locals;
-//!   * captures (free upvalues, allocated lazily on first reference) are the LAST
-//!     contiguous slots, `>= cap_floor`.
+//! Declaration collection assigns lexical bindings stable slots keyed by declaration
+//! node identity. Emission maintains lexical scope maps and initializes runtime binding
+//! descriptors when a scope is entered. Descriptors preserve TDZ, const writes,
+//! closure sharing, and loop iteration identity. Function declarations initialize
+//! at function or block entry; sloppy block declarations additionally update their
+//! permitted Annex B var binding at the declaration statement.
 //!
-//! `cap_floor` is frozen once params + locals are allocated, so the `< cap_floor`
-//! test cleanly separates "param/local" from "capture", and `cap_start =
-//! slots - captures.len()` is where the thunk threads the captured values in.
+//! Captures can be values, legacy shared cells, or live reference descriptors.
+//! Active with object records participate in name resolution and preserve call
+//! receivers. External var bindings let a caller own declarations, including eval
+//! variable environments and native outer-scope envelopes. Compiler-owned bindings
+//! remain inaccessible to with-object interception.
 //!
-//! ## Two-pass slot allocation (single source of truth)
-//! Because virtualize runs pre-resolver, the AST carries NO resolver marks; slot
-//! identity is instead pinned to source position. A `DeclCollector` pre-pass walks
-//! the body ONCE and allocates exactly one slot per block-scoped binding, keyed by
-//! the declaration ident's `BytePos` (`decl_slots`). Emission then never invents
-//! slots: on entering a block / catch / for-head it looks each binding's slot up by
-//! `BytePos` and populates a fresh lexical scope frame (`scopes`, walked
-//! innermost-first by `lookup`/`resolve`). The two passes share `decl_slots` so
-//! they can never disagree on which slot a name owns.
+//! The allocation pass also computes scratch requirements. Binary expression
+//! spines use heap worklists in analysis and emission so large generated expressions
+//! do not consume one Rust stack frame per operand. Capture slots stay contiguous
+//! after scratch slots regardless of the order in which free names are discovered.
 //!
-//! ## Decomposition
-//! The compiler is split per construct family: this module holds the frame model
-//! (`Cx`), slot allocation (`DeclCollector`), and the entry points; `stmt` holds
-//! the statement compiler; `expr` the expression compiler; and `destructure` the
-//! destructuring / spread / iterator helpers. All the `emit_*` free functions take
-//! `&mut Cx` and are `pub(crate)` so they compose across the submodules exactly as
-//! the legacy single-file compiler did.
+//! This module owns frame layout and declaration allocation. Statement, expression,
+//! destructuring, and reference lowering live in their respective submodules.
+//! Unsupported or malformed constructs return an explicit compilation error;
+//! explicit native exclusions are controlled separately by CompileOptions.
 
 use std::collections::HashMap;
 
@@ -47,36 +38,66 @@ use crate::cells;
 use crate::chunk::{ChildChunk, Compiled, Const};
 use crate::isa::Instr;
 
-/// Compile-time options that steer the Phase-3 native-closure escape hatch (§4).
-/// Threaded from the virtualize pass (which owns the `--virtualize-exclude` glob)
-/// down into [`emit_nested_closure`], where the divert decision is made. The
-/// default (`exclude: None`, `divert_ineligible: false`) is byte-for-byte the
-/// pre-Phase-3 behavior: a nested fn always becomes a child chunk and an
-/// ineligible one bails the parent.
+/// Frame binding contracts and explicit closure policy supplied by the caller.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CompileOptions<'a> {
     /// Name-glob of nested functions to KEEP NATIVE (run as a native closure
     /// inside the VM frame). `None` = match nothing.
     pub exclude: Option<&'a str>,
-    /// When true, a nested function that is async/generator/`"use strict"`/
-    /// structurally-ineligible/otherwise un-virtualizable is diverted to a native
-    /// closure instead of bailing the whole parent (coverage maximization, §4.1).
-    /// When false (the default), such a nested fn bails the parent as before.
+    /// Explicit legacy policy permitting a native child when compilation fails.
+    /// Native children are reported separately from protected VM chunks.
     pub divert_ineligible: bool,
     /// Captures are live property descriptors supplied by the calling thunk.
     pub live_captures: bool,
+    /// Captures whose object/environment receiver and resolution remain dynamic.
+    pub dynamic_captures: Option<&'a std::collections::HashSet<String>>,
+    /// Source-resolved dynamic compiler references, keyed by expression position.
+    pub source_compiler_sites: Option<&'a std::collections::HashSet<u32>>,
+    /// Lossless source markers restored once as this frame's constants form.
+    pub source_utf16: Option<&'a crate::source_text::SourceTextMap>,
     /// The native wrapper already initialized parameters and owns arguments.
     pub native_parameters: bool,
+    /// Arrows inherit arguments from their enclosing function.
+    pub lexical_arguments: bool,
+    /// Inherited or explicit strict mode.
+    pub strict: bool,
+    /// This body is an eval StatementList rather than a new function activation.
+    pub eval_context: bool,
+    /// Original source grammar, independent of the synthetic entry shell.
+    pub source_context: crate::eval::SourceContext,
+    /// Source class grammar and opaque capsules, keyed by direct eval position.
+    pub eval_class_contexts: Option<&'a crate::eval::EvalClassContexts>,
+    /// Synthetic lexical entry sharing the incoming variable environment.
+    pub lexical_entry: bool,
+    /// Immutable named function-expression binding supplied by MakeClosure.
+    pub self_binding: Option<&'a str>,
+    /// Compiler-owned bindings cannot be intercepted by with object records.
+    pub internal_bindings: Option<&'a std::collections::HashSet<String>>,
+    /// Var declarations backed by a caller-owned variable environment.
+    /// For lexical/eval entries this is the complete source var set, including
+    /// permitted Annex B aliases; a partition must not invent additional aliases.
+    pub external_var_bindings: Option<&'a std::collections::HashSet<String>>,
+    /// Native suspension shell kind for each lowered executable body.
+    /// Original lexical names preserved by suspension cell lowering at eval sites.
+    pub suspension_references: Option<&'a crate::eval::SuspensionLexicalReferences>,
+    pub suspension_lexicals: Option<&'a crate::eval::SuspensionLexicalScopes>,
+    pub suspensions: Option<&'a HashMap<u32, crate::chunk::SuspensionKind>>,
 }
 
 pub(crate) mod destructure;
+pub(crate) mod dynamic_scope;
+pub(crate) mod environment;
 pub(crate) mod expr;
 pub(crate) mod native;
+pub(crate) mod object_super;
+pub(crate) mod projection;
 pub(crate) mod stmt;
 
 // Re-export the construct-family emit entry points used across submodules and by
 // the parent (the names the legacy single-file compiler exposed at module scope).
 pub(crate) use destructure::*;
+pub(crate) use dynamic_scope::*;
+pub(crate) use environment::*;
 pub(crate) use expr::*;
 pub(crate) use stmt::*;
 
@@ -93,10 +114,9 @@ pub(crate) enum FrameKind {
 /// patched when the construct's exit / continuation point is known.
 pub(crate) struct Frame {
     pub(crate) kind: FrameKind,
-    /// The label attached to the construct, if any (e.g. `outer: for(...)`).
-    /// Set from `pending_label` (loops) or directly (labeled blocks); `None` for
-    /// an unlabeled construct.
-    pub(crate) label: Option<String>,
+    /// All labels attached to this construct (`outer: inner: for (...)`).
+    /// Empty for an unlabeled construct.
+    pub(crate) labels: Vec<String>,
     /// The live `PushHandler` count a `break` to this frame must unwind down to.
     /// For ordinary loops this is the depth at frame entry; for `for-of` it is the
     /// depth OUTSIDE the close handler, so `break` runs the iterator close.
@@ -107,6 +127,19 @@ pub(crate) struct Frame {
     pub(crate) continue_handler_depth: u32,
     pub(crate) break_jumps: Vec<usize>,
     pub(crate) continue_jumps: Vec<usize>,
+}
+
+/// Identity of a declaration node during one immutable compilation. Distinct
+/// generated declarations may share both their resolved Id and source span.
+/// Addresses are lookup-only: never order by them or emit them into bytecode.
+/// Any AST normalization or cloning must occur before allocation; emission must
+/// use those same borrowed declarations when looking up their slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct DeclarationKey(usize);
+impl DeclarationKey {
+    pub(crate) fn of(identifier: &Ident) -> Self {
+        Self(std::ptr::from_ref(identifier).addr())
+    }
 }
 
 pub(crate) struct Cx<'a> {
@@ -121,20 +154,23 @@ pub(crate) struct Cx<'a> {
     /// (`resolve`) walks frames innermost-first; a name found in no frame is a free
     /// capture allocated into the function frame.
     pub(crate) scopes: Vec<HashMap<String, u32>>,
-    /// Authoritative slot for each **block-scoped** binding declaration, keyed by
-    /// the declared identifier's span (`BytePos.0`). The `DeclCollector` pre-pass
-    /// is the single source of truth: it allocates one fresh slot per block-scoped
-    /// binding (v1 never recycles slots across sibling blocks) and records it here;
-    /// emission looks the slot up by span when it enters the binding's block and
-    /// populates the new frame — so the two passes never disagree on a slot.
-    pub(crate) decl_slots: HashMap<u32, u32>,
+    pub(crate) with_scopes: Vec<(usize, u32)>,
+    pub(crate) needs_environment: bool,
+    pub(crate) dynamic_variables: bool,
+    pub(crate) hidden_environment_bindings: std::collections::HashSet<String>,
+    pub(crate) simple_catch_slots: std::collections::HashSet<u32>,
+    pub(crate) var_binding_slots: std::collections::HashSet<u32>,
+    environment_snapshots: Vec<usize>,
+    /// Slots keyed by declaration-node identity in the immutable input AST.
+    /// Allocation and emission visit the same nodes; source coordinates may be
+    /// shared or entirely absent in generated input.
+    pub(crate) decl_slots: HashMap<DeclarationKey, u32>,
+    pub(crate) block_fn_aliases: HashMap<DeclarationKey, u32>,
+    block_fn_external_aliases: HashMap<DeclarationKey, String>,
     pub(crate) lexical_slots: HashMap<u32, bool>,
     pub(crate) initializing: bool,
-    /// Names declared by a body `let`/`const`/`catch` (block-scoped) binding,
-    /// collected during the `DeclCollector` pass. Used only by the default-param
-    /// scope-soundness check (`default_scope_ok`) to keep its conservative bail when
-    /// a default references a name the body also declares block-scoped.
-    pub(crate) block_local_names: std::collections::HashSet<String>,
+    /// Parameter bindings maintained by the native entry wrapper.
+    pub(crate) native_bindings: std::collections::HashSet<String>,
     /// captures in first-encounter order.
     pub(crate) captures: Vec<String>,
     /// D1 boxed-capture names: the subset of free names that the enclosing-scope
@@ -163,9 +199,8 @@ pub(crate) struct Cx<'a> {
     /// captures (so captures stay the last contiguous slots). `temp_base` is the
     /// first temp slot; `temp_top` is the next free temp slot (a LIFO bump
     /// pointer). Temps are never recorded in any scope frame or `captures`.
-    /// Sized by `count_temps` (the max simultaneously-live temps); 0 today since
-    /// no in-scope construct allocates temps yet (for-of/for-in/destructuring
-    /// targets, added by later tasks, are the only consumers).
+    /// Sized by the declaration pass for the maximum simultaneous scratch usage
+    /// across iteration, destructuring, reference preparation, and closure capture.
     pub(crate) temp_base: u32,
     pub(crate) temp_top: u32,
     pub(crate) frames: Vec<Frame>,
@@ -173,10 +208,8 @@ pub(crate) struct Cx<'a> {
     /// emitting a `try` body, restored after). Drives the fast-vs-unwind choice for
     /// `return`/`break`/`continue` and is snapshotted into each pushed `Frame`.
     pub(crate) handler_depth: u32,
-    /// Label pending attachment to the next pushed frame. Set by the labeled-
-    /// statement arm when the labeled body is a loop, and consumed via `take()`
-    /// when that loop pushes its frame; `None` otherwise.
-    pub(crate) pending_label: Option<String>,
+    /// Labels consumed when the next labeled loop pushes its control frame.
+    pub(crate) pending_labels: Vec<String>,
     /// Phase 3 (§4.3): the binding name inferred for the next function/arrow
     /// EXPRESSION emitted in a value position (`const render = () => …`,
     /// `obj.render = function(){}`, `{ render: () => … }`). Set by the emit site
@@ -387,6 +420,20 @@ impl<'a> Cx<'a> {
     }
 }
 
+/// Walk arbitrarily long binary spines with heap storage. Analysis visitors use
+/// this instead of SWC's recursive default, preserving left-to-right leaf order.
+pub(crate) fn walk_binary_chain<V: Visit>(binary: &BinExpr, visitor: &mut V) {
+    let mut pending: Vec<&Expr> = vec![&binary.right, &binary.left];
+    while let Some(expr) = pending.pop() {
+        if let Expr::Bin(binary) = expr {
+            pending.push(&binary.right);
+            pending.push(&binary.left);
+        } else {
+            expr.visit_with(visitor);
+        }
+    }
+}
+
 /// Temp slots an array-destructuring level holds live: the iterator and a `done`
 /// flag always, plus a 2-slot scratch (accumulator array + value) when the level
 /// has a `...rest` element. The source itself is NOT a temp here — array
@@ -395,32 +442,6 @@ impl<'a> Cx<'a> {
 pub(crate) fn array_level_temps(arr: &ArrayPat) -> u32 {
     let has_rest = arr.elems.iter().any(|e| matches!(e, Some(Pat::Rest(_))));
     2 + if has_rest { 2 } else { 0 }
-}
-
-/// Temps a spread level holds. An array/`new` spread level needs 3 (the
-/// accumulator array + iterator + value scratch); 0 with no spread.
-pub(crate) fn array_spread_charge(n: &ArrayLit) -> u32 {
-    if n.elems.iter().flatten().any(|e| e.spread.is_some()) {
-        3
-    } else {
-        0
-    }
-}
-/// A spread CALL needs 4 — the 3 of `array_spread_charge` plus one for a method
-/// receiver held across the args build (`o.m(...a)` -> `o.m.apply(recv, ARR)`).
-pub(crate) fn call_spread_charge(n: &CallExpr) -> u32 {
-    if n.args.iter().any(|a| a.spread.is_some()) {
-        4
-    } else {
-        0
-    }
-}
-pub(crate) fn new_spread_charge(n: &NewExpr) -> u32 {
-    let has = n
-        .args
-        .as_ref()
-        .is_some_and(|a| a.iter().any(|x| x.spread.is_some()));
-    if has { 3 } else { 0 }
 }
 
 /// Max simultaneously-live spread temps in an expression subtree (the scratch the
@@ -448,24 +469,32 @@ impl SpreadTempScan {
     }
 }
 impl Visit for SpreadTempScan {
-    fn visit_array_lit(&mut self, n: &ArrayLit) {
-        let c = array_spread_charge(n);
-        self.enter(c);
-        n.visit_children_with(self);
-        self.exit(c);
+    fn visit_bin_expr(&mut self, n: &BinExpr) {
+        walk_binary_chain(n, self);
     }
-    fn visit_call_expr(&mut self, n: &CallExpr) {
-        let c = call_spread_charge(n);
-        self.enter(c);
+    fn visit_object_lit(&mut self, n: &ObjectLit) {
+        self.enter(2);
         n.visit_children_with(self);
-        self.exit(c);
+        self.exit(2);
     }
-    fn visit_new_expr(&mut self, n: &NewExpr) {
-        let c = new_spread_charge(n);
-        self.enter(c);
+
+    fn visit_assign_expr(&mut self, n: &AssignExpr) {
+        self.enter(3);
         n.visit_children_with(self);
-        self.exit(c);
+        self.exit(3);
     }
+
+    fn visit_opt_call(&mut self, n: &OptCall) {
+        let count = if n.args.iter().any(|a| a.spread.is_some()) {
+            1
+        } else {
+            0
+        };
+        self.enter(count);
+        n.visit_children_with(self);
+        self.exit(count);
+    }
+
     fn visit_function(&mut self, _: &Function) {}
     fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
 }
@@ -495,50 +524,37 @@ pub(crate) fn pat_temp_count(pat: &Pat) -> u32 {
                 .props
                 .iter()
                 .map(|p| match p {
-                    ObjectPatProp::KeyValue(kv) => pat_temp_count(&kv.value),
+                    ObjectPatProp::KeyValue(kv) => {
+                        pat_temp_count(&kv.value).max(if let PropName::Computed(c) = &kv.key {
+                            expr_max_spread_temps(&c.expr)
+                        } else {
+                            0
+                        })
+                    }
                     ObjectPatProp::Assign(a) => {
-                        a.value.as_ref().map_or(0, |d| expr_max_spread_temps(d))
+                        2 + a.value.as_ref().map_or(0, |d| expr_max_spread_temps(d))
                     }
                     ObjectPatProp::Rest(r) => pat_temp_count(&r.arg),
                 })
                 .max()
                 .unwrap_or(0);
-            1 + child
+            let has_rest = obj
+                .props
+                .iter()
+                .any(|p| matches!(p, ObjectPatProp::Rest(_)));
+            let keys = obj
+                .props
+                .iter()
+                .filter(|p| !matches!(p, ObjectPatProp::Rest(_)))
+                .count() as u32;
+            1 + if has_rest { keys } else { keys.min(1) } + child
         }
-        Pat::Assign(ap) => pat_temp_count(&ap.left).max(expr_max_spread_temps(&ap.right)),
+        Pat::Assign(ap) => pat_temp_count(&ap.left) + expr_max_spread_temps(&ap.right),
+        Pat::Expr(expr) => 3 + expr_max_spread_temps(expr),
         Pat::Rest(r) => pat_temp_count(&r.arg),
+        Pat::Ident(_) => 2,
         _ => 0,
     }
-}
-
-/// Default-param scope soundness: a default expression evaluates in *parameter*
-/// scope, seeing earlier params but not later ones (TDZ), not itself, and not body
-/// locals / destructuring-param leaves. A reference our flat slot model would
-/// resolve to the wrong binding bails rather than miscompile. `own_slot` is the
-/// defaulted param's slot; a referenced param at slot `>= own_slot` is itself or a
-/// later param.
-pub(crate) fn default_scope_ok(
-    default: &Expr,
-    own_slot: u32,
-    param_slots: &HashMap<String, u32>,
-    func_locals: &HashMap<String, u32>,
-    block_locals: &std::collections::HashSet<String>,
-) -> Result<(), &'static str> {
-    let mut rc = RefNameCollector { names: Vec::new() };
-    default.visit_with(&mut rc);
-    for name in &rc.names {
-        if let Some(&pslot) = param_slots.get(name) {
-            if pslot >= own_slot {
-                return Err("default_refs_later_param");
-            }
-        } else if func_locals.contains_key(name) || block_locals.contains(name) {
-            // A body-declared `var`/`let`/`const` shares the name: the default sees
-            // the OUTER binding (param scope excludes the body scope), but our model
-            // would resolve it to the body local — bail conservatively.
-            return Err("default_refs_body_local");
-        }
-    }
-    Ok(())
 }
 
 /// Visitor: collect var/let/const declared identifier names in the body
@@ -557,6 +573,10 @@ pub(crate) fn default_scope_ok(
 /// (e.g. a destructuring for-of head on top of the loop's iterator).
 pub(crate) struct DeclCollector<'a, 'b> {
     cx: &'a mut Cx<'b>,
+    statement_depth: u32,
+    with_depth: u32,
+    lexical_names: Vec<std::collections::HashSet<String>>,
+    parameter_names: std::collections::HashSet<String>,
     /// Temps currently live at this point of the traversal.
     temp_cur: u32,
     /// High-water mark of `temp_cur` — the value `count_temps` reports.
@@ -564,6 +584,25 @@ pub(crate) struct DeclCollector<'a, 'b> {
 }
 
 impl<'a, 'b> DeclCollector<'a, 'b> {
+    fn statement_list(&mut self, statements: &[Stmt]) {
+        if self.statement_depth > 0 {
+            allocate_block_functions(self.cx, statements);
+        }
+        let mut names = std::collections::HashSet::new();
+        for statement in statements {
+            if let Stmt::Decl(Decl::Var(declaration)) = statement {
+                names.extend(
+                    for_var_decl_block_bindings(declaration)
+                        .into_iter()
+                        .map(|(name, _)| name),
+                );
+            }
+        }
+        self.lexical_names.push(names);
+        statements.visit_with(self);
+        self.lexical_names.pop();
+    }
+
     /// Enter a construct that holds `n` temps live across its subtree.
     fn enter_temps(&mut self, n: u32) {
         self.temp_cur += n;
@@ -588,66 +627,27 @@ impl<'a, 'b> DeclCollector<'a, 'b> {
 /// materialize the actual arguments object. A non-computed member property (`o.arguments`)
 /// is an `IdentName`, not an `Ident`, so it does not trip this — only genuine
 /// identifier references do.
-pub(crate) fn uses_arguments(body: &BlockStmt) -> bool {
+pub(crate) fn uses_arguments(body: &FunctionBody) -> bool {
     struct V {
         found: bool,
     }
     impl Visit for V {
+        fn visit_bin_expr(&mut self, n: &BinExpr) {
+            walk_binary_chain(n, self);
+        }
         fn visit_ident(&mut self, n: &Ident) {
             if n.sym.as_ref() == "arguments" {
                 self.found = true;
             }
         }
-    }
-    let mut v = V { found: false };
-    body.visit_with(&mut v);
-    v.found
-}
-
-/// True if the body explicitly declares a binding named `arguments` via
-/// `var`/`let`/`const` (a leaf of any declaration pattern). A param named
-/// `arguments` is handled separately (it occupies a positional slot the
-/// interpreter fills, so resolving references to it is correct). A `var`/`let`/
-/// `const arguments` shadow is a sloppy-mode corner case whose initial value the
-/// flat-slot model can't reproduce, so the caller bails rather than miscompile.
-pub(crate) fn declares_arguments(body: &BlockStmt) -> bool {
-    struct V {
-        found: bool,
-    }
-    fn pat_has(pat: &Pat, found: &mut bool) {
-        match pat {
-            Pat::Ident(bi) => {
-                if bi.id.sym.as_ref() == "arguments" {
-                    *found = true;
-                }
+        fn visit_function(&mut self, function: &Function) {
+            if function
+                .body
+                .as_ref()
+                .is_some_and(|body| mangler_jsast::span::is_suspension_entry_span(body.span))
+            {
+                function.visit_children_with(self);
             }
-            Pat::Assign(ap) => pat_has(&ap.left, found),
-            Pat::Rest(r) => pat_has(&r.arg, found),
-            Pat::Array(arr) => {
-                for el in arr.elems.iter().flatten() {
-                    pat_has(el, found);
-                }
-            }
-            Pat::Object(obj) => {
-                for prop in &obj.props {
-                    match prop {
-                        ObjectPatProp::KeyValue(kv) => pat_has(&kv.value, found),
-                        ObjectPatProp::Assign(a) => {
-                            if a.key.id.sym.as_ref() == "arguments" {
-                                *found = true;
-                            }
-                        }
-                        ObjectPatProp::Rest(r) => pat_has(&r.arg, found),
-                    }
-                }
-            }
-            Pat::Expr(_) | Pat::Invalid(_) => {}
-        }
-    }
-    impl Visit for V {
-        fn visit_var_declarator(&mut self, d: &VarDeclarator) {
-            pat_has(&d.name, &mut self.found);
-            d.visit_children_with(self);
         }
     }
     let mut v = V { found: false };
@@ -656,7 +656,7 @@ pub(crate) fn declares_arguments(body: &BlockStmt) -> bool {
 }
 
 pub(crate) fn slot_func_binding(cx: &mut Cx<'_>, name: String) -> bool {
-    if cx.scopes[0].contains_key(&name) {
+    if cx.native_bindings.contains(&name) || cx.scopes[0].contains_key(&name) {
         return false;
     }
     let slot = cx.next_slot;
@@ -665,18 +665,13 @@ pub(crate) fn slot_func_binding(cx: &mut Cx<'_>, name: String) -> bool {
     true
 }
 
-/// Slot a single block-scoped (`let`/`const`/`catch`) binding (D3). v1 NEVER reuses
-/// slots across sibling blocks: every block-scoped binding gets a brand-new slot,
-/// recorded by the declared identifier's span in `decl_slots` so emission can look
-/// it up when it enters the binding's block. A shadow therefore lands on its own
-/// slot and never clobbers the outer binding. `lo` is the binding ident's span
-/// `BytePos.0` (a stable per-binding key across the decl/emit passes); `name` is
-/// recorded in `block_local_names` for the default-param scope check.
-pub(crate) fn slot_block_binding(cx: &mut Cx<'_>, name: &str, lo: u32) {
+/// Allocate a distinct lexical slot for this declaration node. Function-scoped
+/// redeclarations and duplicate block functions share slots through their own
+/// explicit hoisting rules, independently of declaration identity.
+pub(crate) fn slot_block_binding(cx: &mut Cx<'_>, identifier: &Ident) {
     let slot = cx.next_slot;
     cx.next_slot += 1;
-    cx.decl_slots.insert(lo, slot);
-    cx.block_local_names.insert(name.to_string());
+    cx.decl_slots.insert(DeclarationKey::of(identifier), slot);
 }
 
 /// Recursively slot every leaf binding identifier in a `var` declaration pattern or
@@ -714,11 +709,11 @@ pub(crate) fn slot_pat_leaves_func(cx: &mut Cx<'_>, pat: &Pat) {
 
 /// Recursively allocate a fresh block-scoped slot for every leaf binding identifier
 /// in a `let`/`const` declaration or destructuring `catch` pattern (D3), recording
-/// each by its span in `decl_slots` (see `slot_block_binding`). Used by the
+/// each by its declaration identity in `decl_slots` (see `slot_block_binding`). Used by the
 /// `DeclCollector` allocation pass.
 pub(crate) fn slot_pat_leaves_block(cx: &mut Cx<'_>, pat: &Pat) {
     match pat {
-        Pat::Ident(bi) => slot_block_binding(cx, bi.id.sym.as_ref(), bi.id.span.lo.0),
+        Pat::Ident(bi) => slot_block_binding(cx, &bi.id),
         Pat::Assign(ap) => slot_pat_leaves_block(cx, &ap.left),
         Pat::Rest(r) => slot_pat_leaves_block(cx, &r.arg),
         Pat::Array(arr) => {
@@ -730,9 +725,7 @@ pub(crate) fn slot_pat_leaves_block(cx: &mut Cx<'_>, pat: &Pat) {
             for prop in &obj.props {
                 match prop {
                     ObjectPatProp::KeyValue(kv) => slot_pat_leaves_block(cx, &kv.value),
-                    ObjectPatProp::Assign(a) => {
-                        slot_block_binding(cx, a.key.id.sym.as_ref(), a.key.id.span.lo.0)
-                    }
+                    ObjectPatProp::Assign(a) => slot_block_binding(cx, &a.key.id),
                     ObjectPatProp::Rest(r) => slot_pat_leaves_block(cx, &r.arg),
                 }
             }
@@ -741,28 +734,28 @@ pub(crate) fn slot_pat_leaves_block(cx: &mut Cx<'_>, pat: &Pat) {
     }
 }
 
-/// Collect every leaf binding `(name, span_lo)` pair in a declaration/catch pattern,
+/// Collect every leaf binding `(name, declaration)` pair in a declaration/catch pattern,
 /// in source (leaf) order. Used by **emission** to populate a freshly-pushed scope
-/// frame from the `DeclCollector`-allocated `decl_slots` (looked up by `span_lo`),
+/// frame from the `DeclCollector`-allocated `decl_slots` (looked up by declaration identity),
 /// and to enumerate a block's / catch's bindings without re-allocating.
-pub(crate) fn collect_pat_binding_lows(pat: &Pat, out: &mut Vec<(String, u32)>) {
+pub(crate) fn collect_pattern_bindings(pat: &Pat, out: &mut Vec<(String, DeclarationKey)>) {
     match pat {
-        Pat::Ident(bi) => out.push((bi.id.sym.to_string(), bi.id.span.lo.0)),
-        Pat::Assign(ap) => collect_pat_binding_lows(&ap.left, out),
-        Pat::Rest(r) => collect_pat_binding_lows(&r.arg, out),
+        Pat::Ident(bi) => out.push((bi.id.sym.to_string(), DeclarationKey::of(&bi.id))),
+        Pat::Assign(ap) => collect_pattern_bindings(&ap.left, out),
+        Pat::Rest(r) => collect_pattern_bindings(&r.arg, out),
         Pat::Array(arr) => {
             for elem in arr.elems.iter().flatten() {
-                collect_pat_binding_lows(elem, out);
+                collect_pattern_bindings(elem, out);
             }
         }
         Pat::Object(obj) => {
             for prop in &obj.props {
                 match prop {
-                    ObjectPatProp::KeyValue(kv) => collect_pat_binding_lows(&kv.value, out),
+                    ObjectPatProp::KeyValue(kv) => collect_pattern_bindings(&kv.value, out),
                     ObjectPatProp::Assign(a) => {
-                        out.push((a.key.id.sym.to_string(), a.key.id.span.lo.0))
+                        out.push((a.key.id.sym.to_string(), DeclarationKey::of(&a.key.id)))
                     }
-                    ObjectPatProp::Rest(r) => collect_pat_binding_lows(&r.arg, out),
+                    ObjectPatProp::Rest(r) => collect_pattern_bindings(&r.arg, out),
                 }
             }
         }
@@ -772,17 +765,20 @@ pub(crate) fn collect_pat_binding_lows(pat: &Pat, out: &mut Vec<(String, u32)>) 
 
 /// Collect the **direct** block-scoped (`let`/`const`) bindings of a block's
 /// statement list — i.e. the bindings whose lexical scope is exactly this block —
-/// as `(name, span_lo)` pairs. Does NOT descend into nested blocks, loops, `try`
+/// as `(name, declaration)` pairs. Does NOT descend into nested blocks, loops, `try`
 /// bodies, `switch`, or functions (those open their own scopes). Emission uses this
 /// to populate a block's scope frame (D3); `var` is function-scoped and excluded.
-pub(crate) fn direct_block_bindings(stmts: &[Stmt]) -> Vec<(String, u32)> {
+pub(crate) fn direct_block_bindings(stmts: &[Stmt]) -> Vec<(String, DeclarationKey)> {
     let mut out = Vec::new();
     for s in stmts {
+        if let Stmt::Decl(Decl::Fn(f)) = s {
+            out.push((f.ident.sym.to_string(), DeclarationKey::of(&f.ident)));
+        }
         if let Stmt::Decl(Decl::Var(v)) = s
             && matches!(v.kind, VarDeclKind::Let | VarDeclKind::Const)
         {
             for d in &v.decls {
-                collect_pat_binding_lows(&d.name, &mut out);
+                collect_pattern_bindings(&d.name, &mut out);
             }
         }
     }
@@ -790,12 +786,12 @@ pub(crate) fn direct_block_bindings(stmts: &[Stmt]) -> Vec<(String, u32)> {
 }
 
 /// Populate the innermost (just-pushed) scope frame with each `(name, slot)` for the
-/// given `(name, span_lo)` bindings, resolving the slot via `decl_slots`. A binding
+/// given `(name, declaration)` bindings, resolving the slot via `decl_slots`. A binding
 /// missing from `decl_slots` (should not happen — the `DeclCollector` allocates all
 /// block-scoped bindings) is skipped defensively.
-pub(crate) fn bind_lows_in_scope(cx: &mut Cx<'_>, lows: &[(String, u32)]) {
-    for (name, lo) in lows {
-        if let Some(&slot) = cx.decl_slots.get(lo) {
+pub(crate) fn bind_declarations_in_scope(cx: &mut Cx<'_>, bindings: &[(String, DeclarationKey)]) {
+    for (name, declaration) in bindings {
+        if let Some(&slot) = cx.decl_slots.get(declaration) {
             cx.bind_in_scope(name.clone(), slot);
             if let Some(&constant) = cx.lexical_slots.get(&slot) {
                 cx.emit(Instr::BeginLexical(slot * 2 + u32::from(constant)));
@@ -804,19 +800,156 @@ pub(crate) fn bind_lows_in_scope(cx: &mut Cx<'_>, lows: &[(String, u32)]) {
     }
 }
 
+fn allocate_block_functions<'a>(cx: &mut Cx<'_>, statements: impl IntoIterator<Item = &'a Stmt>) {
+    let mut slots = HashMap::new();
+    for statement in statements {
+        if let Stmt::Decl(Decl::Fn(function)) = statement {
+            let name = function.ident.sym.to_string();
+            let slot = *slots.entry(name.clone()).or_insert_with(|| {
+                let slot = cx.next_slot;
+                cx.next_slot += 1;
+                cx.lexical_slots.insert(slot, false);
+                slot
+            });
+            cx.decl_slots
+                .insert(DeclarationKey::of(&function.ident), slot);
+        }
+    }
+}
+
+#[derive(Default)]
+struct IdentifierCount(u32);
+impl Visit for IdentifierCount {
+    fn visit_bin_expr(&mut self, n: &BinExpr) {
+        walk_binary_chain(n, self);
+    }
+    fn visit_ident(&mut self, _: &Ident) {
+        self.0 += 1;
+    }
+}
+
+#[derive(Default)]
+struct NestedCaptureTemps(u32);
+impl Visit for NestedCaptureTemps {
+    fn visit_bin_expr(&mut self, n: &BinExpr) {
+        walk_binary_chain(n, self);
+    }
+    fn visit_function(&mut self, function: &Function) {
+        let mut count = IdentifierCount::default();
+        function.visit_with(&mut count);
+        self.0 = self.0.max(count.0);
+    }
+    fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+        let mut count = IdentifierCount::default();
+        arrow.visit_with(&mut count);
+        self.0 = self.0.max(count.0);
+    }
+}
+
 impl Visit for DeclCollector<'_, '_> {
-    fn visit_for_of_stmt(&mut self, f: &ForOfStmt) {
-        // One temp holds the iterator object for the whole loop, including its
-        // body — so it stacks with any temps the body needs.
+    fn visit_bin_expr(&mut self, n: &BinExpr) {
+        walk_binary_chain(n, self);
+    }
+    fn visit_for_stmt(&mut self, n: &ForStmt) {
+        let names = match &n.init {
+            Some(VarDeclOrExpr::VarDecl(v)) => for_var_decl_block_bindings(v)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect(),
+            _ => std::collections::HashSet::new(),
+        };
+        self.lexical_names.push(names);
+        n.visit_children_with(self);
+        self.lexical_names.pop();
+    }
+    fn visit_switch_stmt(&mut self, n: &SwitchStmt) {
+        allocate_block_functions(self.cx, n.cases.iter().flat_map(|case| &case.cons));
+        let mut names = std::collections::HashSet::new();
+        for case in &n.cases {
+            for statement in &case.cons {
+                if let Stmt::Decl(Decl::Var(v)) = statement {
+                    names.extend(
+                        for_var_decl_block_bindings(v)
+                            .into_iter()
+                            .map(|(name, _)| name),
+                    );
+                }
+            }
+        }
+        self.lexical_names.push(names);
+        n.visit_children_with(self);
+        self.lexical_names.pop();
+    }
+
+    fn visit_with_stmt(&mut self, n: &WithStmt) {
         self.enter_temps(1);
-        f.visit_children_with(self);
+        self.with_depth += 1;
+        n.visit_children_with(self);
+        self.with_depth -= 1;
         self.exit_temps(1);
+    }
+
+    fn visit_object_lit(&mut self, n: &ObjectLit) {
+        self.enter_temps(2);
+        n.visit_children_with(self);
+        self.exit_temps(2);
+    }
+
+    fn visit_assign_expr(&mut self, n: &AssignExpr) {
+        self.enter_temps(3);
+        n.visit_children_with(self);
+        self.exit_temps(3);
+    }
+
+    fn visit_stmt(&mut self, stmt: &Stmt) {
+        self.statement_depth += 1;
+        stmt.visit_children_with(self);
+        self.statement_depth -= 1;
+    }
+    fn visit_block_stmt(&mut self, block: &BlockStmt) {
+        self.statement_list(&block.stmts);
+    }
+    fn visit_function_body(&mut self, body: &FunctionBody) {
+        self.statement_list(&body.stmts);
+    }
+
+    fn visit_opt_call(&mut self, n: &OptCall) {
+        let count = if n.args.iter().any(|a| a.spread.is_some()) {
+            1
+        } else {
+            0
+        };
+        self.enter_temps(count);
+        n.visit_children_with(self);
+        self.exit_temps(count);
+    }
+
+    fn visit_for_of_stmt(&mut self, f: &ForOfStmt) {
+        // Iterator plus a value scratch used to install the close handler at
+        // the enclosing stack depth after IteratorStep succeeds.
+        self.enter_temps(2);
+        self.lexical_names.push(
+            for_head_block_bindings(&f.left)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect(),
+        );
+        f.visit_children_with(self);
+        self.lexical_names.pop();
+        self.exit_temps(2);
     }
 
     fn visit_for_in_stmt(&mut self, f: &ForInStmt) {
         // Two temps (enumerated keys + current index) stay live across the loop.
         self.enter_temps(2);
+        self.lexical_names.push(
+            for_head_block_bindings(&f.left)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect(),
+        );
         f.visit_children_with(self);
+        self.lexical_names.pop();
         self.exit_temps(2);
     }
 
@@ -826,7 +959,11 @@ impl Visit for DeclCollector<'_, '_> {
         // enclosing construct (e.g. the iterator temp of a destructuring for-of
         // head). No recursion: `pat_temp_count` already accounts for sub-patterns
         // and their default expressions.
-        let n = pat_temp_count(p);
+        let mut capture_temps = NestedCaptureTemps::default();
+        if self.with_depth > 0 || self.cx.dynamic_variables {
+            p.visit_with(&mut capture_temps);
+        }
+        let n = pat_temp_count(p) + capture_temps.0;
         self.enter_temps(n);
         self.exit_temps(n);
     }
@@ -834,39 +971,21 @@ impl Visit for DeclCollector<'_, '_> {
     // Spread expressions (`[...a]`, `f(...a)`, `new C(...a)`) build a scratch array
     // via the iterator; charge their temps so they stack with any enclosing
     // for-of/destructure. Object spread (`{...o}`) uses `Object.assign` (no temp).
-    fn visit_array_lit(&mut self, n: &ArrayLit) {
-        let c = array_spread_charge(n);
-        self.enter_temps(c);
-        n.visit_children_with(self);
-        self.exit_temps(c);
-    }
-    fn visit_call_expr(&mut self, n: &CallExpr) {
-        let c = call_spread_charge(n);
-        self.enter_temps(c);
-        n.visit_children_with(self);
-        self.exit_temps(c);
-    }
-    fn visit_new_expr(&mut self, n: &NewExpr) {
-        let c = new_spread_charge(n);
-        self.enter_temps(c);
-        n.visit_children_with(self);
-        self.exit_temps(c);
-    }
 
     fn visit_var_decl(&mut self, v: &VarDecl) {
         // `var` is function-scoped: slot into the function frame, deduping a
         // re-declaration. `let`/`const` is block-scoped (D3): every binding gets a
-        // fresh slot recorded by span in `decl_slots`, so a shadow lands on its own
+        // fresh slot recorded by declaration identity in `decl_slots`, so a shadow lands on its own
         // slot — no bail. (A let/const colliding with a same-named var/param of the
         // same scope is a JS syntax error and never parses.)
         let block_scoped = matches!(v.kind, VarDeclKind::Let | VarDeclKind::Const);
         for d in &v.decls {
             if block_scoped {
                 slot_pat_leaves_block(self.cx, &d.name);
-                let mut lows = Vec::new();
-                collect_pat_binding_lows(&d.name, &mut lows);
-                for (_, lo) in lows {
-                    if let Some(&slot) = self.cx.decl_slots.get(&lo) {
+                let mut bindings = Vec::new();
+                collect_pattern_bindings(&d.name, &mut bindings);
+                for (_, declaration) in bindings {
+                    if let Some(&slot) = self.cx.decl_slots.get(&declaration) {
                         self.cx
                             .lexical_slots
                             .insert(slot, v.kind == VarDeclKind::Const);
@@ -881,136 +1000,130 @@ impl Visit for DeclCollector<'_, '_> {
     }
     fn visit_catch_clause(&mut self, c: &CatchClause) {
         // The catch binding is block-scoped (D3): allocate a fresh slot recorded by
-        // span, so `catch (e)` shadowing an outer `e` lands on its own slot — no
+        // declaration identity, so `catch (e)` shadowing an outer `e` lands on its own slot — no
         // bail. `visit_children_with` then counts the param pattern's temps via
         // `visit_pat` and descends into the catch body.
         match &c.param {
             Some(Pat::Ident(bi)) => {
-                slot_block_binding(self.cx, bi.id.sym.as_ref(), bi.id.span.lo.0)
+                slot_block_binding(self.cx, &bi.id);
+                self.cx
+                    .simple_catch_slots
+                    .insert(self.cx.decl_slots[&DeclarationKey::of(&bi.id)]);
             }
             Some(p @ (Pat::Array(_) | Pat::Object(_))) => slot_pat_leaves_block(self.cx, p),
             _ => {}
         }
         if let Some(p) = &c.param {
-            let mut lows = Vec::new();
-            collect_pat_binding_lows(p, &mut lows);
-            for (_, lo) in lows {
-                if let Some(&slot) = self.cx.decl_slots.get(&lo) {
+            let mut bindings = Vec::new();
+            collect_pattern_bindings(p, &mut bindings);
+            for (_, declaration) in bindings {
+                if let Some(&slot) = self.cx.decl_slots.get(&declaration) {
                     self.cx.lexical_slots.insert(slot, false);
                 }
             }
         }
+        let mut names = std::collections::HashSet::new();
+        if let Some(pattern @ (Pat::Array(_) | Pat::Object(_))) = &c.param {
+            mangler_jsast::analysis::binding_names(pattern, &mut |id| {
+                names.insert(id.sym.to_string());
+            });
+        }
+        self.lexical_names.push(names);
         c.visit_children_with(self);
+        self.lexical_names.pop();
     }
     // D5: a nested `function f(){…}` DECLARATION binds `f` function-scoped (hoisted),
     // so slot the name into the function frame like a `var` (deduping a
     // re-declaration). Do NOT descend into the nested fn's body (its own scope) —
-    // its locals/captures are compiled in a separate chunk. A block-nested fn-decl is
-    // bailed separately by `check_no_nested_block_fn_decls`, so an unused slot here is
-    // harmless.
+    // its locals/captures are compiled in a separate chunk. Block declarations
+    // reuse the lexical slot assigned by their statement-list hoisting pass.
     fn visit_fn_decl(&mut self, n: &FnDecl) {
-        slot_func_binding(self.cx, n.ident.sym.to_string());
+        self.visit_function(&n.function);
+        let name = n.ident.sym.to_string();
+        if self.statement_depth <= 1 {
+            slot_func_binding(self.cx, name);
+        } else {
+            if !self
+                .cx
+                .decl_slots
+                .contains_key(&DeclarationKey::of(&n.ident))
+            {
+                slot_block_binding(self.cx, &n.ident);
+            }
+            let slot = self.cx.decl_slots[&DeclarationKey::of(&n.ident)];
+            self.cx.lexical_slots.insert(slot, false);
+            if !self.cx.opts.strict
+                && (!(self.cx.opts.lexical_entry || self.cx.opts.eval_context)
+                    || self
+                        .cx
+                        .opts
+                        .external_var_bindings
+                        .is_none_or(|names| names.contains(&name)))
+                && !self.parameter_names.contains(&name)
+                && !self.lexical_names.iter().any(|scope| scope.contains(&name))
+            {
+                slot_func_binding(self.cx, name.clone());
+                if let Some(&alias) = self.cx.scopes[0].get(&name) {
+                    self.cx
+                        .block_fn_aliases
+                        .insert(DeclarationKey::of(&n.ident), alias);
+                } else if self.cx.native_bindings.contains(&name) {
+                    self.cx
+                        .block_fn_external_aliases
+                        .insert(DeclarationKey::of(&n.ident), name);
+                }
+            }
+        }
     }
     // Do not descend into nested functions; their bodies are separate chunks (D5).
-    fn visit_function(&mut self, _: &Function) {}
-    fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
-}
-
-/// True if a top-level statement list contains a `function`-declaration nested
-/// inside a block / loop / `if` / `try` / `switch` (i.e. NOT a direct top-level
-/// statement of the function body). Such a declaration's hoisting is mode-dependent
-/// (sloppy block-function semantics), which the flat-slot VM cannot reproduce, so
-/// the caller bails. Direct top-level fn-decls are fine (fully hoisted). Does not
-/// descend into nested function bodies (their own chunks handle their decls).
-pub(crate) fn check_no_nested_block_fn_decls(stmts: &[Stmt]) -> Result<(), &'static str> {
-    struct V {
-        depth: u32,
-        bad: bool,
-    }
-    impl Visit for V {
-        fn visit_fn_decl(&mut self, n: &FnDecl) {
-            if self.depth > 0 {
-                self.bad = true;
-            }
-            // Do not descend into the nested fn's own body.
-            let _ = n;
+    fn visit_function(&mut self, n: &Function) {
+        if self.with_depth > 0 || self.cx.dynamic_variables {
+            let mut count = IdentifierCount::default();
+            n.visit_with(&mut count);
+            self.enter_temps(count.0);
+            self.exit_temps(count.0);
         }
-        fn visit_stmt(&mut self, s: &Stmt) {
-            match s {
-                // A fn-decl as a direct child of the CURRENT statement list is fine;
-                // anything that opens a nested statement context bumps depth.
-                Stmt::Decl(Decl::Fn(_)) if self.depth == 0 => {}
-                Stmt::Block(_)
-                | Stmt::If(_)
-                | Stmt::For(_)
-                | Stmt::ForIn(_)
-                | Stmt::ForOf(_)
-                | Stmt::While(_)
-                | Stmt::DoWhile(_)
-                | Stmt::Try(_)
-                | Stmt::Switch(_)
-                | Stmt::Labeled(_)
-                | Stmt::With(_) => {
-                    self.depth += 1;
-                    s.visit_children_with(self);
-                    self.depth -= 1;
-                    return;
-                }
-                _ => {}
-            }
-            s.visit_children_with(self);
+    }
+    fn visit_arrow_expr(&mut self, n: &ArrowExpr) {
+        if self.with_depth > 0 || self.cx.dynamic_variables {
+            let mut count = IdentifierCount::default();
+            n.visit_with(&mut count);
+            self.enter_temps(count.0);
+            self.exit_temps(count.0);
         }
-        fn visit_function(&mut self, _: &Function) {}
-        fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
-    }
-    let mut v = V {
-        depth: 0,
-        bad: false,
-    };
-    for s in stmts {
-        s.visit_with(&mut v);
-    }
-    if v.bad {
-        Err("nested_block_fn_decl")
-    } else {
-        Ok(())
     }
 }
 
-/// Collects the value-position identifier names an expression *reads* — used to
-/// validate default-param expressions against the parameter scope. Skips
-/// member-property and object-key identifiers (not bindings) and nested
-/// function/arrow bodies (their own scope).
-pub(crate) struct RefNameCollector {
-    names: Vec<String>,
+/// Initialize block functions at block entry, before any statement executes.
+pub(crate) fn emit_block_function_declarations(cx: &mut Cx<'_>, stmts: &[Stmt]) {
+    for stmt in stmts {
+        let Stmt::Decl(Decl::Fn(decl)) = stmt else {
+            continue;
+        };
+        let Some(&slot) = cx.decl_slots.get(&DeclarationKey::of(&decl.ident)) else {
+            continue;
+        };
+        let Some(body) = &decl.function.body else {
+            cx.bail_with("fn_decl_no_body");
+            return;
+        };
+        let params: Vec<Pat> = decl.function.params.iter().map(|p| p.pat.clone()).collect();
+        cx.pending_fn_name = Some(decl.ident.sym.to_string());
+        emit_nested_closure(
+            cx,
+            &params,
+            body,
+            false,
+            decl.function.is_async,
+            decl.function.is_generator,
+            None,
+        );
+        cx.emit(Instr::InitLocal(slot));
+        cx.emit(Instr::Pop);
+    }
 }
 
-impl Visit for RefNameCollector {
-    fn visit_ident(&mut self, id: &Ident) {
-        self.names.push(id.sym.to_string());
-    }
-    fn visit_member_expr(&mut self, m: &MemberExpr) {
-        m.obj.visit_with(self);
-        if let MemberProp::Computed(c) = &m.prop {
-            c.visit_with(self);
-        }
-    }
-    fn visit_prop_name(&mut self, p: &PropName) {
-        if let PropName::Computed(c) = p {
-            c.visit_with(self);
-        }
-    }
-    fn visit_function(&mut self, _: &Function) {}
-    fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
-}
-
-/// Compile a function body to bytecode, or `None` to skip anything we can't
-/// prove safe.
-///
-/// Compile `body` with no boxed captures (the common, no-capture-mutation path).
-/// Equivalent to `compile_body_boxed` with an empty boxed set; kept as the public
-/// entry point used by tests and the non-D1 call sites.
-pub fn compile_body(params: &[Param], body: &BlockStmt) -> Result<Compiled, &'static str> {
+pub fn compile_body(params: &[Param], body: &FunctionBody) -> Result<Compiled, &'static str> {
     compile_body_boxed(params, body, &std::collections::HashSet::new())
 }
 
@@ -1021,7 +1134,7 @@ pub fn compile_body(params: &[Param], body: &BlockStmt) -> Result<Compiled, &'st
 /// is diverted too.
 pub fn compile_body_with_opts(
     params: &[Param],
-    body: &BlockStmt,
+    body: &FunctionBody,
     opts: CompileOptions<'_>,
 ) -> Result<Compiled, &'static str> {
     compile_body_inner_opts(params, body, &std::collections::HashSet::new(), None, opts)
@@ -1040,7 +1153,7 @@ pub fn compile_body_with_opts(
 /// cells.
 pub fn compile_body_boxed(
     params: &[Param],
-    body: &BlockStmt,
+    body: &FunctionBody,
     boxed: &std::collections::HashSet<String>,
 ) -> Result<Compiled, &'static str> {
     compile_body_inner(params, body, boxed, None)
@@ -1052,7 +1165,7 @@ pub fn compile_body_boxed(
 /// mutated shared upvalue to `LoadCell`/`StoreCell`.
 pub fn compile_body_with_plan(
     params: &[Param],
-    body: &BlockStmt,
+    body: &FunctionBody,
     boxed: &std::collections::HashSet<String>,
     plan: &cells::BoxPlan,
 ) -> Result<Compiled, &'static str> {
@@ -1061,7 +1174,7 @@ pub fn compile_body_with_plan(
 
 pub(crate) fn compile_body_inner(
     params: &[Param],
-    body: &BlockStmt,
+    body: &FunctionBody,
     boxed: &std::collections::HashSet<String>,
     plan: Option<&cells::BoxPlan>,
 ) -> Result<Compiled, &'static str> {
@@ -1070,11 +1183,34 @@ pub(crate) fn compile_body_inner(
 
 pub(crate) fn compile_body_inner_opts<'a>(
     params: &[Param],
-    body: &BlockStmt,
+    body: &FunctionBody,
     boxed: &std::collections::HashSet<String>,
     plan: Option<&'a cells::BoxPlan>,
     opts: CompileOptions<'a>,
 ) -> Result<Compiled, &'static str> {
+    let environment_use = environment_usage(params, body, opts.suspension_lexicals);
+    let mut hidden_environment_bindings = opts.internal_bindings.cloned().unwrap_or_default();
+    if let Some(contexts) = opts.eval_class_contexts {
+        hidden_environment_bindings.extend(
+            contexts
+                .values()
+                .map(|context| context.capsule_binding.clone()),
+        );
+    }
+    if let Some(scopes) = opts.suspension_lexicals {
+        hidden_environment_bindings.extend(scopes.values().flatten().flat_map(|alias| {
+            std::iter::once(alias.cell.clone()).chain(alias.objects.iter().cloned())
+        }));
+    }
+    if let Some(references) = opts.suspension_references {
+        hidden_environment_bindings
+            .extend(references.values().map(|reference| reference.cell.clone()));
+        hidden_environment_bindings.extend(
+            references
+                .values()
+                .flat_map(|reference| reference.objects.iter().cloned()),
+        );
+    }
     let mut cx = Cx {
         code: Vec::new(),
         consts: Vec::new(),
@@ -1082,10 +1218,19 @@ pub(crate) fn compile_body_inner_opts<'a>(
         // never popped. Block/catch/for-head frames are pushed and popped around
         // their bodies during emission (D3).
         scopes: vec![HashMap::new()],
+        with_scopes: Vec::new(),
+        needs_environment: environment_use.descendants,
+        hidden_environment_bindings,
+        dynamic_variables: environment_use.direct,
+        var_binding_slots: std::collections::HashSet::new(),
+        simple_catch_slots: std::collections::HashSet::new(),
+        environment_snapshots: Vec::new(),
         decl_slots: HashMap::new(),
+        block_fn_aliases: HashMap::new(),
+        block_fn_external_aliases: HashMap::new(),
         lexical_slots: HashMap::new(),
         initializing: false,
-        block_local_names: std::collections::HashSet::new(),
+        native_bindings: std::collections::HashSet::new(),
         captures: Vec::new(),
         boxed_caps: boxed.clone(),
         // D5: this body's own locals that a nested closure captures-and-mutates must
@@ -1099,7 +1244,7 @@ pub(crate) fn compile_body_inner_opts<'a>(
         temp_top: 0,
         frames: Vec::new(),
         handler_depth: 0,
-        pending_label: None,
+        pending_labels: Vec::new(),
         pending_fn_name: None,
         bail_reason: None,
         children: Vec::new(),
@@ -1107,103 +1252,115 @@ pub(crate) fn compile_body_inner_opts<'a>(
         opts,
     };
 
-    // 1. Params first. Record default-value params so their init prologue can
-    //    be emitted (in order) once all params and body locals are slotted —
-    //    this keeps captures the last slots (cap_start math holds), since a
-    //    capture is only ever allocated during prologue/body emission.
-    let mut defaults: Vec<(u32, &Expr)> = Vec::new();
-    // Destructuring params `function f([a], {b})`: each takes one positional slot
-    // (the raw arg, copied by the interpreter) and is destructured in the prologue.
-    // `(positional_slot, pattern, optional outer default)`.
-    let mut destructure_params: Vec<(u32, &Pat, Option<&Expr>)> = Vec::new();
-    // Trailing `...rest` param: its slot is filled by a `LoadRest` prologue (not
-    // the positional arg copy), so it is recorded here and emitted after defaults.
-    let mut rest_slot: Option<u32> = None;
-    let param_count = params.len();
-    for (pi, p) in params.iter().enumerate() {
-        match &p.pat {
-            Pat::Ident(bi) => {
-                let name = bi.id.sym.to_string();
-                // Duplicate param name (sloppy-mode `function(a, a)`): JS binds
-                // the LAST occurrence, and the flat slot model maps the name to
-                // the FIRST slot, so reads diverge — and it breaks the
-                // params.len()==param-slots invariant the arg-copy cap relies on.
-                // Bail; the function stays un-virtualized (runs as normal JS).
-                if !slot_func_binding(&mut cx, name) {
-                    return Err("dup_param");
+    if let Some(bindings) = opts.external_var_bindings {
+        cx.native_bindings.extend(bindings.iter().cloned());
+    }
+
+    // Positional input slots are independent of binding slots. Simple parameters
+    // retain their input slots (last duplicate wins); non-simple parameters use
+    // lexical descriptors so every not-yet-initialized binding has a real TDZ.
+    let opts = CompileOptions {
+        strict: opts.strict || has_use_strict_directive_block(body),
+        ..opts
+    };
+    cx.opts = opts;
+    let simple = params.iter().all(|p| matches!(p.pat, Pat::Ident(_)));
+    struct ParameterExpressions(bool);
+    impl Visit for ParameterExpressions {
+        fn visit_bin_expr(&mut self, n: &BinExpr) {
+            walk_binary_chain(n, self);
+        }
+        fn visit_expr(&mut self, _: &Expr) {
+            self.0 = true;
+        }
+    }
+    let mut expressions = ParameterExpressions(false);
+    params.visit_with(&mut expressions);
+    let separate_environment = expressions.0;
+    let mut parameter_names = Vec::new();
+    for p in params {
+        collect_pattern_bindings(&p.pat, &mut parameter_names);
+    }
+    let param_count = if opts.native_parameters {
+        0
+    } else {
+        params.len()
+    };
+    let has_rest =
+        !opts.native_parameters && params.last().is_some_and(|p| matches!(p.pat, Pat::Rest(_)));
+    let pcount = (param_count - usize::from(has_rest)) as u32;
+    if opts.native_parameters {
+        if !separate_environment {
+            cx.native_bindings
+                .extend(parameter_names.iter().map(|(n, _)| n.clone()));
+            cx.native_bindings.insert("arguments".into());
+        }
+    } else {
+        cx.next_slot = param_count as u32;
+        if simple {
+            for (index, p) in params.iter().enumerate() {
+                if let Pat::Ident(id) = &p.pat {
+                    cx.scopes[0].insert(id.id.sym.to_string(), index as u32);
+                    cx.lexical_slots.insert(index as u32, false);
                 }
             }
-            Pat::Rest(rp) => {
-                // Only a TRAILING rest param with a simple-ident target is modeled.
-                // A non-trailing rest is a syntax error (never parses), but guard
-                // anyway; a destructuring rest target is out of scope.
-                if pi != param_count - 1 {
-                    return Err("rest_pattern");
-                }
-                let bi = match &*rp.arg {
-                    Pat::Ident(bi) => bi,
-                    _ => return Err("rest_pattern"),
-                };
-                let name = bi.id.sym.to_string();
-                if cx.scopes[0].contains_key(&name) {
-                    return Err("dup_param");
+        } else {
+            for (name, _) in &parameter_names {
+                if cx.scopes[0].contains_key(name) {
+                    return Err("duplicate_non_simple_parameter");
                 }
                 let slot = cx.next_slot;
                 cx.next_slot += 1;
-                cx.scopes[0].insert(name, slot);
-                rest_slot = Some(slot);
-            }
-            Pat::Assign(ap) => {
-                // Default param `target = <expr>`. A simple-ident target gets a
-                // binding slot + a simple-default prologue; a destructuring target
-                // (`[a] = d` / `{a} = d`) takes a positional slot and is destructured
-                // in the prologue after applying the outer default.
-                match &*ap.left {
-                    Pat::Ident(bi) => {
-                        let name = bi.id.sym.to_string();
-                        if cx.scopes[0].contains_key(&name) {
-                            // Duplicate param name (e.g. `function(a, a=2)`): same
-                            // hazard as the simple-ident case above. Bail.
-                            return Err("dup_param");
-                        }
-                        let s = cx.next_slot;
-                        cx.next_slot += 1;
-                        cx.scopes[0].insert(name, s);
-                        defaults.push((s, &ap.right));
-                    }
-                    p @ (Pat::Array(_) | Pat::Object(_)) => {
-                        let s = cx.next_slot;
-                        cx.next_slot += 1;
-                        destructure_params.push((s, p, Some(&ap.right)));
-                    }
-                    _ => return Err("default_destructure"),
-                }
-            }
-            // Destructuring param without an outer default.
-            p @ (Pat::Array(_) | Pat::Object(_)) => {
-                let s = cx.next_slot;
-                cx.next_slot += 1;
-                destructure_params.push((s, p, None));
-            }
-            _ => {
-                // `using` / other unmodeled param shapes: out of scope.
-                return Err("param_pattern");
+                cx.scopes[0].insert(name.clone(), slot);
+                cx.lexical_slots.insert(slot, false);
             }
         }
     }
-    // Snapshot of param-name -> slot, taken before body locals AND destructuring-
-    // param leaves are slotted, so the default-scope check below treats a leaf
-    // reference as a body-local reference (conservative bail, never a miscompile).
-    let param_slots: HashMap<String, u32> = cx.scopes[0].clone();
+    // Object-method lowering supplies a compiler-owned class capsule at body
+    // entry. Its lexical descriptor belongs to the activation before defaults,
+    // so eval in a parameter can use the same capsule as eval in the body.
+    let capsule_names: std::collections::HashSet<&str> = opts
+        .eval_class_contexts
+        .into_iter()
+        .flat_map(|contexts| contexts.values())
+        .map(|context| context.capsule_binding.as_str())
+        .collect();
+    let early_capsules: Vec<(usize, &Stmt)> = body
+        .stmts
+        .iter()
+        .enumerate()
+        .filter(|(_, statement)| {
+            matches!(statement, Stmt::Decl(Decl::Var(declaration))
+            if declaration.span.is_dummy() && declaration.kind == VarDeclKind::Const
+            && !declaration.decls.is_empty() && declaration.decls.iter().all(|binding|
+                binding.init.is_some() && matches!(&binding.name, Pat::Ident(id)
+                    if capsule_names.contains(id.id.sym.as_ref()))))
+        })
+        .collect();
+    let early_bindings: Vec<(String, DeclarationKey)> = early_capsules
+        .iter()
+        .flat_map(|(_, statement)| {
+            let Stmt::Decl(Decl::Var(declaration)) = statement else {
+                unreachable!()
+            };
+            declaration.decls.iter().map(|binding| {
+                let Pat::Ident(id) = &binding.name else {
+                    unreachable!()
+                };
+                (id.id.sym.to_string(), DeclarationKey::of(&id.id))
+            })
+        })
+        .collect();
+    let early_declarations: std::collections::HashSet<DeclarationKey> = early_bindings
+        .iter()
+        .map(|(_, declaration)| *declaration)
+        .collect();
 
-    // Slot destructuring-param leaf bindings now — after the contiguous positional
-    // slots (0..pcount) and before body locals, into the function frame so a body
-    // `var` of the same name reuses the leaf's slot.
-    for (_, pat, _) in &destructure_params {
-        slot_pat_leaves_func(&mut cx, pat);
-    }
-    if let Some(r) = cx.bail_reason {
-        return Err(r);
+    let param_slots = cx.scopes[0].clone();
+    // A parameter expression cannot see body declarations. Allocate that body's
+    // var environment independently and join it only after parameter evaluation.
+    if separate_environment && !opts.native_parameters {
+        cx.scopes[0].clear();
     }
     // 2. Body-declared locals (and, in the same walk, the count_temps pre-pass).
     //    The reserved temp pool must cover both the body's needs and the (separate,
@@ -1213,6 +1370,10 @@ pub(crate) fn compile_body_inner_opts<'a>(
     {
         let mut dc = DeclCollector {
             cx: &mut cx,
+            statement_depth: 0,
+            with_depth: 0,
+            lexical_names: Vec::new(),
+            parameter_names: parameter_names.iter().map(|(n, _)| n.clone()).collect(),
             temp_cur: 0,
             temp_max: 0,
         };
@@ -1230,40 +1391,50 @@ pub(crate) fn compile_body_inner_opts<'a>(
         return Err(r);
     }
 
-    // 2a'. D2 `arguments` materialization. If the body references `arguments` and it
-    //      is NOT shadowed by an explicit param/`var` binding of that name (which the
-    //      steps above would have slotted into the function frame), allocate a fresh
-    //      function-frame slot for it and remember to load the arguments object.
-    //      Binding the name `"arguments"` here (a local slot, < cap_floor) makes every
-    //      `arguments` read resolve via `lookup` to this slot — never a capture. The
-    //      sloppy-aliasing soundness bail lives in `eligibility::classify_body`; by the
-    //      time we get here the function is known not to observe aliasing.
-    let arg_slot: Option<u32> = if !opts.native_parameters && uses_arguments(body) {
-        if cx.scopes[0].contains_key("arguments") {
-            // An explicit `arguments` binding shadows the implicit object. A PARAM
-            // named `arguments` is a genuine, soundly-modeled shadow (its slot is
-            // filled by the interpreter's positional copy), so references resolve
-            // to it and we emit no implicit arguments binding. A `var`/`let`/`const arguments` shadow,
-            // by contrast, has a sloppy-mode initial value (the arguments object)
-            // that the flat-slot model can't reproduce — bail rather than diverge.
-            if declares_arguments(body) {
-                return Err("arguments_var_shadow");
+    let mut parameter_arguments = false;
+    for p in params {
+        struct ArgumentsUse(bool);
+        impl Visit for ArgumentsUse {
+            fn visit_bin_expr(&mut self, n: &BinExpr) {
+                walk_binary_chain(n, self);
             }
+            fn visit_ident(&mut self, n: &Ident) {
+                self.0 |= n.sym == *"arguments";
+            }
+            fn visit_function(&mut self, _: &Function) {}
+        }
+        let mut scan = ArgumentsUse(false);
+        p.pat.visit_with(&mut scan);
+        parameter_arguments |= scan.0;
+    }
+    let declared_body_slots = cx.scopes[0].clone();
+    let arg_slot = if !opts.native_parameters
+        && !opts.lexical_arguments
+        && !param_slots.contains_key("arguments")
+        && (uses_arguments(body) || parameter_arguments || cx.needs_environment)
+    {
+        let existing = if separate_environment {
             None
         } else {
-            let s = cx.next_slot;
+            cx.scopes[0].get("arguments").copied()
+        };
+        let slot = existing.unwrap_or_else(|| {
+            let slot = cx.next_slot;
             cx.next_slot += 1;
-            cx.scopes[0].insert("arguments".to_string(), s);
-            Some(s)
-        }
+            slot
+        });
+        cx.scopes[0].insert("arguments".into(), slot);
+        cx.lexical_slots.insert(slot, false);
+        Some(slot)
     } else {
         None
     };
-
+    let mut body_slots = cx.scopes[0].clone();
+    body_slots.extend(declared_body_slots);
     // 2b. Reserve the anonymous temp-slot pool. It MUST sit after body locals and
     // before captures so captures stay the last contiguous slots (the thunk /
     // interpreter compute `cap_start = slots - captures.len()`). `reserved` comes
-    // from count_temps (0 today; non-zero once for-of/for-in/destructuring land).
+    // from the declaration pass's maximum simultaneous scratch usage.
     cx.temp_base = cx.next_slot;
     cx.next_slot += reserved;
     cx.temp_top = cx.temp_base;
@@ -1272,115 +1443,157 @@ pub(crate) fn compile_body_inner_opts<'a>(
     // during prologue/body emission (steps 3–4), so any slot >= this value is a
     // capture.
     cx.cap_floor = cx.next_slot;
-
-    // 2d. Default-param scope soundness. A default expression is evaluated in
-    //     the *parameter* scope: it sees earlier params but NOT body var/let
-    //     bindings (which live in the body scope) and NOT its own / later params
-    //     (TDZ). Our flat slot model would otherwise resolve such a reference to
-    //     the wrong binding (e.g. a body local's uninitialized slot instead of
-    //     the outer binding it should capture), silently diverging. Bail on
-    //     those rather than miscompile.
-    for (own_slot, default) in &defaults {
-        default_scope_ok(
-            default,
-            *own_slot,
-            &param_slots,
-            &cx.scopes[0],
-            &cx.block_local_names,
-        )?;
+    cx.var_binding_slots.extend(param_slots.values().copied());
+    cx.var_binding_slots.extend(body_slots.values().copied());
+    if let Some(slot) = arg_slot {
+        cx.var_binding_slots.insert(slot);
     }
-    for (own_slot, _, default) in &destructure_params {
-        if let Some(default) = default {
-            default_scope_ok(
-                default,
-                *own_slot,
-                &param_slots,
-                &cx.scopes[0],
-                &cx.block_local_names,
-            )?;
+
+    // Evaluate all parameters in source order in their own environment. Captures
+    // allocated here remain separate from same-named body locals.
+    cx.scopes[0] = param_slots.clone();
+    if let Some(slot) = arg_slot {
+        cx.scopes[0].insert("arguments".into(), slot);
+    }
+    if cx.needs_environment
+        && let Some(name) = opts
+            .self_binding
+            .filter(|name| !param_slots.contains_key(*name))
+    {
+        let slot = cx.resolve(name);
+        emit_variable_environment(&mut cx, &HashMap::from([(name.to_string(), slot)]));
+    }
+    if cx.needs_environment && !opts.lexical_entry && (!opts.eval_context || opts.strict) {
+        let mut variables = if separate_environment {
+            param_slots.clone()
+        } else {
+            body_slots.clone()
+        };
+        variables.extend(param_slots.clone());
+        if let Some(slot) = arg_slot {
+            variables.insert("arguments".into(), slot);
         }
-    }
-
-    // 3. Default-param init prologue: `if (L[s] === undefined) L[s] = <default>`.
-    //    Runs before the body and after all param/local slots exist. Captures
-    //    referenced by a default are allocated here (still after locals).
-    for (slot, default) in &defaults {
-        cx.emit(Instr::LoadLocal(*slot));
-        cx.emit(Instr::PushUndef);
-        cx.emit(Instr::Bin(7)); // ===
-        let skip = cx.code.len();
-        cx.emit(Instr::JumpIfFalse(u32::MAX));
-        emit_expr(&mut cx, default);
-        cx.emit(Instr::StoreLocal(*slot));
-        cx.emit(Instr::Pop);
-        let here = cx.here();
-        patch(&mut cx, skip, here);
-        if let Some(r) = cx.bail_reason {
-            return Err(r);
-        }
-    }
-
-    // 3a. Destructuring-param prologue: destructure each `[..]`/`{..}` param from
-    //     its positional slot (the interpreter already copied the raw arg there).
-    //     With an outer default (`[a] = d`), apply it first. Runs after simple
-    //     defaults so a destructure referencing an earlier simple param sees it.
-    for (slot, pat, default) in &destructure_params {
-        match default {
-            Some(default) => {
-                // Apply the outer default to the arg, then bind the (defaulted) value.
-                cx.emit(Instr::LoadLocal(*slot));
-                emit_value_default(&mut cx, default);
-                emit_bind_target(&mut cx, pat);
-            }
-            None => match pat {
-                // Destructure straight from the positional slot (no source temp).
-                Pat::Array(arr) => {
-                    cx.emit(Instr::LoadLocal(*slot));
-                    emit_destructure_array(&mut cx, arr);
+        let environment = emit_variable_environment(&mut cx, &variables);
+        if separate_environment {
+            let parameter_slots: std::collections::HashSet<u32> =
+                param_slots.values().copied().collect();
+            if let Const::Environment(metadata) = &mut cx.consts[environment as usize] {
+                for scope in &mut metadata.scopes {
+                    if let crate::eval::EnvironmentScope::Bindings(bindings) = scope {
+                        for binding in bindings {
+                            binding.lexical = parameter_slots.contains(&binding.slot);
+                        }
+                    }
                 }
-                Pat::Object(obj) => emit_destructure_object(&mut cx, obj, *slot),
-                _ => unreachable!("destructure_params holds only array/object patterns"),
-            },
-        }
-        if let Some(r) = cx.bail_reason {
-            return Err(r);
+            }
         }
     }
-
-    // 3b. Rest-param prologue: `L[restSlot] = arguments.slice(fixedCount)`. Runs
-    //     after the default prologue (a rest param can follow defaulted params)
-    //     and before the body. `fixedCount` is the positional param count.
-    let pcount = (param_count - if rest_slot.is_some() { 1 } else { 0 }) as u32;
-    if let Some(rslot) = rest_slot {
-        cx.emit(Instr::LoadRest(pcount));
-        cx.emit(Instr::StoreLocal(rslot));
-        cx.emit(Instr::Pop);
+    if !opts.native_parameters && !simple && arg_slot.is_some() {
+        cx.emit(Instr::UnmapArguments);
     }
-
-    // The actual arguments object retains its identity and property descriptors.
-    if let Some(aslot) = arg_slot {
+    if !opts.native_parameters && !simple {
+        let mut slots: Vec<u32> = param_slots.values().copied().collect();
+        slots.sort_unstable();
+        for slot in slots {
+            cx.emit(Instr::BeginLexical(slot * 2));
+        }
+    }
+    if !opts.native_parameters
+        && simple
+        && !opts.strict
+        && !opts.lexical_arguments
+        && arg_slot.is_some()
+    {
+        let mut slots: Vec<u32> = param_slots.values().copied().collect();
+        slots.sort_unstable();
+        for slot in slots {
+            cx.emit(Instr::MapArgument(slot, slot));
+        }
+    }
+    if let Some(slot) = arg_slot {
+        cx.emit(Instr::BeginLexical(slot * 2));
         cx.emit(Instr::LoadArguments);
-        cx.emit(Instr::StoreLocal(aslot));
+        cx.emit(Instr::InitLocal(slot));
         cx.emit(Instr::Pop);
+    }
+    bind_declarations_in_scope(&mut cx, &early_bindings);
+    for (_, statement) in &early_capsules {
+        emit_stmt(&mut cx, statement);
+        if let Some(reason) = cx.bail_reason {
+            return Err(reason);
+        }
+    }
+    if !opts.native_parameters && !simple {
+        cx.initializing = true;
+        for (index, p) in params.iter().enumerate() {
+            match &p.pat {
+                Pat::Rest(rest) => {
+                    cx.emit(Instr::LoadRest(index as u32));
+                    emit_bind_target(&mut cx, &rest.arg);
+                }
+                pat => {
+                    cx.emit(Instr::LoadLocal(index as u32));
+                    emit_bind_target(&mut cx, pat);
+                }
+            }
+            if let Some(reason) = cx.bail_reason {
+                return Err(reason);
+            }
+        }
+        cx.initializing = false;
+    }
+    // Body var declarations overlapping parameters receive the initialized value,
+    // while closures created by defaults keep the original parameter environment.
+    for (name, slot) in &body_slots {
+        if opts.native_parameters
+            && separate_environment
+            && (name == "arguments" || parameter_names.iter().any(|(n, _)| n == name))
+        {
+            let parameter = cx.resolve(name);
+            cx.emit(Instr::LoadLocal(parameter));
+            cx.emit(Instr::StoreLocal(*slot));
+            cx.emit(Instr::Pop);
+        } else if name == "arguments" && arg_slot.is_some_and(|arg| arg != *slot) {
+            cx.emit(Instr::LoadLocal(arg_slot.unwrap()));
+            cx.emit(Instr::StoreLocal(*slot));
+            cx.emit(Instr::Pop);
+        } else if let Some(param) = param_slots.get(name).filter(|param| *param != slot) {
+            cx.emit(Instr::LoadLocal(*param));
+            cx.emit(Instr::StoreLocal(*slot));
+            cx.emit(Instr::Pop);
+        }
+    }
+    if cx.needs_environment
+        && separate_environment
+        && !opts.lexical_entry
+        && (!opts.eval_context || opts.strict)
+    {
+        emit_variable_environment(&mut cx, &body_slots);
+    }
+    cx.scopes[0].extend(body_slots);
+    let mut external_aliases: Vec<_> = std::mem::take(&mut cx.block_fn_external_aliases)
+        .into_iter()
+        .collect();
+    // Capture allocation follows declaration slots, never hash or address order.
+    external_aliases.sort_by_key(|(declaration, _)| cx.decl_slots[declaration]);
+    for (declaration, name) in external_aliases {
+        let slot = cx.resolve(&name);
+        cx.block_fn_aliases.insert(declaration, slot);
     }
 
     // 3d. D5 nested function DECLARATIONS are hoisted: a `function inc(){…}` at the
     //     body's top level binds `inc` (function-scoped) to its closure, visible
-    //     throughout the body (including before the textual declaration). We bail on
-    //     a `function`-decl nested inside a block/loop (its scoping is mode-dependent
-    //     and the flat-slot model can't reproduce sloppy block-hoisting precisely).
+    //     throughout the body (including before the textual declaration).
     //     Each top-level fn-decl gets a function-frame slot, then its closure is
     //     built (MakeClosure) and stored into that slot here, before the body.
-    check_no_nested_block_fn_decls(&body.stmts)?;
+
     // The fn-decl NAMES were already slotted (function-scoped) by `DeclCollector`
     // (see its `visit_fn_decl`), so they sit below `cap_floor` like `var`s; here we
     // just collect each top-level fn-decl with its slot for the hoisted emission.
     let mut fn_decl_slots: Vec<(u32, &FnDecl)> = Vec::new();
     for stmt in &body.stmts {
         if let Stmt::Decl(Decl::Fn(fd)) = stmt {
-            let slot = *cx.scopes[0]
-                .get(fd.ident.sym.as_ref())
-                .expect("fn-decl slotted");
+            let slot = cx.resolve(fd.ident.sym.as_ref());
             fn_decl_slots.push((slot, fd));
         }
     }
@@ -1390,12 +1603,13 @@ pub(crate) fn compile_body_inner_opts<'a>(
     //    `DeclCollector`-allocated slots before emission so a top-level `let x`
     //    resolves to its slot (D3). Nested blocks push their own frames as they are
     //    emitted. Captures are allocated lazily here.
-    let top_lows = direct_block_bindings(&body.stmts);
-    bind_lows_in_scope(&mut cx, &top_lows);
+    let mut top_bindings = direct_block_bindings(&body.stmts);
+    top_bindings.retain(|(_, declaration)| !early_declarations.contains(declaration));
+    bind_declarations_in_scope(&mut cx, &top_bindings);
 
     // 4a. D5 in-VM cell SEEDING. Each boxed local (captured-and-mutated by a nested
     //     closure) must hold a one-element cell `[v]` before any closure builder or
-    //     body statement runs. This runs AFTER `bind_lows_in_scope` so a body-top-
+    //     body statement runs. This runs AFTER `bind_declarations_in_scope` so a body-top-
     //     level `let` (slotted in `decl_slots`, bound just above) is resolvable:
     //       * a boxed PARAM is boxed in place — `MakeCell(slot)` wraps the already-
     //         copied argument (`L[slot] = [L[slot]]`);
@@ -1411,8 +1625,17 @@ pub(crate) fn compile_body_inner_opts<'a>(
             .iter()
             .filter_map(|name| {
                 cx.lookup(name)
-                    .filter(|slot| !cx.lexical_slots.contains_key(slot))
-                    .map(|slot| (slot, param_slots.contains_key(name)))
+                    .filter(|slot| *slot < cx.cap_floor && !cx.lexical_slots.contains_key(slot))
+                    .map(|slot| {
+                        (
+                            slot,
+                            param_slots.contains_key(name)
+                                || (opts.native_parameters
+                                    && separate_environment
+                                    && (name == "arguments"
+                                        || parameter_names.iter().any(|(n, _)| n == name))),
+                        )
+                    })
             })
             .collect();
         seeds.sort_by_key(|(slot, _)| *slot);
@@ -1439,6 +1662,7 @@ pub(crate) fn compile_body_inner_opts<'a>(
         // If the fn-decl name is itself a boxed local (a sibling closure captures and
         // reassigns it), store the closure THROUGH the cell so the sibling sees it.
         let celled = cx.is_boxed_local(&self_name);
+        cx.pending_fn_name = Some(self_name.clone());
         emit_nested_closure(
             &mut cx,
             &pats,
@@ -1446,7 +1670,7 @@ pub(crate) fn compile_body_inner_opts<'a>(
             false,
             fd.function.is_async,
             fd.function.is_generator,
-            Some(&self_name),
+            None,
         );
         cx.emit(if celled {
             Instr::StoreCell(*slot)
@@ -1459,7 +1683,10 @@ pub(crate) fn compile_body_inner_opts<'a>(
         }
     }
 
-    for stmt in &body.stmts {
+    for (index, stmt) in body.stmts.iter().enumerate() {
+        if early_capsules.iter().any(|(early, _)| *early == index) {
+            continue;
+        }
         emit_stmt(&mut cx, stmt);
         if let Some(r) = cx.bail_reason {
             return Err(r);
@@ -1471,15 +1698,21 @@ pub(crate) fn compile_body_inner_opts<'a>(
     cx.emit(Instr::PushUndef);
     cx.emit(Instr::Ret);
 
+    finish_environment_snapshots(&mut cx);
     let slots = cx.next_slot;
-    Ok(Compiled {
+    let mut compiled = Compiled {
+        requires_source_compiler: source_compiler_usage(params, body, opts.source_compiler_sites),
         code: cx.code,
         consts: cx.consts,
         captures: cx.captures,
         slots,
         pcount,
         children: cx.children,
-    })
+    };
+    if let Some(map) = opts.source_utf16 {
+        crate::source_text::restore_constants(&mut compiled, map);
+    }
+    Ok(compiled)
 }
 
 /// Scan the frame stack from innermost outward, returning the index of the first
@@ -1499,7 +1732,7 @@ pub(crate) fn find_target(
 ) -> Option<usize> {
     cx.frames.iter().enumerate().rev().find_map(|(i, f)| {
         let label_ok = match label {
-            Some(_) => f.label.as_ref() == label.as_ref(),
+            Some(name) => f.labels.contains(name),
             None => true,
         };
         if kind_ok(&f.kind) && label_ok {
@@ -1538,23 +1771,23 @@ pub(crate) fn find_continue_target(cx: &Cx<'_>, label: &Option<String>) -> Optio
 /// the frame up front (not at each decl point) so a reference earlier in the block
 /// resolves to the inner slot; its accessor throws until declaration initialization.
 /// The block-scoped (`let`/`const`) bindings introduced by a `for`/`for-in`/
-/// `for-of` head, as `(name, span_lo)` pairs — empty for a `var`/expression head
+/// `for-of` head, as `(name, declaration)` pairs — empty for a `var`/expression head
 /// (those are function-scoped or pre-existing). The loop arms push a scope frame
 /// holding these so a `for (let i …)` head that shadows an outer `i` resolves to
 /// its own slot for the whole loop (D3).
-pub(crate) fn for_var_decl_block_bindings(v: &VarDecl) -> Vec<(String, u32)> {
+pub(crate) fn for_var_decl_block_bindings(v: &VarDecl) -> Vec<(String, DeclarationKey)> {
     let mut out = Vec::new();
     if matches!(v.kind, VarDeclKind::Let | VarDeclKind::Const) {
         for d in &v.decls {
-            collect_pat_binding_lows(&d.name, &mut out);
+            collect_pattern_bindings(&d.name, &mut out);
         }
     }
     out
 }
 
-/// The `(name, span_lo)` block-scoped bindings of a `for-in`/`for-of` head
+/// The `(name, declaration)` block-scoped bindings of a `for-in`/`for-of` head
 /// (`for (let x of …)`); empty for a `var`/pattern head.
-pub(crate) fn for_head_block_bindings(head: &ForHead) -> Vec<(String, u32)> {
+pub(crate) fn for_head_block_bindings(head: &ForHead) -> Vec<(String, DeclarationKey)> {
     match head {
         ForHead::VarDecl(v) => for_var_decl_block_bindings(v),
         _ => Vec::new(),
@@ -1604,6 +1837,66 @@ mod tests {
             "shadow must allocate a distinct slot, got {}",
             prog.slots
         );
+    }
+
+    #[test]
+    fn generated_declarations_do_not_depend_on_spans_or_addresses() {
+        use swc_core::common::DUMMY_SP;
+        use swc_core::ecma::ast::Ident;
+        use swc_core::ecma::visit::{VisitMut, VisitMutWith};
+        struct Synthetic;
+        impl VisitMut for Synthetic {
+            fn visit_mut_ident(&mut self, identifier: &mut Ident) {
+                identifier.span = DUMMY_SP;
+            }
+        }
+        for source in [
+            "function(){const env=1;try{throw 2}catch(error){}return env}",
+            "function(){let x=1;{let x=2}return x}",
+            "function(){let [left,right]=[1,2];return left+right}",
+            "function(){let {left,right}={left:1,right:2};return left+right}",
+            "function(){var first,second;{function f(){return 1}function f(){return 2}first=f}{function f(){return 3}second=f}return first()+second()}",
+            "function(){let x=0;for(let i=0;i<2;i++){x+=i}return x}",
+            "function(){let sum=0;for(let [x,y] of [[1,2]]){sum+=x+y}return sum}",
+        ] {
+            let (params, mut body) = parse_fn_with_params(source);
+            let expected = compile_body(&params, &body).expect("source body compiles");
+            body.visit_mut_with(&mut Synthetic);
+            let compiled = compile_body(&params, &body).expect("generated body compiles");
+            assert_eq!(
+                compiled, expected,
+                "source positions cannot change bindings: {source}"
+            );
+            let cloned = body.clone();
+            assert_eq!(
+                compiled,
+                compile_body(&params, &cloned).unwrap(),
+                "declaration addresses cannot affect bytecode: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_block_function_aliases_allocate_captures_in_declaration_order() {
+        use std::collections::HashSet;
+        let (params, body) = parse_fn_with_params(
+            "function(){{function first(){return 1}}{function second(){return 2}}return first()+second()}",
+        );
+        let external = HashSet::from(["first".to_string(), "second".to_string()]);
+        let options = super::CompileOptions {
+            live_captures: true,
+            external_var_bindings: Some(&external),
+            ..Default::default()
+        };
+        let expected = super::compile_body_with_opts(&params, &body, options).unwrap();
+        assert_eq!(expected.captures, ["first", "second"]);
+        for _ in 0..4 {
+            let cloned = body.clone();
+            assert_eq!(
+                expected,
+                super::compile_body_with_opts(&params, &cloned, options).unwrap()
+            );
+        }
     }
 
     #[test]
@@ -1657,7 +1950,7 @@ mod tests {
     fn bails_on_exponential_numeric_object_key() {
         // {1e21: 1} would stringify differently in Rust vs JS — must bail, not miscompile.
         let (p, b) = parse_fn_with_params("function(){ var o = { 1e21: 1 }; return o; }");
-        assert!(matches!(compile_body(&p, &b), Err("numeric_prop_key")));
+        assert!(compile_body(&p, &b).is_ok());
         // A safe small-integer key still compiles.
         let (p2, b2) = parse_fn_with_params("function(){ var o = { 42: 1, 0: 2 }; return o[42]; }");
         assert!(compile_body(&p2, &b2).is_ok());
@@ -1687,13 +1980,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_param_names() {
-        // sloppy-mode `function(a, a)`: JS binds the last `a`; the flat slot model
-        // maps to the first and would mis-cap the arg copy. Must bail.
+    fn compiles_duplicate_simple_param_names() {
+        // Sloppy duplicate simple parameters bind the last positional occurrence.
         let (p, b) = parse_fn_with_params("function(a, a){ return a; }");
-        assert!(matches!(compile_body(&p, &b), Err("dup_param")));
+        assert_eq!(compile_body(&p, &b).unwrap().pcount, 2);
         let (p2, b2) = parse_fn_with_params("function(a, a = 2){ return a; }");
-        assert!(matches!(compile_body(&p2, &b2), Err("dup_param")));
+        assert!(matches!(
+            compile_body(&p2, &b2),
+            Err("duplicate_non_simple_parameter")
+        ));
     }
 
     #[test]
@@ -1721,9 +2016,9 @@ mod tests {
             "rest param must emit LoadRest(fixedCount=1)"
         );
         assert_eq!(prog.pcount, 1, "pcount must exclude the rest slot");
-        // A rest param with a destructuring target is out of scope -> bail.
+        // Rest values can initialize an arbitrary binding pattern.
         let (p2, b2) = parse_fn_with_params("function(...[a, b]){ return a + b; }");
-        assert!(matches!(compile_body(&p2, &b2), Err("rest_pattern")));
+        assert!(compile_body(&p2, &b2).is_ok());
         // A plain function (no rest) reports pcount == params.len().
         let (p3, b3) = parse_fn_with_params("function(a, b){ return a + b; }");
         assert_eq!(compile_body(&p3, &b3).unwrap().pcount, 2);
@@ -1738,38 +2033,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_default_referencing_body_local() {
+    fn captures_default_referencing_body_local() {
         // A default must NOT resolve to a body var/let local. In real JS the
         // default sees the OUTER `c`, not the body `var c` (which is invisible in
         // the parameter scope). Our flat slot model would wrongly read the local
         // slot, so we must bail rather than miscompile to a silent wrong value.
         let (p, b) = parse_fn_with_params("function(a, b = c){ var c = 5; return b; }");
-        assert!(matches!(
-            compile_body(&p, &b),
-            Err("default_refs_body_local")
-        ));
+        assert!(compile_body(&p, &b).is_ok());
         // `let`-declared body local is the same divergence.
         let (p2, b2) = parse_fn_with_params("function(a, b = c){ let c = 5; return b; }");
-        assert!(matches!(
-            compile_body(&p2, &b2),
-            Err("default_refs_body_local")
-        ));
+        assert!(compile_body(&p2, &b2).is_ok());
     }
 
     #[test]
-    fn rejects_default_referencing_self_or_later_param() {
+    fn compiles_default_parameter_tdz() {
         // self-reference (TDZ in real JS).
         let (p, b) = parse_fn_with_params("function(a = a){ return a; }");
-        assert!(matches!(
-            compile_body(&p, &b),
-            Err("default_refs_later_param")
-        ));
+        assert!(compile_body(&p, &b).is_ok());
         // later-param reference (TDZ in real JS); could return a wrong value.
         let (p2, b2) = parse_fn_with_params("function(a = b, b){ return a; }");
-        assert!(matches!(
-            compile_body(&p2, &b2),
-            Err("default_refs_later_param")
-        ));
+        assert!(compile_body(&p2, &b2).is_ok());
     }
 
     #[test]
@@ -1934,14 +2217,10 @@ mod tests {
     }
 
     #[test]
-    fn bails_on_optional_call_of_method() {
-        // `o.m?.()` would strand the receiver under the short-circuited
-        // `undefined` at END; we bail rather than miscompile.
+    fn compiles_optional_call_of_method() {
+        // Optional method calls preserve the member receiver through the guard.
         let (p, b) = parse_fn_with_params("function(o){ return o.m?.(); }");
-        assert!(matches!(
-            compile_body(&p, &b),
-            Err("optional_chain_unsupported")
-        ));
+        assert!(compile_body(&p, &b).is_ok());
     }
 
     #[test]
@@ -2086,10 +2365,7 @@ mod tests {
         );
         // A computed pattern key is out of scope (read-once temp not reserved).
         let (p2, b2) = parse_fn_with_params("function(s, k){ var { [k]: v } = s; return v; }");
-        assert!(matches!(
-            compile_body(&p2, &b2),
-            Err("destructure_computed_key")
-        ));
+        assert!(compile_body(&p2, &b2).is_ok());
     }
 
     #[test]
@@ -2125,15 +2401,15 @@ mod tests {
         let (p, b) = parse_fn_with_params("function(g, a){ var xs = [1, ...a]; return g(...xs); }");
         let prog = compile_body(&p, &b).expect("spread must compile");
         assert!(
-            prog.code.iter().any(|i| matches!(i, Instr::GetIter)),
-            "spread must iterate its sources"
+            prog.code.iter().any(|i| matches!(i, Instr::ArraySpread)),
+            "spread must invoke the iterator protocol"
         );
         // `new C(...a)` lowers to a captured-global Reflect.construct call.
         let (p2, b2) = parse_fn_with_params("function(C, a){ return new C(...a); }");
         let prog2 = compile_body(&p2, &b2).expect("new-spread must compile");
         assert!(
-            prog2.captures.iter().any(|c| c == "Reflect"),
-            "new-spread must capture the global Reflect"
+            prog2.code.iter().any(|i| matches!(i, Instr::NewArray)),
+            "new-spread must use the intrinsic construction operation"
         );
         // Object spread lowers to a captured-global Object.assign call.
         let (p3, b3) = parse_fn_with_params("function(o){ return { a: 1, ...o, b: 2 }; }");
@@ -2158,10 +2434,10 @@ mod tests {
     }
 
     #[test]
-    fn bails_on_delete_of_non_member() {
-        // `delete x` (a non-member target) is a sloppy-mode no-op we don't model.
+    fn compiles_delete_of_local_binding() {
+        // A local identifier is an undeletable binding in sloppy code.
         let (p, b) = parse_fn_with_params("function(x){ return delete x; }");
-        assert!(matches!(compile_body(&p, &b), Err("delete_target")));
+        assert!(compile_body(&p, &b).is_ok());
     }
 
     #[test]

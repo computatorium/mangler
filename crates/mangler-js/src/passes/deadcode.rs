@@ -29,7 +29,7 @@ use mangler_jsast::Js;
 use mangler_jsast::build as b;
 use mangler_passgraph::{ArtifactBus, Pass, Resource};
 use swc_core::ecma::ast::{
-    ArrowExpr, BlockStmt, BlockStmtOrExpr, Function, IfStmt, Pat, Stmt, VarDeclKind,
+    ArrowExpr, ArrowFunctionBody, Function, FunctionBody, IfStmt, Pat, Stmt, VarDeclKind,
 };
 use swc_core::ecma::visit::{VisitMut, VisitMutWith};
 
@@ -189,7 +189,7 @@ impl DeadInjector<'_> {
     /// `1 + pick(2)` (1..=3) dead branches. The draw is taken unconditionally per
     /// body so the RNG stream stays a deterministic function of `(seed, "deadcode")`
     /// and body-visit order.
-    fn inject(&mut self, body: &mut BlockStmt) {
+    fn inject(&mut self, body: &mut FunctionBody) {
         if self.inside_core_init {
             return;
         }
@@ -202,16 +202,24 @@ impl DeadInjector<'_> {
         for _ in 0..n {
             branches.push(self.dead_branch());
         }
-        let at = mangler_jsast::directives::leading_directive_count(&body.stmts);
+        let at = mangler_jsast::directives::leading_initialization_count(&body.stmts);
         body.stmts.splice(at..at, branches);
     }
 }
 
 impl VisitMut for DeadInjector<'_> {
+    fn visit_mut_expr(&mut self, expression: &mut swc_core::ecma::ast::Expr) {
+        if mangler_jsast::span::is_runtime_span(swc_core::common::Spanned::span(expression)) {
+            return;
+        }
+        expression.visit_mut_children_with(self);
+    }
+
     fn visit_mut_fn_decl(&mut self, n: &mut swc_core::ecma::ast::FnDecl) {
         // Skip the anchor function entirely (decode-path / self-recursion guard):
         // neither inject into it nor descend into its body.
-        if n.ident.sym.as_ref() == self.skip_fn_name
+        if mangler_jsast::span::is_runtime_span(n.ident.span)
+            || n.ident.sym.as_ref() == self.skip_fn_name
             || self.runtime.as_ref().is_some_and(|vm| {
                 vm.interpreter_names
                     .iter()
@@ -232,7 +240,7 @@ impl VisitMut for DeadInjector<'_> {
 
     fn visit_mut_arrow_expr(&mut self, n: &mut ArrowExpr) {
         n.visit_mut_children_with(self);
-        if let BlockStmtOrExpr::BlockStmt(body) = &mut *n.body {
+        if let ArrowFunctionBody::FunctionBody(body) = &mut *n.body {
             self.inject(body);
         }
     }

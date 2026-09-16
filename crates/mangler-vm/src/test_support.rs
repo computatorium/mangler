@@ -1,13 +1,13 @@
 //! Test-only parsing helpers for the VM compiler unit tests.
 
-use swc_core::common::sync::Lrc;
 use swc_core::common::FileName;
 use swc_core::common::SourceMap;
+use swc_core::common::sync::Lrc;
 use swc_core::ecma::ast::*;
-use swc_core::ecma::parser::{lexer::Lexer, EsSyntax, Parser, StringInput, Syntax};
+use swc_core::ecma::parser::{EsSyntax, Parser, StringInput, Syntax, lexer::Lexer};
 
 /// Parses `src` as the body of `function _() { ... }` and returns its block.
-pub fn parse_fn_body(src: &str) -> BlockStmt {
+pub fn parse_fn_body(src: &str) -> FunctionBody {
     let cm: Lrc<SourceMap> = Default::default();
     let wrapped = format!("function _() {{ {src} }}");
     let fm = cm.new_source_file(Lrc::new(FileName::Custom("t.js".into())), wrapped);
@@ -34,7 +34,7 @@ pub fn parse_fn_body(src: &str) -> BlockStmt {
 
 /// Parses `src` (a function EXPRESSION like `function(a,b){...}`) and returns
 /// its params + body.
-pub fn parse_fn_with_params(src: &str) -> (Vec<Param>, BlockStmt) {
+pub fn parse_fn_with_params(src: &str) -> (Vec<Param>, FunctionBody) {
     let cm: Lrc<SourceMap> = Default::default();
     let wrapped = format!("var __f = ({src});");
     let fm = cm.new_source_file(Lrc::new(FileName::Custom("t.js".into())), wrapped);

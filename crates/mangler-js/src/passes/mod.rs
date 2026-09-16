@@ -51,12 +51,7 @@
 //!   [`opaque`](crate::opaque) library (exemplar; reads `DecoderAnchor`,
 //!   optionally).
 //!
-//! # Implemented by follow-up agents (declared edges to slot into the schedule)
-//!
-//! Each remaining pass is a stub module documenting the exact `Pass<Js,
-//! FileConfig>` shape, its config knob, and the reads/writes it should declare so
-//! the topological sort reproduces the legacy ordering. Fill in the `run` body and
-//! append to `register_passes`.
+//! # Pass resource dependencies
 //!
 //! | pass         | reads                                  | writes                  | enabled knob                                  |
 //! |--------------|----------------------------------------|-------------------------|-----------------------------------------------|
@@ -71,7 +66,7 @@
 //! | idnames      | ResolvedScopes                         | MangleControl           | `mangle.enabled` (+ naming scheme)            |
 //! | minify       | MangleControl                          | —                       | always (terminal codegen; in the runner)      |
 //!
-//! Notes for the follow-up:
+//! Scheduling invariants:
 //! * **globalref** must run after memberaccess (so it sees `document["getElementById"]`)
 //!   and before strings (so its injected global-name literals get encoded) — both
 //!   edges come from the `PropertyLiterals` read and the `GlobalNameLiterals` write.
@@ -88,16 +83,12 @@
 pub mod expr;
 pub mod memberaccess;
 
-// ---------------------------------------------------------------------------
-// One file-module per remaining pass — implemented by follow-up agents. Each owns
-// its own `passes/<name>.rs` (or `passes/<name>/`) subtree exclusively; the exact
-// `Pass<Js, FileConfig>` shape and the reads/writes each must declare are in the
-// table above. The orchestrator wires each into `crate::runner::register_passes`.
-// ---------------------------------------------------------------------------
-
 pub mod cfflatten;
 pub mod deadcode;
 pub mod globalref;
 pub mod idnames;
 pub mod strings;
+pub(crate) mod intrinsics;
+pub mod suspension;
+mod resources;
 pub mod virtualize;

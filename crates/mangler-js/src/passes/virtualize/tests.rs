@@ -281,23 +281,24 @@ fn glob_selects_only_matching_names() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn ineligible_with_bails_intact() {
+fn with_scope_is_virtualized() {
     // `with` is a permanent structural bail. The function stays un-virtualized and no
     // table/artifact is produced.
     let src = "function f(o){ with(o){ return x; } } globalThis.__out=String(typeof f);";
     let (out, put) = run_virtualize(src, "*", 7);
-    assert!(!put, "nothing virtualized → no VmTable artifact");
-    assert!(out.contains("with"), "with-body left intact: {out}");
+    assert!(put, "with body must execute as bytecode");
+    mangler_testkit::eval::assert_behaviorally_equal(src, &out);
 }
 
 #[test]
-fn generator_and_async_bail() {
+fn generator_and_async_lower_to_virtualized_bodies() {
     for src in [
         "function* f(){ yield 1; } globalThis.__out=String(typeof f);",
         "async function f(){ return 1; } globalThis.__out=String(typeof f);",
     ] {
-        let (_out, put) = run_virtualize(src, "*", 7);
-        assert!(!put, "generator/async must bail: {src}");
+        let (out, put) = run_virtualize(src, "*", 7);
+        assert!(put, "generator/async source body must virtualize: {src}");
+        mangler_testkit::eval::assert_behaviorally_equal(src, &out);
     }
 }
 
@@ -359,10 +360,22 @@ fn sloppy_program_emits_no_strict_machinery() {
     for seed in [1u64, 7, 42] {
         let (out, put) = run_virtualize(src, "*", seed);
         assert!(put, "sloppy function still virtualizes");
-        assert!(
-            !out.contains("use strict"),
-            "a fully-sloppy program emits NO strict directive (byte-identity):\n{out}"
-        );
+        // A shared closure factory contains a strict branch, but the source
+        // function's native envelope and selected VM frame remain sloppy.
+        let ast = Js.parse(&out, &ParseOpts::default()).unwrap();
+        let mut source = None;
+        struct Find<'a>(&'a mut Option<Function>);
+        impl swc_core::ecma::visit::Visit for Find<'_> {
+            fn visit_fn_decl(&mut self, f: &FnDecl) {
+                if f.ident.sym == *"f" {
+                    *self.0 = Some((*f.function).clone());
+                }
+            }
+        }
+        swc_core::ecma::visit::VisitWith::visit_with(ast.program(), &mut Find(&mut source));
+        assert!(!has_use_strict_directive(
+            source.unwrap().body.as_ref().unwrap()
+        ));
         // Determinism: same seed → byte-identical.
         let (out2, _) = run_virtualize(src, "*", seed);
         assert_eq!(out, out2, "same seed → byte-identical sloppy output");
@@ -639,21 +652,13 @@ fn binding_name_var_declarator_fn_expr() {
     mangler_testkit::eval::assert_behaviorally_equal(src, &out_no_excl);
 }
 
-/// Form 2b: ArrowExpr is NOT a top-level virtualization target in the current
-/// named-function mode (arrows have no `arguments` binding, so the standard thunk
-/// form cannot be used). The arrow stays native regardless of `target`/`exclude`.
-/// Binding-name inference for arrows is deferred to the native-closure phase (§4).
+/// Native arrow envelopes preserve lexical this/arguments and initialize parameters.
 #[test]
-fn binding_name_var_declarator_arrow_stays_native() {
-    // Arrows are not top-level virtualization targets: with target="*", no artifact
-    // is produced (there are no eligible named functions), and the source is unchanged.
+fn binding_name_var_declarator_arrow_is_virtualized() {
     let src =
         "var process = (x) => { return x * 5; }; globalThis.__out=JSON.stringify(process(4));";
     let (out, put) = run_virtualize(src, "*", 7);
-    assert!(
-        !put,
-        "arrow-only program → no VmTable artifact (arrows not top-level targets)"
-    );
+    assert!(put, "arrow body must produce a VM table");
     mangler_testkit::eval::assert_behaviorally_equal(src, &out);
 }
 
@@ -779,45 +784,6 @@ fn program_top_strictness_attribute() {
     assert!(program_top_is_strict(&module), "module top is strict");
 }
 
-#[test]
-fn strict_candidate_pre_scan_is_precise_for_sloppy() {
-    // No strict anywhere → no strict candidate (so NO extra names drawn → byte-identity).
-    assert!(!program_has_strict_candidate(
-        &parse_prog("function f(a){ return a*2; }"),
-        "*",
-        None
-    ));
-    assert!(!program_has_strict_candidate(
-        &parse_prog("var f = function(){ return 1; }; obj.g = function(){ return 2; };"),
-        "*",
-        None
-    ));
-    // Own-directive strict function matching the glob → candidate.
-    assert!(program_has_strict_candidate(
-        &parse_prog("function f(){ 'use strict'; return this; }"),
-        "*",
-        None
-    ));
-    // Strict candidate EXCLUDED by glob → not a candidate.
-    assert!(!program_has_strict_candidate(
-        &parse_prog("function render(){ 'use strict'; return this; }"),
-        "*",
-        Some("render")
-    ));
-    // Strict-by-inheritance nested function matching the glob → candidate.
-    assert!(program_has_strict_candidate(
-        &parse_prog("function outer(){ 'use strict'; function f(){ return this; } }"),
-        "f",
-        None
-    ));
-    // A strict function NOT matching the target glob → not a candidate.
-    assert!(!program_has_strict_candidate(
-        &parse_prog("function f(){ 'use strict'; return this; }"),
-        "other",
-        None
-    ));
-}
-
 // ---------------------------------------------------------------------------
 // Phase 1: whole-program virtualization (`--virtualize-program`, §2/§2.1)
 // ---------------------------------------------------------------------------
@@ -898,11 +864,6 @@ fn whole_program_sloppy_threads_globalthis_receiver() {
     let src = "(function(){ globalThis.__out = JSON.stringify(typeof this); })();";
     let (out, put) = run_whole_program(src, 3);
     assert!(put, "virtualized");
-    // No strict interpreter variant (sloppy program).
-    assert!(
-        !out.contains("\"use strict\""),
-        "sloppy program: no strict variant:\n{out}"
-    );
     // The §2.1 re-entry call passes `globalThis` (sloppy receiver), not `undefined`.
     assert!(
         out.contains(",this,true)"),
@@ -1054,7 +1015,7 @@ fn whole_program_module_import_boundary_partitions() {
 /// `x[0]`; the program computes the correct value AND the cell binding is NOT a real
 /// global beyond what the original declared.
 #[test]
-fn whole_program_cross_run_var_function_flow_via_cells() {
+fn whole_program_cross_run_uses_native_live_bindings() {
     // `seed` (var) and `dbl` (function) are declared in run A, read in run B across
     // the import boundary → both become cells.
     let src = "var seed = 21; function dbl(n){ return n * 2; } \
@@ -1064,8 +1025,8 @@ fn whole_program_cross_run_var_function_flow_via_cells() {
     assert!(put, "virtualized around the import");
     // The cross-run names are cell-ified: a hoisted `[undefined]` cell and `[0]` reads.
     assert!(
-        out.contains("=[undefined]") || out.contains("= [undefined]"),
-        "cross-run names hoisted to native cells:\n{out}"
+        !out.contains("seed[0]") && !out.contains("dbl[0]"),
+        "cross-run names retain native bindings:\n{out}"
     );
     // Behavioral VALUE parity via the script-equivalent: `dbl(seed)` must be 42 in both.
     let stripped = strip_module_decls(src);
@@ -1120,16 +1081,9 @@ fn whole_program_bisection_isolates_offender() {
         globalThis.__out = JSON.stringify(globalThis.__a + globalThis.__b);";
     let (out, put) = run_whole_program(src, 8);
     assert!(put, "the eligible neighbors virtualize");
-    // The offending `with` stays native (the VM never emits `with`).
     assert!(
-        out.contains("with"),
-        "the `with` offender stays native:\n{out}"
-    );
-    // At least two re-entry calls (the two eligible neighbors).
-    let calls = out.matches("[0],").count();
-    assert!(
-        calls >= 2,
-        "neighbors virtualize as separate chunks, saw {calls}:\n{out}"
+        !out.contains("with ("),
+        "with scope lowered to bytecode: {out}"
     );
     mangler_testkit::eval::assert_behaviorally_equal(src, &out);
 }
@@ -1188,7 +1142,7 @@ fn native_parameter_initialization_and_live_bindings_regressions() {
     ] {
         let (out, protected) = run_virtualize(src, "pay", 919);
         assert!(protected, "expected VM coverage: {src}");
-        mangler_testkit::eval::assert_behaviorally_equal(src, &out);
+        assert_node_equivalent(src, &out);
     }
 }
 
@@ -1227,7 +1181,6 @@ fn required_outcome(
 #[test]
 fn required_virtualization_fails_for_native_and_unmatched_functions() {
     for (src, target, excluded, whole, reason) in [
-        ("async function pay(){return 1}", None, None, false, "async"),
         (
             "function other(){return 1}",
             None,
@@ -1241,29 +1194,6 @@ fn required_virtualization_fails_for_native_and_unmatched_functions() {
             Some("pay"),
             false,
             "excluded",
-        ),
-        ("const pay=()=>1", None, None, false, "arrow"),
-        (
-            "function pay(){return typeof missing}",
-            None,
-            None,
-            false,
-            "native",
-        ),
-        ("async function pay(){return 1}", None, None, true, "async"),
-        (
-            "let Object={};function pay(x){return x+1}",
-            None,
-            None,
-            false,
-            "runtime_intrinsic_shadow",
-        ),
-        (
-            "function outer(){async function native(){function pay(){return 1}return pay()}return native()}",
-            None,
-            Some("other"),
-            true,
-            "async",
         ),
         (
             "function outer(){function native(){function pay(){return 7}return pay()}return native()}",
@@ -1357,11 +1287,6 @@ fn required_wildcard_counts_only_source_functions_before_helpers() {
 fn dynamic_parameter_and_native_factory_scopes_fail_required_protection() {
     for (src, excluded, reason) in [
         (
-            "function pay(x=eval('1')){return x}",
-            None,
-            "parameter_direct_eval",
-        ),
-        (
             "function pay(x){function keep(){return eval('x')}return keep()}",
             Some("keep"),
             "native_direct_eval",
@@ -1374,5 +1299,470 @@ fn dynamic_parameter_and_native_factory_scopes_fail_required_protection() {
     ] {
         let error = required_outcome(src, None, "pay", excluded, false).unwrap_err();
         assert!(error.contains(reason), "{error} should explain {reason}");
+    }
+}
+
+#[test]
+fn native_arrow_envelopes_preserve_lexical_state_and_parameter_initialization() {
+    for src in [
+        "function outer(x){const pay=(y=arguments[0])=>[this.id,x,y,arguments[0]];return pay()}globalThis.__out=JSON.stringify(outer.call({id:9},7));",
+        "const pay=({x}={x:3},...rest)=>[x,rest.length,pay.length];globalThis.__out=JSON.stringify(pay(undefined,2,4));",
+        "const pay=()=>typeof missing;globalThis.__out=pay();",
+        "const pay=(x)=>{x+=2;return ()=>x};globalThis.__out=pay(3)();",
+    ] {
+        let (out, put) = run_virtualize(src, "pay", 801);
+        assert!(put, "arrow must compile: {src}");
+        mangler_testkit::eval::assert_behaviorally_equal(src, &out);
+        required_outcome(src, Some("pay"), "pay", None, false).unwrap();
+    }
+}
+
+#[test]
+fn required_coverage_includes_callbacks_accessors_and_private_members() {
+    for src in [
+        "[1,2].map(x=>x+1);",
+        "[1,2].map(function(x){return x+1});",
+        "const obj={get total(){return 3},set total(v){this.x=v}};",
+        "class Pay { constructor(x){this.x=x} #charge(){return this.x} run(){return this.#charge()} }",
+    ] {
+        required_outcome(src, Some("*"), "*", None, false).unwrap();
+    }
+}
+
+#[test]
+fn lost_source_identity_fails_required_coverage() {
+    let source = "function pay(){return 1}";
+    let parsed = Js.parse(source, &ParseOpts::default()).unwrap();
+    let cfg = FileConfig::new(
+        ResolvedConfig::try_from(ConfigFlags {
+            preset: Some(Intensity::Minify),
+            require_virtualized: Some("pay".into()),
+            ..Default::default()
+        })
+        .unwrap(),
+        19,
+        reserved_idents(source),
+    )
+    .with_source_functions(source_functions(parsed.program()));
+    let mut ast = Js.parse("0;", &ParseOpts::default()).unwrap();
+    let mut bus = ArtifactBus::new();
+    let pass = VirtualizePass;
+    bus.enter_pass(pass.id(), pass.reads(), pass.writes());
+    let mut notes = Notes::default();
+    let error = pass
+        .run(
+            &mut ast,
+            &cfg,
+            &mut Rng::for_pass(19, pass.id()),
+            &mut bus,
+            &mut notes,
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("transformed_source_missing"),
+        "{error}"
+    );
+}
+
+#[test]
+fn native_parameter_environment_redeclarations_keep_default_closures_separate() {
+    for src in [
+        "function pay(a=1,b=()=>a){var a=2;return b()}globalThis.__out=pay();",
+        "function pay(a){var a=2;return [a,arguments[0]]}globalThis.__out=JSON.stringify(pay(1));",
+        "function pay(a){var arguments;return [arguments[0],Array.isArray(arguments)]}globalThis.__out=JSON.stringify(pay(7));",
+        "function pay(a=1,b=()=>a){function a(){return 2}return [b(),typeof a]}globalThis.__out=JSON.stringify(pay());",
+        "let pay;pay=function(x){return x+1};globalThis.__out=pay(8);",
+        "const obj={['pay'](x){return x+1}};globalThis.__out=obj.pay(8);",
+    ] {
+        let (out, put) = run_virtualize(src, "pay", 803);
+        assert!(put, "source function must compile: {src}");
+        mangler_testkit::eval::assert_behaviorally_equal(src, &out);
+        required_outcome(src, Some("pay"), "pay", None, false).unwrap();
+    }
+}
+
+#[test]
+fn parameter_eval_never_silently_becomes_indirect_global_eval() {
+    for source in [
+        "function pay(a=eval('var x=3')){return [x,Object.hasOwn(globalThis,'x')]}globalThis.__out=pay();",
+        "function pay(a=eval('var x=3')){var x;return [x,Object.hasOwn(globalThis,'x')]}globalThis.__out=pay();",
+        "function pay(a,b=(eval)('a')){return b}globalThis.__out=pay(7);",
+        "function pay(value,a=eval('var hidden=value')){return ()=>hidden}var first=pay(3),second=pay(7);globalThis.__out=[first(),second(),Object.hasOwn(globalThis,'hidden')];",
+        "function pay(a=eval('new.target')){this.value=a===pay}globalThis.__out=(new pay()).value;",
+    ] {
+        let (output, protected) = run_virtualize(source, "pay", 809);
+        assert!(protected);
+        assert_node_equivalent(source, &output);
+    }
+}
+
+#[test]
+fn native_parameter_callbacks_are_independently_protected() {
+    let src = "function pay(a=1,b=()=>a){return b()}globalThis.__out=pay();";
+    let notes = required_outcome(src, Some("pay"), "*", None, false).unwrap();
+    let report = notes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(report.matches(": virtualized").count(), 2, "{report}");
+}
+
+#[test]
+fn selected_source_bodies_fail_closed_without_required_flag() {
+    let src = "function pay(code){return code}";
+    let cfg = FileConfig::new(resolved_with_target("pay", 807), 807, reserved_idents(src));
+    let ast = Js.parse(src, &ParseOpts::default()).unwrap();
+    let candidates = coverage::candidates(ast.program());
+    let outcomes = candidates
+        .iter()
+        .map(|candidate| (candidate.span, Some("compiler_failure".to_string())))
+        .collect();
+    let error = coverage::report(
+        &candidates,
+        &outcomes,
+        &cfg.resolved().passes.virtualize,
+        &mut Notes::default(),
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("selected source bodies"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("pay"), "{error}");
+    let (_, protected) = run_virtualize_with_exclude(src, "pay", "pay", 807);
+    assert!(!protected, "an explicit exclusion remains permitted");
+}
+
+fn assert_node_equivalent(source: &str, transformed: &str) {
+    fn evaluate(source: &str) -> std::process::Output {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("node")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Node ECMAScript evaluator");
+        {
+            let mut input = child.stdin.take().unwrap();
+            input.write_all(source.as_bytes()).unwrap();
+            input
+                .write_all(b";process.stdout.write(JSON.stringify(globalThis.__out));")
+                .unwrap();
+        }
+        child.wait_with_output().unwrap()
+    }
+    let expected = evaluate(source);
+    let actual = evaluate(transformed);
+    assert!(
+        expected.status.success(),
+        "native Node execution: {}",
+        String::from_utf8_lossy(&expected.stderr)
+    );
+    assert!(
+        actual.status.success(),
+        "virtualized Node execution: {}",
+        String::from_utf8_lossy(&actual.stderr)
+    );
+    assert_eq!(
+        actual.stdout, expected.stdout,
+        "Node semantic mismatch: {source}"
+    );
+}
+
+#[test]
+fn generator_parameter_initializers_execute_bytecode_at_call_time() {
+    for src in [
+        "var calls=0;function* pay(x=++calls){yield x}var g=pay();globalThis.__out=JSON.stringify([calls,g.next(),pay.length,Object.getPrototypeOf(pay).constructor.name]);",
+        "function* pay(x=1,get=()=>x){x=2;yield [get(),get.name]}globalThis.__out=JSON.stringify(pay().next());",
+        "var seen=[];function* pay({[seen.push('key')]:x=seen.push('default')}={}){yield [x,seen]}var g=pay();globalThis.__out=JSON.stringify([seen.slice(),g.next()]);",
+        "function* pay(x=1){yield x}try{new pay()}catch(e){globalThis.__out=e.name}",
+        "function* pay(__proto__=()=>1){yield __proto__.name}globalThis.__out=JSON.stringify(pay().next());",
+        "function* pay(a=eval('var hidden=3')){yield [hidden,Object.hasOwn(globalThis,'hidden')]}var iterator=pay();globalThis.__out=JSON.stringify(iterator.next());",
+        "function* pay(value,a=eval('var hidden=value'),get=()=>hidden){yield get()}var first=pay(3),second=pay(7);globalThis.__out=JSON.stringify([first.next(),second.next(),Object.hasOwn(globalThis,'hidden')]);",
+    ] {
+        let (out, put) = run_virtualize(src, "pay", 811);
+        assert!(put, "source generator must compile: {src}");
+        assert_node_equivalent(src, &out);
+        required_outcome(src, Some("pay"), "pay", None, false).unwrap();
+    }
+}
+
+#[test]
+fn whole_program_preserves_script_global_var_storage_and_lexical_tdz() {
+    for src in [
+        "if(true){var amount=7}globalThis.__out=JSON.stringify([amount,globalThis.amount]);",
+        "for(var i=0;i<3;i++){}globalThis.__out=JSON.stringify([i,globalThis.i]);",
+        "globalThis.__out=[];try{globalThis.__out.push(balance)}catch(e){globalThis.__out.push(e.name)}let balance=21*2;globalThis.__out.push(balance);globalThis.__out=JSON.stringify(globalThis.__out);",
+        "var calls=0;const {[++calls]:value=++calls}={};globalThis.__out=JSON.stringify([value,calls]);",
+    ] {
+        let (out, protected) = run_whole_program(src, 817);
+        assert!(protected);
+        mangler_testkit::eval::assert_behaviorally_equal(src, &out);
+    }
+}
+
+#[test]
+fn whole_program_export_initializers_keep_live_module_bindings() {
+    let src =
+        "export let balance=40+2;export function charge(){balance-=2}export const initial=balance;";
+    let (out, protected) = run_whole_program(src, 819);
+    assert!(protected);
+    fn evaluate(source: &str) -> Vec<u8> {
+        let result = std::process::Command::new("node").arg("-e").arg("import('data:text/javascript,'+encodeURIComponent(process.argv[1])).then(m=>{m.charge();process.stdout.write(JSON.stringify([m.initial,m.balance]))}).catch(e=>{console.error(e);process.exit(1)})").arg(source).output().expect("Node module evaluator");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        result.stdout
+    }
+    assert_eq!(evaluate(src), evaluate(&out));
+    assert!(
+        !out.contains("balance=40+2"),
+        "export initializer must execute in VM"
+    );
+}
+
+#[test]
+fn excluded_nested_function_retains_its_inferred_name() {
+    let source =
+        "function pay(){function keep(){return keep.name}return keep()}globalThis.__out=pay();";
+    let (output, protected) = run_virtualize_with_exclude(source, "pay", "keep", 821);
+    assert!(protected);
+    assert_node_equivalent(source, &output);
+}
+
+#[test]
+fn whole_program_module_await_runs_bytecode_without_extra_adoption_jobs() {
+    fn evaluate(source: &str) -> Vec<u8> {
+        let output = std::process::Command::new("node")
+            .args(["--input-type=module", "-e"])
+            .arg(format!(
+                "{source};process.stdout.write(JSON.stringify(globalThis.__out));"
+            ))
+            .output()
+            .expect("Node module await evaluator");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+    for source in [
+        "export let balance=await Promise.resolve(40)+2;globalThis.__out=balance;",
+        "let order=[];Promise.resolve().then(()=>order.push('first')).then(()=>order.push('second'));order.push(await Promise.resolve('value'));globalThis.__out=order;",
+        "let values=[];for await(const value of [Promise.resolve(2),3]){values.push(value*2)}globalThis.__out=values;export{};",
+        "let values=[];try{values.push(await Promise.reject('failure'))}catch(error){values.push(error)}finally{values.push('finally')}globalThis.__out=values;export{};",
+        "const first=1,second=await Promise.resolve(first+1),third=second+1;globalThis.__out=[first,second,third];export{};",
+        "export default await Promise.resolve(3*7);globalThis.__out=21;",
+    ] {
+        let (output, protected) = run_whole_program(source, 823);
+        assert!(protected);
+        assert_eq!(
+            evaluate(source),
+            evaluate(&output),
+            "module await mismatch: {source}"
+        );
+    }
+}
+
+#[test]
+fn default_export_suspension_shells_preserve_names_and_callable_kinds() {
+    fn evaluate(source: &str) -> Vec<u8> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("node").arg("-e").arg("import('data:text/javascript,'+encodeURIComponent(require('fs').readFileSync(0,'utf8'))).then(async m=>{const f=m.default;let value=f();if(value&&value.next)value=await value.next();else value=await value;process.stdout.write(JSON.stringify([f.name,f.length,Object.getPrototypeOf(f).constructor.name,Object.hasOwn(f,'prototype'),value,m.before]))}).catch(e=>{console.error(e);process.exit(1)})").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(source.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+    for source in [
+        "export default async function(a=3){return a*7}",
+        "export const before=pay.name;export default async function pay(a=3){return a*7}",
+        "export default function*(a=3){yield a*7}",
+        "export default async function*(a=3){yield a*7}",
+        "export default (async(a=3)=>a*7)",
+    ] {
+        let (output, protected) = run_whole_program(source, 827);
+        assert!(protected);
+        assert_eq!(
+            evaluate(source),
+            evaluate(&output),
+            "default export mismatch: {source}"
+        );
+    }
+}
+
+#[test]
+fn whole_program_eval_uses_the_native_script_variable_environment() {
+    for source in [
+        "var result=eval('var hidden=3');globalThis.__out=JSON.stringify([hidden,globalThis.hidden]);",
+        "eval('var hidden=3');globalThis.__out=JSON.stringify([hidden,globalThis.hidden]);",
+        "let amount=1;var caught='none';try{eval('var amount=2')}catch(e){caught=e.name}globalThis.__out=JSON.stringify([amount,caught]);",
+        "let secret=7;function pay(){return (0,eval)('secret')}globalThis.__out=JSON.stringify(pay());",
+        "var outcome;try{(()=>eval('new.target'))()}catch(e){outcome=e.name}globalThis.__out=outcome;",
+    ] {
+        let (output, protected) = run_whole_program(source, 829);
+        assert!(protected);
+        assert_node_equivalent(source, &output);
+    }
+}
+
+#[test]
+fn awaited_native_patterns_preserve_tdz_iterator_close_and_promise_jobs() {
+    fn evaluate(source: &str) -> Vec<u8> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("node")
+            .args(["--input-type=module"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                format!("{source};process.stdout.write(JSON.stringify(globalThis.__out));")
+                    .as_bytes(),
+            )
+            .unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        result.stdout
+    }
+    for source in [
+        "export const [first=await Promise.resolve(2),second=await Promise.resolve(first+3)]=[];globalThis.__out=[first,second];",
+        "let log=[];Promise.resolve().then(()=>log.push('first')).then(()=>log.push('second'));const [value=(log.push('start'),await Promise.resolve(3),log.push('end'))]=[];globalThis.__out=log;export{};",
+        "let log=[];const {[await Promise.resolve('x')]:value=await Promise.resolve(4),other=value+1}={};globalThis.__out=[value,other];export{};",
+        "let log=[];const iterator={[Symbol.iterator](){return{next(){log.push('next');return{value:void 0,done:false}},return(){log.push('close');return{done:true}}}}};const [first=await Promise.resolve(2),second=await Promise.resolve(first+3)]=iterator;globalThis.__out=[first,second,log];export{};",
+        "let caught;try{const [first=await Promise.resolve(second),second=3]=[]}catch(e){caught=e.name}globalThis.__out=caught;export{};",
+        "let log=[];const iterator={[Symbol.iterator](){return{next(){log.push('next');return{value:void 0,done:false}},return(){log.push('close');throw Error('close')}}}};let caught;try{const [value=await Promise.reject(Error('original'))]=iterator}catch(e){caught=e.message}globalThis.__out=[caught,log];export{};",
+        "const [value=true?(await Promise.resolve(2))+await Promise.resolve(3):await Promise.resolve(9)]=[];globalThis.__out=value;export{};",
+    ] {
+        let (output, protected) = run_whole_program(source, 831);
+        assert!(protected);
+        assert_eq!(
+            evaluate(source),
+            evaluate(&output),
+            "awaited binding mismatch: {source}"
+        );
+    }
+}
+
+#[test]
+fn generated_decoder_spans_cannot_satisfy_source_function_coverage() {
+    use swc_core::ecma::visit::{Visit, VisitWith};
+    #[derive(Default)]
+    struct Body {
+        native_rate: bool,
+        vm_call: bool,
+    }
+    impl Visit for Body {
+        fn visit_number(&mut self, number: &Number) {
+            self.native_rate |= number.value == 1.0725;
+        }
+        fn visit_call_expr(&mut self, call: &CallExpr) {
+            self.vm_call |= call.args.len() >= 8 && call.args.iter().take(2).all(|arg| matches!(&*arg.expr, Expr::Member(member) if matches!(&*member.obj, Expr::Member(_))));
+            call.visit_children_with(self);
+        }
+    }
+    #[derive(Default)]
+    struct PaymentBody {
+        found: bool,
+        body: Body,
+    }
+    impl Visit for PaymentBody {
+        fn visit_fn_decl(&mut self, function: &FnDecl) {
+            if function.ident.sym == "pay" {
+                self.found = true;
+                function.function.body.visit_with(&mut self.body);
+            }
+        }
+    }
+    for prefix in ["", " "] {
+        let source = format!(
+            "{prefix}function pay(amount,tier){{const discount=tier==='gold'?17:3;if(amount>7900)return Math.round((amount-discount*100)*1.0725)+49;return amount+129}}globalThis.__out=pay(10000,'gold');"
+        );
+        for whole_program in [false, true] {
+            for preset in [Intensity::High, Intensity::Max] {
+                for coupled in [false, true] {
+                    let config = ResolvedConfig::try_from(ConfigFlags {
+                        preset: Some(preset),
+                        seed: Some(42),
+                        virtualize: (!whole_program).then(|| "*".into()),
+                        virtualize_program: whole_program,
+                        require_virtualized: Some("*".into()),
+                        strings_in_vm: Some(true),
+                        self_coupled_key: Some(coupled),
+                        exec_trace_key: Some(coupled),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                    let (output, _) =
+                        crate::runner::process(&source, &ParseOpts::default(), &config).unwrap();
+                    let ast = Js.parse(&output, &ParseOpts::default()).unwrap();
+                    let mut body = PaymentBody::default();
+                    ast.program().visit_with(&mut body);
+                    assert!(
+                        body.found && body.body.vm_call && !body.body.native_rate,
+                        "source payment body remained native: prefix={prefix:?} whole={whole_program} preset={preset:?} coupled={coupled}"
+                    );
+                    assert_node_equivalent(&source, &output);
+                }
+            }
+        }
+    }
+}
+
+#[path = "super_construct_tests.rs"]
+mod super_construct;
+
+#[path = "generator_kernel_tests.rs"]
+mod generator_kernel;
+
+#[test]
+fn source_anonymity_is_distinct_from_coverage_display_labels() {
+    for source in [
+        "var values=[function*(value){yield value+1}];globalThis.__out=JSON.stringify([values[0].name,values[0](3).next().value]);",
+        "var values=[async function(){},async()=>{}];globalThis.__out=JSON.stringify(values.map(value=>value.name));",
+        "var value={['<anonymous@8>']:function*(){return 1}};globalThis.__out=value['<anonymous@8>'].name;",
+    ] {
+        let (output, used) = run_virtualize(source, "*", 42);
+        assert!(used);
+        mangler_testkit::eval::assert_behaviorally_equal(source, &output);
+    }
+}
+
+#[test]
+fn generated_argument_cells_cannot_inherit_source_suspension_kind() {
+    // The source generator starts at the same positive parser offset as the
+    // generated strict argument-cell getter. Generated spans must be cleared.
+    for prefix in ["", " ", "/* offset */"] {
+        let source = format!(
+            "{prefix}\"use strict\";\nvar callCount = 0;\nvar f;\nf = function*(x, _ = 0) {{arguments[0]=1;var before=[x,arguments[0]];x=2;return [before,x,arguments[0]]}};globalThis.__out=JSON.stringify(f().next().value);"
+        );
+        let (output, used) = run_virtualize(&source, "*", 42);
+        assert!(used);
+        mangler_testkit::eval::assert_behaviorally_equal(&source, &output);
     }
 }

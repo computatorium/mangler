@@ -4,13 +4,13 @@
 #![cfg(test)]
 
 use swc_core::common::sync::Lrc;
-use swc_core::common::{FileName, SourceMap, DUMMY_SP};
+use swc_core::common::{DUMMY_SP, FileName, SourceMap};
 use swc_core::ecma::ast::*;
-use swc_core::ecma::codegen::{text_writer::JsWriter, Config as CodegenConfig, Emitter};
-use swc_core::ecma::parser::{lexer::Lexer, EsSyntax, Parser, StringInput, Syntax};
+use swc_core::ecma::codegen::{Config as CodegenConfig, Emitter, text_writer::JsWriter};
+use swc_core::ecma::parser::{EsSyntax, Parser, StringInput, Syntax, lexer::Lexer};
 
 /// Parses `src` as the body of `function __t() { ... }` and returns its block.
-pub fn parse_body(src: &str) -> BlockStmt {
+pub fn parse_body(src: &str) -> FunctionBody {
     let cm: Lrc<SourceMap> = Default::default();
     let wrapped = format!("function __t() {{ {src} }}");
     let fm = cm.new_source_file(Lrc::new(FileName::Custom("t.js".into())), wrapped);
@@ -50,7 +50,7 @@ pub fn test_support_cfg() -> crate::config::FileConfig {
 }
 
 /// Codegens a [`BlockStmt`] to a string for structural assertions.
-pub fn emit_block(block: &BlockStmt) -> String {
+pub fn emit_block(statements: &[Stmt]) -> String {
     let cm: Lrc<SourceMap> = Default::default();
     let mut buf = Vec::new();
     {
@@ -63,7 +63,11 @@ pub fn emit_block(block: &BlockStmt) -> String {
         };
         let script = Script {
             span: DUMMY_SP,
-            body: vec![Stmt::Block(block.clone())],
+            body: vec![Stmt::Block(BlockStmt {
+                span: DUMMY_SP,
+                stmts: statements.to_vec(),
+                ..Default::default()
+            })],
             shebang: None,
         };
         emitter.emit_script(&script).unwrap();

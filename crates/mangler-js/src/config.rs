@@ -46,6 +46,16 @@ pub struct FileConfig {
     eff_seed: u64,
     allocator: RefCell<NameAllocator>,
     source_functions: Option<HashSet<(u32, String)>>,
+    source_anonymous: Option<HashSet<u32>>,
+    source_compiler_sites: Option<crate::passes::virtualize::SourceDependencies>,
+    eval_class_contexts: Option<crate::passes::virtualize::eval_contexts::SourceClassContexts>,
+    runtime_frontend: bool,
+    runtime_intrinsics: Option<String>,
+    runtime_eval_frontend: bool,
+    runtime_eval_context: Option<mangler_vm::eval::EvalClassContext>,
+    runtime_support: RefCell<Vec<(Vec<swc_core::ecma::ast::Stmt>, String)>>,
+    runtime_internals: RefCell<HashSet<String>>,
+    source_utf16: Option<mangler_vm::source_text::SourceTextMap>,
 }
 
 impl FileConfig {
@@ -65,17 +75,146 @@ impl FileConfig {
             eff_seed,
             allocator: RefCell::new(allocator),
             source_functions: None,
+            source_anonymous: None,
+            source_compiler_sites: None,
+            eval_class_contexts: None,
+            runtime_frontend: false,
+            runtime_intrinsics: None,
+            runtime_eval_frontend: false,
+            runtime_eval_context: None,
+            runtime_support: RefCell::new(Vec::new()),
+            runtime_internals: RefCell::new(HashSet::new()),
+            source_utf16: None,
         }
     }
 
+    pub(crate) fn with_source_utf16(mut self, map: mangler_vm::source_text::SourceTextMap) -> Self {
+        if !map.is_empty() {
+            self.source_utf16 = Some(map);
+        }
+        self
+    }
+
+    pub(crate) fn source_utf16(&self) -> Option<&mangler_vm::source_text::SourceTextMap> {
+        self.source_utf16.as_ref()
+    }
+
+    pub(crate) fn with_eval_class_contexts(
+        mut self,
+        contexts: crate::passes::virtualize::eval_contexts::SourceClassContexts,
+    ) -> Self {
+        self.eval_class_contexts = Some(contexts);
+        self
+    }
+    pub(crate) fn eval_class_contexts(
+        &self,
+    ) -> Option<&crate::passes::virtualize::eval_contexts::SourceClassContexts> {
+        self.eval_class_contexts.as_ref()
+    }
+
+    pub(crate) fn with_runtime_eval_context(
+        mut self,
+        context: Option<mangler_vm::eval::EvalClassContext>,
+    ) -> Self {
+        self.runtime_eval_context = context;
+        self
+    }
+
+    pub(crate) fn runtime_eval_context(&self) -> Option<&mangler_vm::eval::EvalClassContext> {
+        self.runtime_eval_context.as_ref()
+    }
+
+    pub(crate) fn with_source_compiler_sites(
+        mut self,
+        sites: crate::passes::virtualize::SourceDependencies,
+    ) -> Self {
+        self.source_compiler_sites = Some(sites);
+        self
+    }
+
+    pub(crate) fn source_compiler_dependencies(
+        &self,
+    ) -> Option<&crate::passes::virtualize::SourceDependencies> {
+        self.source_compiler_sites.as_ref()
+    }
+
     /// Pin protection targets to the input AST before generated helpers are inserted.
-    pub(crate) fn with_source_functions(mut self, functions: Vec<(u32, String)>) -> Self {
-        self.source_functions = Some(functions.into_iter().collect());
+    pub(crate) fn with_source_functions(mut self, functions: Vec<(u32, String, bool)>) -> Self {
+        self.source_anonymous = Some(
+            functions
+                .iter()
+                .filter_map(|(span, _, anonymous)| anonymous.then_some(*span))
+                .collect(),
+        );
+        self.source_functions = Some(
+            functions
+                .into_iter()
+                .map(|(span, name, _)| (span, name))
+                .collect(),
+        );
         self
     }
 
     pub(crate) fn source_functions(&self) -> Option<&HashSet<(u32, String)>> {
         self.source_functions.as_ref()
+    }
+
+    pub(crate) fn source_anonymous(&self) -> Option<&HashSet<u32>> {
+        self.source_anonymous.as_ref()
+    }
+
+    /// Bind generated helper reads to a host-provided startup snapshot.
+    pub(crate) fn with_runtime_intrinsics(mut self, binding: String) -> Self {
+        self.runtime_intrinsics = Some(binding);
+        self
+    }
+
+    pub(crate) fn runtime_intrinsics(&self) -> Option<&str> {
+        self.runtime_intrinsics.as_deref()
+    }
+
+    /// Runtime compilation shares the source pass but supplies its own compiler
+    /// instance to generated tables instead of embedding another Wasm compiler.
+    pub(crate) fn with_runtime_frontend(mut self) -> Self {
+        self.runtime_frontend = true;
+        self
+    }
+
+    pub(crate) fn runtime_frontend(&self) -> bool {
+        self.runtime_frontend
+    }
+
+    pub(crate) fn with_runtime_eval_frontend(mut self) -> Self {
+        self.runtime_frontend = true;
+        self.runtime_eval_frontend = true;
+        self
+    }
+
+    pub(crate) fn runtime_eval_frontend(&self) -> bool {
+        self.runtime_eval_frontend
+    }
+
+    pub(crate) fn collect_runtime_internals(&self, names: &HashSet<String>) {
+        self.runtime_internals
+            .borrow_mut()
+            .extend(names.iter().cloned());
+    }
+
+    pub(crate) fn take_runtime_internals(&self) -> HashSet<String> {
+        self.runtime_internals.take()
+    }
+
+    /// Called only after the ordinary source-coverage gate accepts the program.
+    pub(crate) fn collect_runtime_support(
+        &self,
+        statements: Vec<swc_core::ecma::ast::Stmt>,
+        table: String,
+    ) {
+        self.runtime_support.borrow_mut().push((statements, table));
+    }
+
+    pub(crate) fn take_runtime_support(&self) -> Vec<(Vec<swc_core::ecma::ast::Stmt>, String)> {
+        self.runtime_support.take()
     }
 
     /// The validated obfuscation config. A pass reads its own tuning here, e.g.

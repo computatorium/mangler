@@ -163,7 +163,7 @@ struct Flattener<'a> {
 
 impl Flattener<'_> {
     /// Attempts to flatten one function body in place. Returns whether it did.
-    fn try_flatten_body(&mut self, body: &mut BlockStmt, is_simple: bool) -> bool {
+    fn try_flatten_body(&mut self, body: &mut FunctionBody, is_simple: bool) -> bool {
         if !is_simple {
             return false;
         }
@@ -217,7 +217,7 @@ impl Flattener<'_> {
         // hoisting the CFG cannot model; the gate scan rejects such bodies, so
         // only direct-body declarations reach here.)
         let original = std::mem::take(&mut body.stmts);
-        let directive_count = mangler_jsast::directives::leading_directive_count(&original);
+        let directive_count = mangler_jsast::directives::leading_initialization_count(&original);
         let mut original = original;
         let statements = original.split_off(directive_count);
         let directives = original;
@@ -270,8 +270,16 @@ impl Flattener<'_> {
 }
 
 impl VisitMut for Flattener<'_> {
+    fn visit_mut_expr(&mut self, expression: &mut Expr) {
+        if mangler_jsast::span::is_runtime_span(swc_core::common::Spanned::span(expression)) {
+            return;
+        }
+        expression.visit_mut_children_with(self);
+    }
+
     fn visit_mut_fn_decl(&mut self, n: &mut FnDecl) {
-        if n.ident.sym.as_ref() == self.protect_name
+        if mangler_jsast::span::is_runtime_span(n.ident.span)
+            || n.ident.sym.as_ref() == self.protect_name
             || self.runtime.as_ref().is_some_and(|vm| {
                 vm.interpreter_names
                     .iter()
@@ -296,7 +304,7 @@ impl VisitMut for Flattener<'_> {
         n.visit_mut_children_with(self);
         let simple = !n.is_async;
         // Only block-bodied arrows (expression bodies have nothing to flatten).
-        if let BlockStmtOrExpr::BlockStmt(body) = &mut *n.body {
+        if let ArrowFunctionBody::FunctionBody(body) = &mut *n.body {
             self.try_flatten_body(body, simple);
         }
     }

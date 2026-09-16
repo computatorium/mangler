@@ -2,7 +2,7 @@
 //! may omit unconfigured engines. No implicit `node` or Chrome PATH lookup.
 
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -187,6 +187,24 @@ pub enum Engine {
     Node(PathBuf),
     Chrome(PathBuf),
 }
+
+/// Execute Node source from a temporary file so embedded compiler assets do not
+/// exceed the operating system's command-line limit. The same deadline and
+/// descendant cleanup used by the other engine probes still apply.
+pub fn run_node_source(binary: &Path, source: &str, timeout: Duration) -> io::Result<Output> {
+    let directory = tempfile::tempdir()?;
+    let file = directory.path().join("probe.js");
+    std::fs::write(&file, source)?;
+    // Keep script grammar and globals: running a .cjs file directly introduces
+    // a CommonJS function activation, which changes new.target and arguments.
+    run_bounded(
+        Command::new(binary)
+            .arg("-e")
+            .arg("new(require('node:vm').Script)(require('node:fs').readFileSync(process.argv[1],'utf8')).runInThisContext()")
+            .arg(file),
+        timeout,
+    )
+}
 impl Engine {
     pub fn name(&self) -> &'static str {
         match self {
@@ -355,6 +373,20 @@ pub fn evaluate_many(engine: &Engine, programs: &[&str]) -> io::Result<Vec<serde
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn file_source_exceeds_argv_limits_without_a_function_wrapper() {
+        let Some(node) = node_path() else {
+            return;
+        };
+        let source = format!(
+            "/*{}*/try{{eval('new.target')}}catch(e){{console.log(e.name)}}",
+            "x".repeat(2 * 1024 * 1024),
+        );
+        let output = run_node_source(&node, &source, Duration::from_secs(5)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"SyntaxError\n");
+    }
+
     #[test]
     fn configured_node_has_a_real_deadline() {
         let Some(node) = node_path() else {

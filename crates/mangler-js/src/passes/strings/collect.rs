@@ -236,7 +236,7 @@ impl VisitMut for StringCollector {
     fn visit_mut_arrow_expr(&mut self, n: &mut ArrowExpr) {
         n.params.visit_mut_with(self);
         match &mut *n.body {
-            BlockStmtOrExpr::BlockStmt(body) => {
+            ArrowFunctionBody::FunctionBody(body) => {
                 let previous = self.ctx_stack.in_directive;
                 let count = mangler_jsast::directives::leading_directive_count(&body.stmts);
                 for (idx, stmt) in body.stmts.iter_mut().enumerate() {
@@ -245,7 +245,7 @@ impl VisitMut for StringCollector {
                 }
                 self.ctx_stack.in_directive = previous;
             }
-            BlockStmtOrExpr::Expr(expr) => expr.visit_mut_with(self),
+            ArrowFunctionBody::Expr(expr) => expr.visit_mut_with(self),
         }
     }
 

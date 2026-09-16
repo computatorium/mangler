@@ -1,0 +1,74 @@
+# Bounded semantic strata; retain native and wrapper applicability diagnostics.
+# Optional chains: receiver, evaluation, reflection, await, and a parse negative.
+test/language/expressions/optional-chaining/optional-call-preserves-this.js
+test/language/expressions/optional-chaining/short-circuiting.js
+test/language/expressions/optional-chaining/member-expression.js
+test/language/expressions/optional-chaining/new-target-optional-call.js
+test/language/expressions/optional-chaining/eval-optional-call.js
+test/language/expressions/optional-chaining/super-property-optional-call.js
+test/language/expressions/optional-chaining/member-expression-async-this.js
+test/language/expressions/optional-chaining/iteration-statement-for-await-of.js
+test/language/expressions/optional-chaining/runtime-semantics-evaluation.js
+test/language/expressions/optional-chaining/call-expression-super-no-base.js
+
+# Arguments objects: aliasing, descriptor changes, deletion, and unmapped forms.
+test/language/arguments-object/mapped/Symbol.iterator.js
+test/language/arguments-object/mapped/writable-enumerable-configurable-descriptor.js
+test/language/arguments-object/mapped/enumerable-configurable-accessor-descriptor.js
+test/language/arguments-object/mapped/nonconfigurable-descriptors-set-value-by-arguments.js
+test/language/arguments-object/mapped/nonconfigurable-descriptors-set-value-with-define-property.js
+test/language/arguments-object/mapped/nonwritable-nonconfigurable-descriptors-set-by-param.js
+test/language/arguments-object/mapped/mapped-arguments-nonconfigurable-delete-1.js
+test/language/arguments-object/mapped/mapped-arguments-nonconfigurable-strict-delete-1.js
+test/language/arguments-object/unmapped/Symbol.iterator.js
+test/language/arguments-object/unmapped/via-params-dflt.js
+test/language/arguments-object/unmapped/via-params-dstr.js
+test/language/arguments-object/unmapped/via-params-rest.js
+test/language/arguments-object/unmapped/via-strict.js
+
+# For-of: abrupt completion, close precedence, fresh bindings, and host iterables.
+test/language/statements/for-of/generator-close-via-break.js
+test/language/statements/for-of/generator-close-via-continue.js
+test/language/statements/for-of/generator-close-via-return.js
+test/language/statements/for-of/generator-close-via-throw.js
+test/language/statements/for-of/iterator-close-non-object.js
+test/language/statements/for-of/iterator-close-non-throw-get-method-abrupt.js
+test/language/statements/for-of/iterator-close-throw-get-method-abrupt.js
+test/language/statements/for-of/iterator-close-throw-get-method-non-callable.js
+test/language/statements/for-of/iterator-next-error.js
+test/language/statements/for-of/iterator-next-result-value-attr-error.js
+test/language/statements/for-of/head-const-fresh-binding-per-iteration.js
+test/language/statements/for-of/iterator-as-proxy.js
+test/language/statements/for-of/string-astral.js
+test/language/statements/for-of/typedarray-backed-by-resizable-buffer-shrink-mid-iteration.js
+
+# Try/catch/finally: completion, scopes, and catch destructuring.
+test/language/statements/try/completion-values-fn-finally-abrupt.js
+test/language/statements/try/completion-values-fn-finally-normal.js
+test/language/statements/try/cptn-catch-empty-break.js
+test/language/statements/try/cptn-finally-empty-continue.js
+test/language/statements/try/cptn-finally-skip-catch.js
+test/language/statements/try/scope-catch-block-var-none.js
+test/language/statements/try/dstr/obj-ptrn-rest-skip-non-enumerable.js
+test/language/statements/try/dstr/ary-ptrn-elem-ary-elem-iter.js
+
+# Generators: shape, creation, parameters, bindings, and delegation.
+test/language/statements/generators/no-yield.js
+test/language/statements/generators/return.js
+test/language/statements/generators/default-proto.js
+test/language/statements/generators/prototype-uniqueness.js
+test/language/statements/generators/length-property-descriptor.js
+test/language/statements/generators/invoke-as-constructor.js
+test/language/statements/generators/dflt-params-abrupt.js
+test/language/statements/generators/dflt-params-ref-later.js
+test/language/statements/generators/params-dflt-args-unmapped.js
+test/language/statements/generators/yield-spread-arr-multiple.js
+
+# Async generators: sync/async delegates and promise/error completion.
+test/language/statements/async-generator/return-undefined-implicit-and-explicit.js
+test/language/statements/async-generator/yield-star-sync-throw.js
+test/language/statements/async-generator/yield-star-async-return.js
+test/language/statements/async-generator/yield-star-next-call-returns-abrupt.js
+test/language/statements/async-generator/yield-star-return-missing-value-is-awaited.js
+test/language/statements/async-generator/yield-star-next-then-get-abrupt.js
+test/language/statements/async-generator/dflt-params-arg-val-undefined.js

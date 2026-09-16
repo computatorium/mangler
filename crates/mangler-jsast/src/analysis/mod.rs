@@ -14,6 +14,7 @@
 //! so the WP6 passes get byte-identical behavior on the new substrate.
 
 pub mod bindings;
+pub mod declarations;
 pub mod eligibility;
 pub mod scope;
 

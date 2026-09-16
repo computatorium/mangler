@@ -132,13 +132,14 @@ fn rewrite_literals(
             }
         })
         .skip_subtree(move |mark| match mark {
+            SubtreeMark::Expr { expression } => mangler_jsast::span::is_runtime_span(swc_core::common::Spanned::span(expression)),
             // Never rewrite inside `var <protect> = …` (the decoder/anchor init).
             SubtreeMark::VarDeclaratorInit { name } => {
                 matches!((&protect, name),
                     (Some(p), Pat::Ident(bi)) if bi.id.sym.as_ref() == p.as_str())
                 || matches!((vm, name), (Some(vm), Pat::Ident(bi)) if bi.id.sym.as_ref() == vm.program_table_name)
             }
-            SubtreeMark::FnDecl { ident } => vm.is_some_and(|vm| vm.interpreter_names.iter().any(|name| ident.sym.as_ref() == name)),
+            SubtreeMark::FnDecl { ident } => mangler_jsast::span::is_runtime_span(ident.span) || vm.is_some_and(|vm| vm.interpreter_names.iter().any(|name| ident.sym.as_ref() == name)),
             _ => false,
         })
         .run(program);

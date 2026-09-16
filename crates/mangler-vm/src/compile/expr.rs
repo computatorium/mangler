@@ -7,17 +7,17 @@
 
 use super::*;
 use crate::isa::{Instr, bin_op_code, un_op_code};
+use mangler_jsast::assignment_target::unparen;
 
 pub(crate) fn emit_expr(cx: &mut Cx<'_>, expr: &Expr) {
     if cx.bailed() {
         return;
     }
-    // §4.3: a binding name (`const render = …`, `obj.render = …`, `{render: …}`)
-    // applies ONLY when the value is DIRECTLY a function/arrow expression. Take it
-    // here and re-stash it solely for the direct Fn/Arrow arms below, so a closure
-    // nested elsewhere in the value (e.g. `const x = foo(() => …)`) is NOT mis-named.
+    // §4.3: a binding name (`const render = …`, `render = …`, `{render: …}`)
+    // applies when the value is a function/arrow expression, allowing grouping.
+    // A closure nested in another expression does not inherit that name.
     let pending_name = cx.pending_fn_name.take();
-    if matches!(expr, Expr::Fn(_) | Expr::Arrow(_)) {
+    if matches!(unparen(expr), Expr::Fn(_) | Expr::Arrow(_)) {
         cx.pending_fn_name = pending_name;
     }
     match expr {
@@ -43,7 +43,7 @@ pub(crate) fn emit_expr(cx: &mut Cx<'_>, expr: &Expr) {
             );
         }
         Expr::Arrow(ar) => match &*ar.body {
-            BlockStmtOrExpr::BlockStmt(body) => emit_nested_closure(
+            ArrowFunctionBody::FunctionBody(body) => emit_nested_closure(
                 cx,
                 &ar.params,
                 body,
@@ -52,10 +52,10 @@ pub(crate) fn emit_expr(cx: &mut Cx<'_>, expr: &Expr) {
                 ar.is_generator,
                 None,
             ),
-            BlockStmtOrExpr::Expr(e) => {
+            ArrowFunctionBody::Expr(e) => {
                 // Expression-bodied arrow `(a)=>expr`: wrap as `{ return expr; }` so
                 // the shared block compiler handles it.
-                let wrapped = BlockStmt {
+                let wrapped = FunctionBody {
                     span: swc_core::common::DUMMY_SP,
                     stmts: vec![Stmt::Return(ReturnStmt {
                         span: swc_core::common::DUMMY_SP,
@@ -78,16 +78,19 @@ pub(crate) fn emit_expr(cx: &mut Cx<'_>, expr: &Expr) {
             let ci = cx.const_num(n.value);
             cx.emit(Instr::PushConst(ci));
         }
-        Expr::Lit(Lit::Str(s)) => {
-            // `Str.value` is a `Wtf8Atom`; bail on lone surrogates (not
-            // representable as a clean Rust string for our Const::Str).
-            match s.value.as_str() {
-                Some(v) => {
-                    let ci = cx.const_str(v.to_string());
-                    cx.emit(Instr::PushConst(ci));
-                }
-                None => cx.bail(),
-            }
+        Expr::Lit(Lit::Str(s)) => emit_string(cx, &s.value),
+        Expr::Lit(Lit::BigInt(n)) => {
+            let ci = cx.consts.len() as u32;
+            cx.consts.push(Const::BigInt(n.value.to_string()));
+            cx.emit(Instr::PushConst(ci));
+        }
+        Expr::Lit(Lit::Regex(r)) => {
+            let ci = cx.consts.len() as u32;
+            cx.consts.push(Const::RegExp {
+                pattern: r.exp.to_string(),
+                flags: r.flags.to_string(),
+            });
+            cx.emit(Instr::NewRegExp(ci));
         }
         Expr::Lit(Lit::Bool(b)) => {
             let ci = cx.const_bool(b.value);
@@ -96,9 +99,14 @@ pub(crate) fn emit_expr(cx: &mut Cx<'_>, expr: &Expr) {
         Expr::Lit(Lit::Null(_)) => {
             cx.emit(Instr::PushNull);
         }
-        Expr::Lit(_) => cx.bail(), // regex / bigint
+        Expr::Lit(_) => cx.bail_with("non_javascript_literal"),
         Expr::Ident(id) => {
             let name = id.sym.as_ref();
+            if binding_has_with(cx, name) || binding_has_environment(cx, name) {
+                emit_binding_ref(cx, name);
+                cx.emit(Instr::GetRef);
+                return;
+            }
             // D1: a boxed mutable capture reads through its cell (`L[slot][0]`); a
             // plain local/param/read-only-capture reads directly (`L[slot]`).
             let boxed = cx.is_celled(name);
@@ -109,48 +117,35 @@ pub(crate) fn emit_expr(cx: &mut Cx<'_>, expr: &Expr) {
                 Instr::LoadLocal(slot)
             });
         }
-        Expr::Paren(p) => emit_expr(cx, &p.expr),
-        Expr::Bin(b) => match b.op {
-            BinaryOp::LogicalAnd | BinaryOp::LogicalOr => emit_logical(cx, b),
-            BinaryOp::NullishCoalescing => emit_nullish(cx, b),
-            _ => match bin_op_code(b.op) {
-                Some(code) => {
-                    emit_expr(cx, &b.left);
-                    emit_expr(cx, &b.right);
-                    cx.emit(Instr::Bin(code));
-                }
-                None => cx.bail(),
-            },
-        },
+        Expr::Paren(_) | Expr::Bin(_) | Expr::Seq(_) => emit_expression_tree(cx, expr),
         Expr::Unary(u) => {
-            // `delete o.k` / `delete o[k]`: lower to DeleteProp (pushes the boolean
-            // result). Only a member target is modeled; a `delete x` of a local in
-            // sloppy mode is a no-op we don't reproduce, so bail on it.
             if matches!(u.op, UnaryOp::Delete) {
-                if let Expr::Member(m) = &*u.arg {
-                    emit_expr(cx, &m.obj);
-                    emit_member_key(cx, &m.prop);
-                    if cx.bailed() {
-                        return;
-                    }
-                    cx.emit(Instr::DeleteProp);
-                } else {
-                    cx.bail_with("delete_target");
-                }
+                emit_delete(cx, &u.arg);
                 return;
             }
-            // soundness bail: typeof <free ident capture>. A BOXED capture is fine
-            // (its cell always exists, so `typeof x[0]` reads the boxed value — the
-            // ident emit below loads through the cell); only a read-only/unknown
-            // free name (which `typeof` must tolerate as "undefined") bails.
             if matches!(u.op, UnaryOp::TypeOf)
-                && let Expr::Ident(id) = &*u.arg
+                && let Expr::Ident(id) = unparen(&u.arg)
+                && binding_needs_ref(cx, id.sym.as_ref())
             {
-                let name = id.sym.as_ref();
-                if !cx.is_param_or_local(name) && !cx.is_celled(name) {
-                    cx.bail();
+                emit_binding_ref(cx, id.sym.as_ref());
+                cx.emit(Instr::TypeOfRef);
+                return;
+            }
+            // An unresolved reference is legal for typeof. Ask the source lexical
+            // environment before any capture getter is evaluated; ordinary reads
+            // would throw and cannot distinguish an absent binding from its TDZ.
+            if matches!(u.op, UnaryOp::TypeOf)
+                && let Expr::Ident(id) = unparen(&u.arg)
+                && !cx.is_param_or_local(id.sym.as_ref())
+                && !cx.is_celled(id.sym.as_ref())
+            {
+                if !cx.opts.live_captures {
+                    cx.bail_with("typeof_unresolved_binding");
                     return;
                 }
+                let slot = cx.resolve(id.sym.as_ref());
+                cx.emit(Instr::TypeOfBinding(slot));
+                return;
             }
             match un_op_code(u.op) {
                 Some(code) => {
@@ -161,7 +156,7 @@ pub(crate) fn emit_expr(cx: &mut Cx<'_>, expr: &Expr) {
             }
         }
         Expr::Assign(a) => emit_assign(cx, a),
-        Expr::Update(_) => cx.bail(), // only handled as statement
+        Expr::Update(u) => emit_update(cx, u),
         Expr::Member(m) => {
             emit_expr(cx, &m.obj);
             emit_member_key(cx, &m.prop);
@@ -181,26 +176,42 @@ pub(crate) fn emit_expr(cx: &mut Cx<'_>, expr: &Expr) {
             emit_expr(cx, &c.alt);
             patch(cx, l_end, cx.here());
         }
+        Expr::Call(c) if matches!(c.callee, Callee::Import(_)) => {
+            let ci = cx.consts.len() as u32;
+            let primitive = if c.args.len() == 1 {
+                "function(s){return import(s)}"
+            } else {
+                "function(s,o){return import(s,o)}"
+            };
+            cx.consts.push(Const::NativeFactory(primitive.into()));
+            cx.emit(Instr::PushConst(ci));
+            for arg in &c.args {
+                emit_expr(cx, &arg.expr);
+            }
+            cx.emit(Instr::Call(c.args.len() as u32));
+        }
         Expr::Call(c) => emit_call(cx, c),
+        Expr::MetaProp(meta) if matches!(meta.kind, MetaPropKind::NewTarget) => {
+            cx.emit(Instr::PushNewTarget);
+        }
+        Expr::MetaProp(meta) if matches!(meta.kind, MetaPropKind::ImportMeta) => {
+            // The accessor is emitted in the source module, retaining that module's
+            // host-supplied metadata and import resolution context.
+            let ci = cx.consts.len() as u32;
+            cx.consts
+                .push(Const::NativeFactory("()=>import.meta".into()));
+            cx.emit(Instr::PushConst(ci));
+            cx.emit(Instr::Call(0));
+        }
         Expr::New(n) => {
             let has_spread = n
                 .args
                 .as_ref()
                 .is_some_and(|a| a.iter().any(|x| x.spread.is_some()));
             if has_spread {
-                // `new C(...a)` -> `Reflect.construct(C, [args])` (captured global).
-                let reflect = cx.resolve("Reflect");
-                cx.emit(Instr::LoadLocal(reflect));
-                cx.emit(Instr::Dup);
-                let construct_key = cx.const_str("construct".to_string());
-                cx.emit(Instr::PushConst(construct_key));
-                cx.emit(Instr::GetProp); // [Reflect, construct]
-                emit_expr(cx, &n.callee); // [Reflect, construct, C]
-                if cx.bailed() {
-                    return;
-                }
+                emit_expr(cx, &n.callee);
                 emit_spread_array(cx, n.args.as_deref().unwrap_or(&[]));
-                cx.emit(Instr::CallResolved(2));
+                cx.emit(Instr::NewArray);
             } else {
                 emit_expr(cx, &n.callee);
                 let mut argc = 0u32;
@@ -214,77 +225,33 @@ pub(crate) fn emit_expr(cx: &mut Cx<'_>, expr: &Expr) {
             }
         }
         Expr::Array(arr) => {
-            let has_spread = arr.elems.iter().flatten().any(|e| e.spread.is_some());
-            if has_spread {
-                // A spread array is built via the iterator helper; holes mixed with
-                // spread are out of scope (rare) -> bail.
-                let mut elems = Vec::with_capacity(arr.elems.len());
-                for elem in &arr.elems {
-                    match elem {
-                        Some(e) => elems.push(e.clone()),
-                        None => {
-                            cx.bail_with("spread_array_hole");
-                            return;
-                        }
-                    }
+            if arr
+                .elems
+                .iter()
+                .all(|e| e.as_ref().is_some_and(|e| e.spread.is_none()))
+            {
+                for elem in arr.elems.iter().flatten() {
+                    emit_expr(cx, &elem.expr);
                 }
-                emit_spread_array(cx, &elems);
-            } else {
-                let mut n = 0u32;
-                for elem in &arr.elems {
-                    match elem {
-                        Some(e) => {
-                            emit_expr(cx, &e.expr);
-                            n += 1;
-                        }
-                        None => {
-                            // array hole
-                            cx.bail();
-                            return;
-                        }
-                    }
-                }
-                cx.emit(Instr::MakeArray(n));
-            }
-        }
-        Expr::Object(o) => {
-            let has_spread = o.props.iter().any(|p| matches!(p, PropOrSpread::Spread(_)));
-            if has_spread {
-                emit_object_spread(cx, o);
-            } else {
-                let mut n = 0u32;
-                for prop in &o.props {
-                    match prop {
-                        PropOrSpread::Prop(p) => {
-                            emit_object_entry(cx, p);
-                            if cx.bailed() {
-                                return;
-                            }
-                            n += 1;
-                        }
-                        PropOrSpread::Spread(_) => unreachable!("no spread on this path"),
-                    }
-                }
-                cx.emit(Instr::MakeObject(n));
-            }
-        }
-        Expr::Seq(seq) => {
-            // (a, b, c): evaluate each, discard all but the last.
-            if seq.exprs.is_empty() {
-                cx.bail();
+                cx.emit(Instr::MakeArray(arr.elems.len() as u32));
                 return;
             }
-            let last = seq.exprs.len() - 1;
-            for (i, e) in seq.exprs.iter().enumerate() {
-                emit_expr(cx, e);
-                if cx.bailed() {
-                    return;
-                }
-                if i != last {
-                    cx.emit(Instr::Pop);
+            cx.emit(Instr::MakeArray(0));
+            for elem in &arr.elems {
+                match elem {
+                    Some(e) => {
+                        emit_expr(cx, &e.expr);
+                        cx.emit(if e.spread.is_some() {
+                            Instr::ArraySpread
+                        } else {
+                            Instr::ArrayAppend
+                        });
+                    }
+                    None => cx.emit(Instr::ArrayHole),
                 }
             }
         }
+        Expr::Object(o) => emit_object_spread(cx, o),
         Expr::Tpl(t) => emit_template(cx, t),
         Expr::TaggedTpl(t) => emit_tagged_template(cx, t),
         Expr::OptChain(oc) => emit_opt_chain(cx, oc),
@@ -300,11 +267,6 @@ pub(crate) fn emit_expr(cx: &mut Cx<'_>, expr: &Expr) {
 /// `valueOf`/`toString` stringifies via `toString` here, as a template requires.
 /// Empty quasis are dropped; an all-empty template yields `""`.
 ///
-/// Known limitation: a Symbol interpolation throws TypeError in a real template
-/// but `String(sym)` succeeds, so a virtualized `` `${sym}` `` returns a string
-/// where the original throws. This is unobservable for the differential corpus
-/// (no Symbols flow into virtualized templates) and not statically detectable,
-/// so it is accepted rather than bailed.
 pub(crate) fn emit_template(cx: &mut Cx<'_>, t: &Tpl) {
     // `count` tracks un-folded operands currently on the stack (0, 1, or
     // transiently 2 → folded back to 1 with Add).
@@ -312,28 +274,15 @@ pub(crate) fn emit_template(cx: &mut Cx<'_>, t: &Tpl) {
     let n = t.exprs.len();
     for i in 0..=n {
         let q = &t.quasis[i];
-        let cooked = match &q.cooked {
-            Some(c) => match c.as_str() {
-                Some(s) => s.to_string(),
-                // lone surrogate in cooked value: not representable.
-                None => {
-                    cx.bail_with("template_surrogate");
-                    return;
-                }
-            },
-            // No cooked value (invalid escape) — only possible for tagged
-            // templates, which are rejected; guard anyway.
-            None => {
-                cx.bail_with("template_cooked");
-                return;
-            }
+        let Some(cooked) = &q.cooked else {
+            cx.bail_with("invalid_untagged_template");
+            return;
         };
         if !cooked.is_empty() {
-            let ci = cx.const_str(cooked);
-            cx.emit(Instr::PushConst(ci));
+            emit_string(cx, cooked);
             count += 1;
             if count == 2 {
-                cx.emit(Instr::Bin(0)); // Add (string concat)
+                cx.emit(Instr::Bin(0));
                 count = 1;
             }
         }
@@ -371,87 +320,79 @@ pub(crate) fn emit_template(cx: &mut Cx<'_>, t: &Tpl) {
 /// `obj.tag`…`` member tag is invoked with `obj` as `this` (`CallResolved`); a
 /// bare `tag`…`` is a plain call (`Call`). Cooked/raw come verbatim from the AST;
 /// a cooked `None` (invalid escape — legal in a tagged template) becomes a JS
-/// `undefined` hole. A lone surrogate in a string is not representable -> bail.
+/// `undefined` element. UTF-16 constants preserve lone surrogate code units.
 pub(crate) fn emit_tagged_template(cx: &mut Cx<'_>, t: &TaggedTpl) {
-    // Gather cooked (Option for invalid-escape holes) and raw quasis.
-    let mut cooked: Vec<Option<String>> = Vec::with_capacity(t.tpl.quasis.len());
-    let mut raw: Vec<String> = Vec::with_capacity(t.tpl.quasis.len());
-    for q in &t.tpl.quasis {
-        match &q.cooked {
-            Some(c) => match c.as_str() {
-                Some(s) => cooked.push(Some(s.to_string())),
-                None => {
-                    // lone surrogate in the cooked value: not representable.
-                    cx.bail_with("template_surrogate");
-                    return;
-                }
-            },
-            // No cooked value: an invalid escape in a tagged template -> undefined.
-            None => cooked.push(None),
-        }
-        raw.push(q.raw.as_str().to_string());
-    }
-    let tpl_ci = cx.const_template(cooked, raw);
+    let has_surrogates = t
+        .tpl
+        .quasis
+        .iter()
+        .any(|q| q.cooked.as_ref().is_some_and(|c| c.as_str().is_none()));
+    let tpl_ci = if has_surrogates {
+        let ci = cx.consts.len() as u32;
+        cx.consts.push(Const::TemplateObjectUtf16 {
+            cooked: t
+                .tpl
+                .quasis
+                .iter()
+                .map(|q| q.cooked.as_ref().map(|c| c.to_ill_formed_utf16().collect()))
+                .collect(),
+            raw: t
+                .tpl
+                .quasis
+                .iter()
+                .map(|q| q.raw.encode_utf16().collect())
+                .collect(),
+        });
+        ci
+    } else {
+        let cooked = t
+            .tpl
+            .quasis
+            .iter()
+            .map(|q| q.cooked.as_ref().map(|c| c.as_str().unwrap().to_owned()))
+            .collect();
+        let raw = t.tpl.quasis.iter().map(|q| q.raw.to_string()).collect();
+        cx.const_template(cooked, raw)
+    };
     if cx.bailed() {
         return;
     }
 
-    // Compile the tag callee with the correct receiver, then push the template
-    // object as the first argument, then each substitution expression, then call.
-    let subs = &t.tpl.exprs;
-    if let Expr::Member(m) = &*t.tag {
-        // `obj.tag`…`` -> obj is `this`. Mirror the method-call lowering in
-        // `emit_call`: leave the receiver under the resolved method on the stack.
+    // Suspension has already separated the tag and substitutions into a call.
+    // The generated identity literal is just this site's frozen template object.
+    if matches!(unparen(&t.tag), Expr::Arrow(arrow) if mangler_jsast::span::is_template_object_span(arrow.span))
+    {
+        cx.emit(Instr::PushConst(tpl_ci));
+        return;
+    }
+
+    // Resolve the tag before evaluating substitutions, preserving reference receivers.
+    let receiver = if let Expr::Member(m) = unparen(&t.tag) {
         emit_expr(cx, &m.obj);
         cx.emit(Instr::Dup);
         emit_member_key(cx, &m.prop);
-        if cx.bailed() {
-            return;
-        }
         cx.emit(Instr::GetProp);
-        cx.emit(Instr::PushConst(tpl_ci));
-        let mut argc = 1u32;
-        for e in subs {
-            emit_expr(cx, e);
-            if cx.bailed() {
-                return;
-            }
-            argc += 1;
-        }
-        cx.emit(Instr::CallResolved(argc));
+        true
+    } else if let Expr::Ident(id) = unparen(&t.tag)
+        && binding_needs_ref(cx, id.sym.as_ref())
+    {
+        emit_binding_ref(cx, id.sym.as_ref());
+        cx.emit(Instr::RefCall);
+        true
     } else {
-        // Bare `tag`…`` -> plain call (`this` is undefined).
         emit_expr(cx, &t.tag);
-        if cx.bailed() {
-            return;
-        }
-        cx.emit(Instr::PushConst(tpl_ci));
-        let mut argc = 1u32;
-        for e in subs {
-            emit_expr(cx, e);
-            if cx.bailed() {
-                return;
-            }
-            argc += 1;
-        }
-        cx.emit(Instr::Call(argc));
+        false
+    };
+    cx.emit(Instr::PushConst(tpl_ci));
+    for expr in &t.tpl.exprs {
+        emit_expr(cx, expr);
     }
-}
-
-/// Nullish coalescing `a ?? b`: yields `b` iff `a` is null/undefined.
-pub(crate) fn emit_nullish(cx: &mut Cx<'_>, b: &BinExpr) {
-    // eval a; Dup; PushNull; Bin(==); JumpIfFalse END; Pop; eval b; END:
-    // `a == null` (loose) is true for exactly null and undefined.
-    emit_expr(cx, &b.left);
-    cx.emit(Instr::Dup);
-    cx.emit(Instr::PushNull);
-    cx.emit(Instr::Bin(6)); // == (loose)
-    let end_j = cx.code.len();
-    cx.emit(Instr::JumpIfFalse(u32::MAX));
-    cx.emit(Instr::Pop);
-    emit_expr(cx, &b.right);
-    let here = cx.here();
-    patch(cx, end_j, here);
+    let argc = t.tpl.exprs.len() as u32 + 1;
+    cx.emit(if receiver {
+        Instr::CallResolved(argc)
+    } else {
+        Instr::Call(argc)
+    });
 }
 
 /// Top-level optional chain `a?.b…` (design §L3). Every OPTIONAL link in the
@@ -476,8 +417,8 @@ pub(crate) fn emit_opt_chain(cx: &mut Cx<'_>, oc: &OptChainExpr) {
 }
 
 /// Emit the nullish short-circuit guard for the value currently on top of the
-/// stack: `Dup; PushNull; Bin(== loose); JumpIfFalse cont; Pop; PushUndef; Jump
-/// END`. `a == null` (loose) is true for exactly `null` and `undefined`. When the
+/// stack: `Dup; Un(IsNullish); JumpIfFalse cont; Pop; PushUndef; Jump END`.
+/// Strict checks preserve HTML's `document.all` object. When the
 /// value is non-nullish the guard falls through with the (un-Dup'd) value still on
 /// the stack ready for the access; when nullish it drops the value, pushes
 /// `undefined`, and records a jump to the shared END (patched by `emit_opt_chain`).
@@ -488,8 +429,7 @@ pub(crate) fn emit_opt_chain(cx: &mut Cx<'_>, oc: &OptChainExpr) {
 /// guarded BEFORE the `Dup` that builds `[recv, method]`).
 pub(crate) fn emit_oc_guard(cx: &mut Cx<'_>, sc_jumps: &mut Vec<usize>) {
     cx.emit(Instr::Dup);
-    cx.emit(Instr::PushNull);
-    cx.emit(Instr::Bin(6)); // == (loose): true for null and undefined only
+    cx.emit(Instr::Un(crate::isa::UN_IS_NULLISH));
     let cont = cx.code.len();
     cx.emit(Instr::JumpIfFalse(u32::MAX)); // non-nullish -> skip the short-circuit
     cx.emit(Instr::Pop); // drop the nullish base
@@ -570,10 +510,9 @@ pub(crate) fn emit_oc_member(
 /// resolved method (`Dup`/`GetProp`/`CallResolved`, preserving getter-before-args
 /// order); otherwise it is a plain `Call`.
 ///
-/// `call_optional` is the `?.` on the call itself (`f?.(args)` / `o?.()`). For a
-/// plain call the function value is simply guarded. A `?.` call on a *method*
-/// receiver (`o.m?.()`) is the one shape whose short-circuit would strand the
-/// receiver under the `undefined` at END — we bail on it rather than miscompile.
+/// Optional method calls guard the resolved method and discard both the method
+/// and receiver on the short-circuit path. Arguments are evaluated only after
+/// this guard, and the receiver remains intact on the calling path.
 pub(crate) fn emit_oc_call(
     cx: &mut Cx<'_>,
     callee: &Expr,
@@ -581,9 +520,20 @@ pub(crate) fn emit_oc_call(
     call_optional: bool,
     sc_jumps: &mut Vec<usize>,
 ) {
+    if let Expr::Ident(id) = unparen(callee)
+        && binding_needs_ref(cx, id.sym.as_ref())
+    {
+        emit_binding_ref(cx, id.sym.as_ref());
+        cx.emit(Instr::RefCall);
+        if call_optional {
+            emit_oc_call_guard(cx, sc_jumps);
+        }
+        emit_oc_arguments(cx, args, true);
+        return;
+    }
     // Identify a method-call callee (optional or plain member access) so the
     // receiver is preserved for `CallResolved`.
-    let method: Option<(&Expr, &MemberProp, bool)> = match callee {
+    let method: Option<(&Expr, &MemberProp, bool)> = match unparen(callee) {
         Expr::OptChain(oc) => match &*oc.base {
             OptChainBase::Member(m) => Some((&m.obj, &m.prop, oc.optional)),
             OptChainBase::Call(_) => None,
@@ -594,13 +544,6 @@ pub(crate) fn emit_oc_call(
 
     match method {
         Some((obj, prop, member_optional)) => {
-            // A `?.` on the CALL of a method would need to guard the resolved
-            // method while the receiver sits beneath it — the short-circuit would
-            // leave `[recv, undefined]` at END (stack-imbalanced). Bail.
-            if call_optional {
-                cx.bail_with("optional_chain_unsupported");
-                return;
-            }
             // Receiver, guarded BEFORE the Dup so a nullish receiver short-circuits
             // with a single value on the stack.
             emit_opt_chain_node(cx, obj, sc_jumps);
@@ -616,23 +559,13 @@ pub(crate) fn emit_oc_call(
                 return;
             }
             cx.emit(Instr::GetProp); // [recv, method]
-            let mut argc = 0u32;
-            for a in args {
-                if a.spread.is_some() {
-                    cx.bail();
-                    return;
-                }
-                emit_expr(cx, &a.expr);
-                if cx.bailed() {
-                    return;
-                }
-                argc += 1;
+            if call_optional {
+                emit_oc_call_guard(cx, sc_jumps);
             }
-            cx.emit(Instr::CallResolved(argc));
+            emit_oc_arguments(cx, args, true);
         }
         None => {
-            // Plain call: the callee value is the function. If the call is
-            // optional (`f?.(args)`), guard the function value (sole stack value).
+            let spread = args.iter().any(|a| a.spread.is_some());
             emit_opt_chain_node(cx, callee, sc_jumps);
             if cx.bailed() {
                 return;
@@ -640,19 +573,15 @@ pub(crate) fn emit_oc_call(
             if call_optional {
                 emit_oc_guard(cx, sc_jumps);
             }
-            let mut argc = 0u32;
-            for a in args {
-                if a.spread.is_some() {
-                    cx.bail();
-                    return;
-                }
-                emit_expr(cx, &a.expr);
-                if cx.bailed() {
-                    return;
-                }
-                argc += 1;
+            if spread {
+                let function = cx.alloc_temp();
+                cx.emit(Instr::StoreLocal(function));
+                cx.emit(Instr::Pop);
+                cx.emit(Instr::PushUndef);
+                cx.emit(Instr::LoadLocal(function));
+                cx.free_temp();
             }
-            cx.emit(Instr::Call(argc));
+            emit_oc_arguments(cx, args, spread);
         }
     }
 }
@@ -665,8 +594,9 @@ pub(crate) fn emit_member_key(cx: &mut Cx<'_>, prop: &MemberProp) {
             cx.emit(Instr::PushConst(ci));
         }
         MemberProp::Computed(c) => {
+            // Keep the raw reference key: GetProp/DeleteProp must reject a
+            // nullish base before performing an observable key conversion.
             emit_expr(cx, &c.expr);
-            cx.emit(Instr::Un(crate::isa::UN_TO_PROPERTY_KEY));
         }
         MemberProp::PrivateName(_) => cx.bail(),
     }
@@ -676,73 +606,277 @@ pub(crate) fn emit_member_key(cx: &mut Cx<'_>, prop: &MemberProp) {
 pub(crate) fn emit_prop_key(cx: &mut Cx<'_>, key: &PropName) {
     match key {
         PropName::Ident(name) => {
-            if name.sym.as_ref() == "__proto__" {
-                cx.bail();
-                return;
-            }
             let ci = cx.const_str(name.sym.to_string());
             cx.emit(Instr::PushConst(ci));
         }
-        PropName::Str(s) => {
-            // `Str.value` is a `Wtf8Atom`; bail on lone surrogates.
-            match s.value.as_str() {
-                Some(v) => {
-                    if v == "__proto__" {
-                        cx.bail();
-                        return;
-                    }
-                    let ci = cx.const_str(v.to_string());
-                    cx.emit(Instr::PushConst(ci));
-                }
-                None => cx.bail(),
-            }
-        }
+        PropName::Str(s) => emit_string(cx, &s.value),
         PropName::Num(num) => {
-            // Only safe-range integers stringify identically in Rust and JS.
-            // Other magnitudes (>= 2^53, or values JS renders in exponential
-            // notation) would diverge from Number.prototype.toString — bail
-            // rather than build a wrong property key.
-            let v = num.value;
-            if v.fract() == 0.0 && v.is_finite() && v.abs() < 9007199254740992.0 {
-                let ci = cx.const_str(format!("{}", v as i64));
-                cx.emit(Instr::PushConst(ci));
-            } else {
-                cx.bail_with("numeric_prop_key");
-            }
+            let ci = cx.const_num(num.value);
+            cx.emit(Instr::PushConst(ci));
+            cx.emit(Instr::Un(crate::isa::UN_TO_PROPERTY_KEY));
         }
         PropName::Computed(c) => {
             emit_expr(cx, &c.expr);
             cx.emit(Instr::Un(crate::isa::UN_TO_PROPERTY_KEY));
         }
-        PropName::BigInt(_) => cx.bail(),
+        PropName::BigInt(n) => {
+            let ci = cx.const_str(n.value.to_string());
+            cx.emit(Instr::PushConst(ci));
+        }
     }
 }
 
-pub(crate) fn emit_logical(cx: &mut Cx<'_>, b: &BinExpr) {
-    match b.op {
-        BinaryOp::LogicalAnd => {
-            // eval a; Dup; JumpIfFalse END; Pop; eval b; END:
-            emit_expr(cx, &b.left);
-            cx.emit(Instr::Dup);
-            let end_j = cx.code.len();
-            cx.emit(Instr::JumpIfFalse(u32::MAX));
-            cx.emit(Instr::Pop);
-            emit_expr(cx, &b.right);
-            patch(cx, end_j, cx.here());
+/// Guard a method while its receiver occupies the preceding stack slot.
+fn emit_oc_call_guard(cx: &mut Cx<'_>, sc_jumps: &mut Vec<usize>) {
+    cx.emit(Instr::Dup);
+    cx.emit(Instr::Un(crate::isa::UN_IS_NULLISH));
+    let cont = cx.code.len();
+    cx.emit(Instr::JumpIfFalse(u32::MAX));
+    cx.emit(Instr::Pop);
+    cx.emit(Instr::Pop);
+    cx.emit(Instr::PushUndef);
+    sc_jumps.push(cx.code.len());
+    cx.emit(Instr::Jump(u32::MAX));
+    patch(cx, cont, cx.here());
+}
+
+fn emit_oc_arguments(cx: &mut Cx<'_>, args: &[ExprOrSpread], receiver: bool) {
+    if args.iter().any(|a| a.spread.is_some()) {
+        emit_spread_array(cx, args);
+        cx.emit(Instr::CallArray);
+    } else {
+        for arg in args {
+            emit_expr(cx, &arg.expr);
         }
-        BinaryOp::LogicalOr => {
-            // eval a; Dup; JumpIfFalse EVALB; Jump END; EVALB: Pop; eval b; END:
-            emit_expr(cx, &b.left);
-            cx.emit(Instr::Dup);
-            let evalb_j = cx.code.len();
-            cx.emit(Instr::JumpIfFalse(u32::MAX));
-            let end_j = cx.code.len();
+        cx.emit(if receiver {
+            Instr::CallResolved(args.len() as u32)
+        } else {
+            Instr::Call(args.len() as u32)
+        });
+    }
+}
+
+fn emit_delete(cx: &mut Cx<'_>, arg: &Expr) {
+    match unparen(arg) {
+        Expr::Member(m) => {
+            emit_expr(cx, &m.obj);
+            emit_member_key(cx, &m.prop);
+            cx.emit(Instr::DeleteProp);
+        }
+        Expr::OptChain(oc) => {
+            let mut jumps = Vec::new();
+            match &*oc.base {
+                OptChainBase::Member(m) => {
+                    emit_opt_chain_node(cx, &m.obj, &mut jumps);
+                    if oc.optional {
+                        emit_oc_guard(cx, &mut jumps);
+                    }
+                    emit_member_key(cx, &m.prop);
+                    cx.emit(Instr::DeleteProp);
+                }
+                OptChainBase::Call(_) => {
+                    emit_opt_chain_node(cx, arg, &mut jumps);
+                    cx.emit(Instr::Pop);
+                    let yes = cx.const_bool(true);
+                    cx.emit(Instr::PushConst(yes));
+                }
+            }
+            let end = cx.code.len();
             cx.emit(Instr::Jump(u32::MAX));
-            patch(cx, evalb_j, cx.here());
+            for jump in jumps {
+                patch(cx, jump, cx.here());
+            }
             cx.emit(Instr::Pop);
-            emit_expr(cx, &b.right);
-            patch(cx, end_j, cx.here());
+            let yes = cx.const_bool(true);
+            cx.emit(Instr::PushConst(yes));
+            patch(cx, end, cx.here());
         }
-        _ => cx.bail(),
+        Expr::Ident(id) => {
+            if binding_needs_ref(cx, id.sym.as_ref()) {
+                emit_binding_ref(cx, id.sym.as_ref());
+                cx.emit(Instr::DeleteRef);
+                return;
+            }
+            if cx.is_param_or_local(id.sym.as_ref()) || cx.is_celled(id.sym.as_ref()) {
+                let no = cx.const_bool(false);
+                cx.emit(Instr::PushConst(no));
+            } else if cx.opts.live_captures {
+                let slot = cx.resolve(id.sym.as_ref());
+                cx.emit(Instr::DeleteBinding(slot));
+            } else {
+                cx.bail_with("delete_global_binding");
+            }
+        }
+        expr => {
+            emit_expr(cx, expr);
+            cx.emit(Instr::Pop);
+            let yes = cx.const_bool(true);
+            cx.emit(Instr::PushConst(yes));
+        }
+    }
+}
+
+/// Update expressions convert the old value once and preserve it for postfix
+/// results. Member updates keep the raw reference together in an operator opcode,
+/// preserving the host engine's property-key coercion and getter/setter behavior.
+fn emit_update(cx: &mut Cx<'_>, update: &UpdateExpr) {
+    if emit_call_assignment_target(cx, &update.arg) {
+        return;
+    }
+    let op = match update.op {
+        UpdateOp::PlusPlus => crate::isa::UN_INCREMENT,
+        UpdateOp::MinusMinus => crate::isa::UN_DECREMENT,
+    };
+    match unparen(&update.arg) {
+        Expr::Ident(id) => {
+            let name = id.sym.as_ref();
+            if binding_needs_ref(cx, name) {
+                emit_binding_ref(cx, name);
+                let mode = match (update.op, update.prefix) {
+                    (UpdateOp::PlusPlus, false) => 0,
+                    (UpdateOp::PlusPlus, true) => 1,
+                    (UpdateOp::MinusMinus, false) => 2,
+                    (UpdateOp::MinusMinus, true) => 3,
+                };
+                cx.emit(Instr::UpdateRef(mode));
+                return;
+            }
+            let boxed = cx.is_celled(name);
+            if !cx.is_param_or_local(name) && !boxed && !cx.opts.live_captures {
+                cx.bail_with("mutable_capture");
+                return;
+            }
+            let slot = cx.resolve(name);
+            cx.emit(if boxed {
+                Instr::LoadCell(slot)
+            } else {
+                Instr::LoadLocal(slot)
+            });
+            if !update.prefix {
+                cx.emit(Instr::Un(crate::isa::UN_TO_NUMERIC));
+                cx.emit(Instr::Dup);
+            }
+            cx.emit(Instr::Un(op));
+            cx.emit(if boxed {
+                Instr::StoreCell(slot)
+            } else {
+                Instr::StoreLocal(slot)
+            });
+            if !update.prefix {
+                cx.emit(Instr::Pop);
+            }
+        }
+        Expr::Member(member) => {
+            emit_expr(cx, &member.obj);
+            match &member.prop {
+                MemberProp::Computed(c) => emit_expr(cx, &c.expr),
+                prop => emit_member_key(cx, prop),
+            }
+            let mode = match (update.op, update.prefix) {
+                (UpdateOp::PlusPlus, false) => 0,
+                (UpdateOp::PlusPlus, true) => 1,
+                (UpdateOp::MinusMinus, false) => 2,
+                (UpdateOp::MinusMinus, true) => 3,
+            };
+            cx.emit(Instr::UpdateProp(mode));
+        }
+        _ => cx.bail_with("invalid_update_target"),
+    }
+}
+
+/// Annex B call targets evaluate the call, then throw before reading the RHS or
+/// coercing its result. Parsing restricts this extension to its legacy grammar.
+pub(crate) fn emit_call_assignment_target(cx: &mut Cx<'_>, target: &Expr) -> bool {
+    if !matches!(unparen(target), Expr::Call(_)) {
+        return false;
+    }
+    emit_expr(cx, target);
+    cx.emit(Instr::Pop);
+    cx.emit(Instr::ThrowReferenceError);
+    true
+}
+
+fn emit_string(cx: &mut Cx<'_>, value: &swc_core::atoms::Wtf8Atom) {
+    let ci = match value.as_str() {
+        Some(s) => cx.const_str(s.to_owned()),
+        None => {
+            let ci = cx.consts.len() as u32;
+            cx.consts
+                .push(Const::Utf16(value.to_ill_formed_utf16().collect()));
+            ci
+        }
+    };
+    cx.emit(Instr::PushConst(ci));
+}
+
+/// Keep expression spines on a heap worklist. Generated JavaScript routinely has
+/// thousands of left-associated operators; compiler stack usage must not grow
+/// with that depth. Continuations retain short-circuit and operand ordering.
+fn emit_expression_tree(cx: &mut Cx<'_>, root: &Expr) {
+    enum Task<'a> {
+        Eval(&'a Expr),
+        Binary(u8),
+        Logical(BinaryOp, &'a Expr),
+        Pop,
+        End(usize),
+    }
+    let mut tasks = vec![Task::Eval(root)];
+    while let Some(task) = tasks.pop() {
+        if cx.bailed() {
+            return;
+        }
+        match task {
+            Task::Eval(Expr::Paren(p)) => tasks.push(Task::Eval(&p.expr)),
+            Task::Eval(Expr::Seq(seq)) => {
+                if seq.exprs.is_empty() {
+                    cx.bail_with("empty_sequence");
+                    return;
+                }
+                for (i, expr) in seq.exprs.iter().enumerate().rev() {
+                    if i + 1 < seq.exprs.len() {
+                        tasks.push(Task::Pop);
+                    }
+                    tasks.push(Task::Eval(expr));
+                }
+            }
+            Task::Eval(Expr::Bin(bin)) => {
+                if matches!(
+                    bin.op,
+                    BinaryOp::LogicalAnd | BinaryOp::LogicalOr | BinaryOp::NullishCoalescing
+                ) {
+                    tasks.push(Task::Logical(bin.op, &bin.right));
+                } else if let Some(op) = bin_op_code(bin.op) {
+                    tasks.push(Task::Binary(op));
+                    tasks.push(Task::Eval(&bin.right));
+                } else {
+                    cx.bail_with("unknown_binary_operator");
+                    return;
+                }
+                tasks.push(Task::Eval(&bin.left));
+            }
+            Task::Eval(expr) => emit_expr(cx, expr),
+            Task::Binary(op) => cx.emit(Instr::Bin(op)),
+            Task::Pop => cx.emit(Instr::Pop),
+            Task::End(jump) => patch(cx, jump, cx.here()),
+            Task::Logical(op, right) => {
+                cx.emit(Instr::Dup);
+                if op == BinaryOp::NullishCoalescing {
+                    cx.emit(Instr::Un(crate::isa::UN_IS_NULLISH));
+                }
+                let jump = cx.code.len();
+                cx.emit(Instr::JumpIfFalse(u32::MAX));
+                let end = if op == BinaryOp::LogicalOr {
+                    let end = cx.code.len();
+                    cx.emit(Instr::Jump(u32::MAX));
+                    patch(cx, jump, cx.here());
+                    end
+                } else {
+                    jump
+                };
+                cx.emit(Instr::Pop);
+                tasks.push(Task::End(end));
+                tasks.push(Task::Eval(right));
+            }
+        }
     }
 }

@@ -34,8 +34,20 @@ use swc_core::ecma::minifier::option::{
     CompressOptions, ExtraOptions, MangleOptions, MinifyOptions,
 };
 use swc_core::ecma::parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
-use swc_core::ecma::transforms::base::{fixer::fixer, resolver};
+use swc_core::ecma::transforms::base::{
+    fixer::fixer,
+    hygiene::{Config as HygieneConfig, hygiene_with_config},
+    resolver,
+};
 use swc_core::ecma::visit::{Visit, VisitMutWith, VisitWith};
+
+/// An explicit ECMAScript grammar goal. Unlike automatic program parsing,
+/// Script never accepts module declarations or module-only top-level await.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseGoal {
+    Script,
+    Module,
+}
 
 /// Explicit parse configuration. Dialect is a **decision the caller makes**, not
 /// a filename guess (the legacy `.ts`/`.tsx` sniffing is gone from the seam).
@@ -77,6 +89,7 @@ impl ParseOpts {
         } else {
             Syntax::Es(EsSyntax {
                 jsx: self.jsx,
+                explicit_resource_management: true,
                 ..Default::default()
             })
         }
@@ -95,6 +108,8 @@ pub struct Ast {
     /// Whether the source was parsed as TypeScript — the resolver needs this to
     /// handle TS-specific scoping (e.g. type-only references).
     typescript: bool,
+    runtime_bindings: std::collections::HashSet<String>,
+    native_safety: CompressionSafety<'static>,
 }
 
 impl std::fmt::Debug for Ast {
@@ -106,6 +121,66 @@ impl std::fmt::Debug for Ast {
 }
 
 impl Ast {
+    /// Register compiler-owned runtime declarations for compression analysis.
+    /// Their computed indices/keys are controlled by the runtime. Constant pools
+    /// remain source-bearing and are inspected independently of their container.
+    pub fn register_runtime(&mut self, statements: &[Stmt], table: Option<&str>) {
+        use swc_core::ecma::ast::{Decl, Pat};
+        for statement in statements {
+            match statement {
+                Stmt::Decl(Decl::Fn(function)) => {
+                    self.runtime_bindings.insert(function.ident.sym.to_string());
+                }
+                Stmt::Decl(Decl::Var(declaration)) => {
+                    for variable in &declaration.decls {
+                        if let Pat::Ident(binding) = &variable.name {
+                            self.runtime_bindings.insert(binding.id.sym.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(table) = table {
+            struct NativeConstants<'a, 'b> {
+                table: &'a str,
+                safety: &'b mut CompressionSafety<'static>,
+            }
+            impl Visit for NativeConstants<'_, '_> {
+                fn visit_var_declarator(
+                    &mut self,
+                    declaration: &swc_core::ecma::ast::VarDeclarator,
+                ) {
+                    if matches!(&declaration.name, Pat::Ident(binding) if binding.id.sym == self.table)
+                    {
+                        if let Some(Expr::Array(chunks)) = declaration.init.as_deref() {
+                            for chunk in chunks.elems.iter().flatten() {
+                                if let Expr::Array(fields) = chunk.expr.as_ref()
+                                    && let Some(Some(constants)) = fields.elems.get(1)
+                                {
+                                    constants.expr.visit_with(self.safety);
+                                    self.safety.inferred_names |=
+                                        crate::callable_names::native_inferred(&constants.expr);
+                                }
+                            }
+                        }
+                        return;
+                    }
+                    declaration.visit_children_with(self);
+                }
+                fn visit_bin_expr(&mut self, binary: &swc_core::ecma::ast::BinExpr) {
+                    crate::deep::walk_binary(binary, self);
+                }
+            }
+            // Runtime isolation can nest the table inside a private bootstrap.
+            // Inspect source constants before excluding that bootstrap from the
+            // generated-code analysis; retain only the bounded safety summary.
+            statements.visit_with(&mut NativeConstants {
+                table,
+                safety: &mut self.native_safety,
+            });
+        }
+    }
     /// Shared read access to the [`Program`].
     pub fn program(&self) -> &Program {
         &self.program
@@ -143,6 +218,31 @@ impl Language for Js {
 
     /// Parse `src` into an [`Ast`]. swc parse errors map to [`Error::parse`].
     fn parse(&self, src: &str, opts: &ParseOpts) -> Result<Ast> {
+        self.parse_selected_goal(src, opts, opts.module.then_some(ParseGoal::Module))
+    }
+
+    /// Minified, ascii-only emit — the production codegen path (no minifier pass;
+    /// see [`Js::print_optimized`] for the full optimize+emit).
+    fn print(&self, ast: &Ast) -> String {
+        emit(&ast.program, &ast.source_map, true)
+    }
+}
+
+impl Js {
+    /// Parse with the exact Script or Module grammar goal, overriding
+    /// `ParseOpts::module`. This performs parsing and shared early-error
+    /// validation only; it never resolves imports, transforms, or executes code.
+    /// Parser rejection is returned as the typed [`Error::Parse`] variant.
+    pub fn parse_with_goal(&self, src: &str, opts: &ParseOpts, goal: ParseGoal) -> Result<Ast> {
+        self.parse_selected_goal(src, opts, Some(goal))
+    }
+
+    fn parse_selected_goal(
+        &self,
+        src: &str,
+        opts: &ParseOpts,
+        goal: Option<ParseGoal>,
+    ) -> Result<Ast> {
         let cm: Lrc<SourceMap> = Default::default();
         let fm = cm.new_source_file(
             Lrc::new(FileName::Custom(format!("{}.js", Self::ID))),
@@ -155,30 +255,86 @@ impl Language for Js {
             None,
         );
         let mut parser = Parser::new_from(lexer);
-        let program = if opts.module {
-            parser.parse_module().map(Program::Module)
-        } else {
-            parser.parse_program()
+        let mut program = match goal {
+            Some(ParseGoal::Script) => parser.parse_script().map(Program::Script),
+            Some(ParseGoal::Module) => parser.parse_module().map(Program::Module),
+            None => parser.parse_program(),
         }
         .map_err(|e| Error::parse(Self::ID, format!("{e:?}")))?;
-        if let Some(error) = parser.take_errors().into_iter().next() {
+        let mut errors = parser.take_errors();
+        if !opts.typescript {
+            Self::repair_annex_b(&mut program, false, &mut errors);
+        }
+        if let Some(error) = errors.into_iter().next() {
             return Err(Error::parse(Self::ID, format!("{error:?}")));
         }
+        Self::repair_pattern_elisions(&mut program, src, fm.start_pos);
+        Self::validate_resource_scopes(&program)?;
         Ok(Ast {
             program,
             source_map: cm,
             typescript: opts.typescript,
+            runtime_bindings: Default::default(),
+            native_safety: Default::default(),
         })
     }
+}
 
-    /// Minified, ascii-only emit — the production codegen path (no minifier pass;
-    /// see [`Js::print_optimized`] for the full optimize+emit).
-    fn print(&self, ast: &Ast) -> String {
-        emit(&ast.program, &ast.source_map, true)
+// SWC accepts direct case-clause resource declarations, but ContainsUsing makes
+// them early errors. A nested block owns its disposal scope and remains valid.
+// https://tc39.es/ecma262/#sec-switch-statement-static-semantics-early-errors
+#[derive(Default)]
+struct ResourceCaseValidation {
+    invalid: bool,
+}
+impl Visit for ResourceCaseValidation {
+    fn visit_bin_expr(&mut self, expression: &swc_core::ecma::ast::BinExpr) {
+        crate::deep::walk_binary(expression, self);
+    }
+
+    fn visit_switch_case(&mut self, case: &swc_core::ecma::ast::SwitchCase) {
+        self.invalid |= case
+            .cons
+            .iter()
+            .any(|statement| matches!(statement, Stmt::Decl(swc_core::ecma::ast::Decl::Using(_))));
+        if !self.invalid {
+            case.visit_children_with(self);
+        }
     }
 }
 
 impl Js {
+    /// Recover assignment-pattern elisions omitted by SWC's expression reparse.
+    /// Custom parser contexts, including direct eval, use the same source repair.
+    pub fn repair_pattern_elisions(
+        program: &mut Program,
+        source: &str,
+        start: swc_core::common::BytePos,
+    ) {
+        crate::pattern_elisions::repair(program, source, start);
+    }
+
+    /// Supplement SWC's resource declaration checks for callers using a custom
+    /// parser context, including direct eval. Nested blocks own disposal scopes.
+    pub fn validate_resource_scopes(program: &Program) -> Result<()> {
+        let mut resource_cases = ResourceCaseValidation::default();
+        program.visit_with(&mut resource_cases);
+        if resource_cases.invalid {
+            return Err(Error::parse(
+                Self::ID,
+                "using declarations in switch cases require an enclosing block",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Repair named-class heritage and shared switch lexical scopes after a
+    /// resolver run. Native capture factories use the same scope rules.
+    pub fn repair_resolver_scopes(program: &mut Program) {
+        program.visit_mut_with(&mut crate::class_scope::RepairClassHeritage);
+        program.visit_mut_with(&mut crate::switch_scope::RepairSwitchBindings);
+    }
+
     /// Parse-only verification: confirm `src` is syntactically valid JS/TS under
     /// `opts`. Used by `--verify` to catch a pass that emitted malformed code.
     /// No `GLOBALS`/resolver needed — it is a pure parse.
@@ -195,8 +351,7 @@ impl Js {
         let top_level = Mark::new();
         ast.program
             .visit_mut_with(&mut resolver(unresolved, top_level, ast.typescript));
-        ast.program
-            .visit_mut_with(&mut crate::class_scope::RepairClassHeritage);
+        Self::repair_resolver_scopes(&mut ast.program);
         (unresolved, top_level)
     }
 
@@ -212,30 +367,60 @@ impl Js {
     ) -> String {
         let (unresolved_mark, top_level_mark) = marks;
         let cm = ast.source_map.clone();
-        let mut safety = CompressionSafety::default();
+        let mut safety = CompressionSafety {
+            runtime_bindings: Some(&ast.runtime_bindings),
+            ..ast.native_safety
+        };
         ast.program.visit_with(&mut safety);
+        let keep_callable_names = crate::callable_names::observable(&ast.program, top_level_mark);
+        let keep_inferred_names = safety.inferred_names
+            || crate::callable_names::inferred_observable(&ast.program, top_level_mark);
+        let operators = crate::compression_guards::Operators::new(unresolved_mark);
+        let mut source_program = ast.program;
+        safety.immutable_writes |= operators.protect(&mut source_program);
         let mut program = optimize(
-            ast.program,
+            source_program,
             cm.clone(),
             None,
             None,
             &MinifyOptions {
                 compress: Some(CompressOptions {
                     drop_debugger: false,
+                    keep_classnames: true,
+                    keep_fnames: keep_callable_names,
                     // SWC's return merging drops directives independently of
                     // its directives option. DCE also overlooks key coercion and
                     // class-heritage exceptions. Limit those passes to programs
                     // without the affected constructs; other compression stays on.
                     directives: false,
                     if_return: !safety.directives,
-                    unused: !safety.observable_initializers,
+                    // The unused pass drops writes to const and class inner
+                    // bindings; those writes must retain their required errors.
+                    unused: !safety.observable_initializers && !safety.immutable_writes,
                     dead_code: !safety.observable_initializers,
                     side_effects: !safety.observable_initializers,
+                    evaluate: !safety.intrinsic_calls,
+                    bools: !safety.binding_delete,
+                    inline: if safety.observable_initializers || keep_inferred_names {
+                        0
+                    } else {
+                        3
+                    },
+                    switches: !safety.lexical_switch,
+                    reduce_vars: !safety.lexical_switch
+                        && !safety.observable_initializers
+                        && !keep_inferred_names,
+                    collapse_vars: !safety.lexical_switch
+                        && !safety.observable_initializers
+                        && !keep_inferred_names,
+                    typeofs: !safety.lexical_switch,
                     ..Default::default()
                 }),
                 mangle: if mangle {
                     Some(MangleOptions {
                         top_level: Some(false),
+                        keep_class_names: true,
+                        keep_fn_names: keep_callable_names,
                         reserved: reserved.iter().map(|s| s.as_str().into()).collect(),
                         ..Default::default()
                     })
@@ -250,6 +435,18 @@ impl Js {
                 mangle_name_cache: None,
             },
         );
+        operators.restore(&mut program);
+        // Class declaration compression introduces an immutable named-expression
+        // scope. Repair references before hygiene materializes its distinct name.
+        program.visit_mut_with(&mut crate::class_scope::RepairClassHeritage);
+        // Inlining can bring bindings with distinct resolver contexts into the
+        // same textual scope, even when mangling is disabled or names reserved.
+        // Materialize those identities before emitting JavaScript identifiers.
+        program.visit_mut_with(&mut hygiene_with_config(HygieneConfig {
+            keep_class_names: true,
+            top_level_mark,
+            ..Default::default()
+        }));
         program.visit_mut_with(&mut fixer(None));
         emit(&program, &cm, true)
     }
@@ -265,13 +462,88 @@ impl Js {
 /// Narrow guard around upstream optimizer assumptions that fail on observable
 /// initialization. Keep this at the terminal compression boundary so every pass
 /// and caller receives the same semantics.
-#[derive(Default)]
-struct CompressionSafety {
+#[derive(Clone, Copy, Default)]
+struct CompressionSafety<'a> {
+    runtime_bindings: Option<&'a std::collections::HashSet<String>>,
     directives: bool,
     observable_initializers: bool,
+    immutable_writes: bool,
+    intrinsic_calls: bool,
+    lexical_switch: bool,
+    binding_delete: bool,
+    inferred_names: bool,
 }
 
-impl Visit for CompressionSafety {
+impl Visit for CompressionSafety<'_> {
+    fn visit_bin_expr(&mut self, binary: &swc_core::ecma::ast::BinExpr) {
+        crate::deep::walk_binary(binary, self);
+    }
+
+    fn visit_expr(&mut self, expression: &Expr) {
+        if crate::span::is_runtime_span(swc_core::common::Spanned::span(expression)) {
+            self.directives = true;
+            return;
+        }
+        expression.visit_children_with(self);
+    }
+
+    fn visit_fn_decl(&mut self, function: &swc_core::ecma::ast::FnDecl) {
+        if self
+            .runtime_bindings
+            .is_some_and(|names| names.contains(function.ident.sym.as_ref()))
+        {
+            self.directives = true;
+        } else {
+            function.visit_children_with(self);
+        }
+    }
+
+    fn visit_var_declarator(&mut self, declaration: &swc_core::ecma::ast::VarDeclarator) {
+        if let swc_core::ecma::ast::Pat::Ident(binding) = &declaration.name
+            && self
+                .runtime_bindings
+                .is_some_and(|names| names.contains(binding.id.sym.as_ref()))
+        {
+            self.directives = true;
+            return;
+        }
+        declaration.visit_children_with(self);
+    }
+
+    fn visit_unary_expr(&mut self, unary: &swc_core::ecma::ast::UnaryExpr) {
+        self.binding_delete |= unary.op == swc_core::ecma::ast::UnaryOp::Delete
+            && matches!(unary.arg.as_ref(), Expr::Ident(_));
+        unary.visit_children_with(self);
+    }
+
+    fn visit_ident(&mut self, ident: &swc_core::ecma::ast::Ident) {
+        // The upstream evaluator folds calls to these mutable bindings without
+        // proving their identity. Aliases may become direct calls during inlining.
+        self.intrinsic_calls |= matches!(
+            ident.sym.as_ref(),
+            "String" | "RegExp" | "Math" | "Number" | "Boolean" | "Object" | "Array"
+        );
+    }
+
+    fn visit_member_expr(&mut self, member: &swc_core::ecma::ast::MemberExpr) {
+        if let swc_core::ecma::ast::MemberProp::Computed(key) = &member.prop {
+            self.observable_initializers |=
+                !matches!(key.expr.as_ref(), Expr::Lit(lit) if !matches!(lit, Lit::Regex(_)));
+        }
+        member.visit_children_with(self);
+    }
+
+    fn visit_switch_stmt(&mut self, switch: &swc_core::ecma::ast::SwitchStmt) {
+        use swc_core::ecma::ast::{Decl, VarDeclKind};
+        let lexical = switch.cases.iter().flat_map(|case| &case.cons).any(|stmt| {
+            matches!(stmt, Stmt::Decl(Decl::Var(v)) if v.kind != VarDeclKind::Var)
+                || matches!(stmt, Stmt::Decl(Decl::Class(_) | Decl::Fn(_)))
+        });
+        self.lexical_switch |= lexical;
+        self.observable_initializers |= lexical;
+        switch.visit_children_with(self);
+    }
+
     fn visit_stmts(&mut self, statements: &[Stmt]) {
         self.directives |= statements
             .first()
@@ -294,6 +566,19 @@ impl Visit for CompressionSafety {
                 !matches!(key.expr.as_ref(), Expr::Lit(lit) if !matches!(lit, Lit::Regex(_)));
         }
         name.visit_children_with(self);
+    }
+
+    fn visit_class_expr(&mut self, class: &swc_core::ecma::ast::ClassExpr) {
+        if let Some(name) = &class.ident {
+            self.immutable_writes |= crate::class_scope::inner_name_is_written(name, &class.class);
+        }
+        class.visit_children_with(self);
+    }
+
+    fn visit_class_decl(&mut self, class: &swc_core::ecma::ast::ClassDecl) {
+        self.immutable_writes |=
+            crate::class_scope::inner_name_is_written(&class.ident, &class.class);
+        class.visit_children_with(self);
     }
 
     fn visit_class(&mut self, class: &Class) {
@@ -432,6 +717,25 @@ mod tests {
     #[test]
     fn recoverable_parser_errors_are_rejected() {
         assert!(Js.parse("return 1;", &ParseOpts::default()).is_err());
+    }
+
+    #[test]
+    fn switch_resource_declarations_require_a_block() {
+        for source in [
+            "function f(){switch(0){case 0:using resource=null;}}",
+            "function f(){switch(0){default:using resource=null;}}",
+            "async function f(){switch(0){case 0:await using resource=null;}}",
+            "function f(){return ()=>{switch(0){default:using resource=null;}}}",
+        ] {
+            assert!(Js.parse(source, &ParseOpts::default()).is_err(), "{source}");
+        }
+        for source in [
+            "function f(){switch(0){case 0:{using resource=null;}}}",
+            "async function f(){switch(0){default:{await using resource=null;}}}",
+            "function f(){switch(0){case 0:function g(){using resource=null;}}}",
+        ] {
+            assert!(Js.parse(source, &ParseOpts::default()).is_ok(), "{source}");
+        }
     }
 
     #[test]

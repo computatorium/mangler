@@ -80,12 +80,26 @@ pub fn register_passes() -> Vec<Box<dyn Pass<Js, FileConfig>>> {
 pub fn process(src: &str, opts: &ParseOpts, cfg: &ResolvedConfig) -> Result<(String, Notes)> {
     // Parse outside GLOBALS (a pure parse needs none) so the fingerprint reads the
     // unmutated tree.
-    let ast = Js.parse(src, opts)?;
+    let mut ast = Js.parse(src, opts)?;
     let (eff_seed, reserved_idents) =
         seed::effective_seed_and_idents(ast.program(), cfg.engine.seed);
 
+    let compiler_sites =
+        if cfg.passes.virtualize.whole_program || cfg.passes.virtualize.target.is_some() {
+            crate::passes::virtualize::source_compiler_sites(ast.program_mut())
+        } else {
+            Default::default()
+        };
     let file_cfg = FileConfig::new(cfg.clone(), eff_seed, reserved_idents)
-        .with_source_functions(crate::passes::virtualize::source_functions(ast.program()));
+        .with_source_functions(crate::passes::virtualize::source_functions(ast.program()))
+        .with_source_compiler_sites(compiler_sites);
+    let class_contexts =
+        if cfg.passes.virtualize.whole_program || cfg.passes.virtualize.target.is_some() {
+            crate::passes::virtualize::eval_class_contexts(ast.program(), &file_cfg, None)
+        } else {
+            Default::default()
+        };
+    let file_cfg = file_cfg.with_eval_class_contexts(class_contexts);
 
     // Collect the enabled AST passes, plus the resolver + minify pseudo-pass nodes.
     let passes = register_passes();
@@ -199,7 +213,7 @@ pub fn process(src: &str, opts: &ParseOpts, cfg: &ResolvedConfig) -> Result<(Str
     // checksums. Verification never changes either finalizer's behavior.
     let output = match self_coupled_interp {
         Some(interp_name) => {
-            crate::passes::strings::stub::patch_self_coupled_expected(output, &interp_name)
+            crate::passes::strings::stub::patch_self_coupled_expected(output, &interp_name)?
         }
         None => output,
     };

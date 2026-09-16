@@ -26,17 +26,12 @@
 
 use swc_core::ecma::ast::{AssignOp, BinaryOp, UnaryOp};
 
-/// Number of top-level opcode slots in the dispatch space (canonical `0..N_OPCODES`).
-/// The opcode permutation is sized `N_OPCODES + junk`; the first `N_OPCODES`
-/// entries are the real opcodes.
-pub const N_OPCODES: usize = 47;
-
 /// Number of binary-operator sub-codes (the inner `switch` under the `Bin`
 /// opcode). Permuted per file (C2).
-pub const N_BIN_OPS: usize = 20;
+pub const N_BIN_OPS: usize = 22;
 
 /// Number of unary-operator sub-codes (under `Un`). Permuted per file (C2).
-pub const N_UN_OPS: usize = 10;
+pub const N_UN_OPS: usize = 12;
 
 /// Upvalue-slot sentinel meaning "the closure currently being built" — used for a
 /// named function expression's self reference. Chosen well above any real slot
@@ -111,6 +106,9 @@ macro_rules! opcodes {
                 = $disc:literal => $layout:ident
         ),* $(,)?
     ) => {
+        /// Number of real opcode slots, derived from the canonical table.
+        pub const N_OPCODES: usize = [$($disc),*].len();
+
         /// VM instruction. ONE variant per opcode-table row; the enum, its
         /// discriminant, and its encoding size are all generated here so they can
         /// never drift from the serializer or interpreter. Nullary opcodes are unit
@@ -273,6 +271,52 @@ opcodes! {
     BeginFinally = 45 => Nullary,
     /// Step an iterator without reading the result value (destructuring elision).
     IterElide = 46 => Nullary,
+    NewRegExp(u32) = 47 => Unary,
+    /// Native shell mapping metadata: argument index and local slot. Entry installs
+    /// accessors to real formal parameters, retaining the host arguments exotic.
+    MapArgument(u32, u32) = 48 => Binary,
+    ArrayAppend = 49 => Nullary,
+    ArraySpread = 50 => Nullary,
+    ArrayHole = 51 => Nullary,
+    NewArray = 52 => Nullary,
+    DefineData = 53 => Nullary,
+    DefineGetter = 54 => Nullary,
+    DefineSetter = 55 => Nullary,
+    SetPrototype = 56 => Nullary,
+    SetFunctionName = 57 => Nullary,
+    DefineMethod = 58 => Nullary,
+    TypeOfBinding(u32) = 59 => Unary,
+    DeleteBinding(u32) = 60 => Unary,
+    UpdateProp(u32) = 61 => Unary,
+    /// Operand encodes slot * 2 + whether the slot contains a boxed cell.
+    LocalRef(u32) = 62 => Unary,
+    WithRef(u32, u32) = 63 => Binary,
+    ResolveRef = 64 => Nullary,
+    GetRef = 65 => Nullary,
+    PutRef = 66 => Nullary,
+    RefCall = 67 => Nullary,
+    CaptureRef(u32) = 68 => Unary,
+    DeleteRef = 69 => Nullary,
+    TypeOfRef = 70 => Nullary,
+    EnterWith(u32) = 71 => Unary,
+    UpdateRef(u32) = 72 => Unary,
+    UnmapArguments = 73 => Nullary,
+    SetFunctionLength(u32) = 74 => Unary,
+    ClearRef(u32) = 75 => Unary,
+    SuperAssign(u32) = 76 => Unary,
+    SuperUpdate(u32) = 77 => Unary,
+    PushNewTarget = 78 => Nullary,
+    BeginVarEnvironment(u32) = 79 => Unary,
+    CaptureClosureEnvironment(u32) = 80 => Unary,
+    EvalCall(u32) = 81 => Unary,
+    EnvironmentRef(u32) = 82 => Unary,
+    AccessorRef(u32) = 83 => Unary,
+    RefAdapter = 84 => Nullary,
+    WithRefCell(u32, u32) = 85 => Binary,
+    /// `[home, receiver] -> super operation provider`; operand is source strictness.
+    MakeSuperProvider(u32) = 86 => Unary,
+    /// Abrupt completion for an evaluated Annex B call assignment target.
+    ThrowReferenceError = 87 => Nullary,
 }
 
 impl Instr {
@@ -426,6 +470,16 @@ const BIN_OPS: [BinRow; N_BIN_OPS] = [
         js: "a>>>b",
         assign: Some(AssignOp::ZeroFillRShiftAssign),
     },
+    BinRow {
+        op: BinaryOp::In,
+        js: "a in b",
+        assign: None,
+    },
+    BinRow {
+        op: BinaryOp::InstanceOf,
+        js: "a instanceof b",
+        assign: None,
+    },
 ];
 
 /// The ordered unary-operator table — the canonical sub-code is the row index.
@@ -474,7 +528,15 @@ const UN_OPS: [UnRow; N_UN_OPS] = [
     },
     UnRow {
         op: UnaryOp::Void,
-        js: "Reflect.ownKeys({[a]:0})[0]",
+        js: "((o)=>{var names=Object.getOwnPropertyNames(o);return names.length?names[0]:Object.getOwnPropertySymbols(o)[0]})({[a]:0})",
+    },
+    UnRow {
+        op: UnaryOp::Void,
+        js: "a++",
+    },
+    UnRow {
+        op: UnaryOp::Void,
+        js: "a===null||a===void 0",
     },
 ];
 
@@ -483,6 +545,8 @@ pub const UN_TO_STRING: u8 = 6;
 pub const UN_INCREMENT: u8 = 7;
 pub const UN_DECREMENT: u8 = 8;
 pub const UN_TO_PROPERTY_KEY: u8 = 9;
+pub const UN_TO_NUMERIC: u8 = 10;
+pub const UN_IS_NULLISH: u8 = 11;
 
 /// binop → canonical sub-code stored in `Bin { op }`. `None` => caller bails
 /// (`&&`/`||`/`??`/`in`/`instanceof` are not in the table).
@@ -594,6 +658,47 @@ mod tests {
             Instr::RequireObject,
             Instr::BeginFinally,
             Instr::IterElide,
+            Instr::NewRegExp(0),
+            Instr::MapArgument(0, 0),
+            Instr::ArrayAppend,
+            Instr::ArraySpread,
+            Instr::ArrayHole,
+            Instr::NewArray,
+            Instr::DefineData,
+            Instr::DefineGetter,
+            Instr::DefineSetter,
+            Instr::SetPrototype,
+            Instr::SetFunctionName,
+            Instr::DefineMethod,
+            Instr::TypeOfBinding(0),
+            Instr::DeleteBinding(0),
+            Instr::UpdateProp(0),
+            Instr::LocalRef(0),
+            Instr::WithRef(0, 0),
+            Instr::ResolveRef,
+            Instr::GetRef,
+            Instr::PutRef,
+            Instr::RefCall,
+            Instr::CaptureRef(0),
+            Instr::DeleteRef,
+            Instr::TypeOfRef,
+            Instr::EnterWith(0),
+            Instr::UpdateRef(0),
+            Instr::UnmapArguments,
+            Instr::SetFunctionLength(0),
+            Instr::ClearRef(0),
+            Instr::SuperAssign(0),
+            Instr::SuperUpdate(0),
+            Instr::PushNewTarget,
+            Instr::BeginVarEnvironment(0),
+            Instr::CaptureClosureEnvironment(0),
+            Instr::EvalCall(0),
+            Instr::EnvironmentRef(0),
+            Instr::AccessorRef(0),
+            Instr::RefAdapter,
+            Instr::WithRefCell(0, 0),
+            Instr::MakeSuperProvider(0),
+            Instr::ThrowReferenceError,
             Instr::DeleteProp,
             Instr::MakeCell(0),
             Instr::LoadCell(0),
@@ -677,7 +782,7 @@ mod tests {
         );
         // Non-table ops bail.
         assert_eq!(bin_op_code(BinaryOp::LogicalAnd), None);
-        assert_eq!(bin_op_code(BinaryOp::In), None);
+        assert_eq!(bin_op_code(BinaryOp::In), Some(20));
         assert_eq!(un_op_code(UnaryOp::Delete), None);
         assert_eq!(compound_op_code(AssignOp::AndAssign), None);
     }

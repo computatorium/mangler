@@ -112,7 +112,11 @@ fn hex_renames_locals_and_emits_hex_names() {
         "local var must be renamed: {}",
         r.out
     );
-    assert!(r.out.contains("_0x"), "Hex scheme must emit _0x names: {}", r.out);
+    assert!(
+        r.out.contains("_0x"),
+        "Hex scheme must emit _0x names: {}",
+        r.out
+    );
     assert!(
         r.control.suppress_builtin_mangle,
         "Hex must suppress swc mangle"
@@ -126,8 +130,16 @@ fn globals_and_globalthis_are_never_renamed() {
     // they must survive verbatim even though the local `localPi` is renamed.
     let src = "window.GLOBAL = function(){ var localPi = 3.14; return localPi; };";
     let r = run_idnames(src, config(IdNaming::Hex, &[]), 7);
-    assert!(r.out.contains("window"), "free global window preserved: {}", r.out);
-    assert!(r.out.contains("GLOBAL"), "top-level prop GLOBAL preserved: {}", r.out);
+    assert!(
+        r.out.contains("window"),
+        "free global window preserved: {}",
+        r.out
+    );
+    assert!(
+        r.out.contains("GLOBAL"),
+        "top-level prop GLOBAL preserved: {}",
+        r.out
+    );
     assert!(!r.out.contains("localPi"), "local renamed: {}", r.out);
 }
 
@@ -137,16 +149,32 @@ fn top_level_bindings_are_never_renamed() {
     // nested local `innerLocal` is renamed.
     let src = "var topThing = 1; function f(){ var innerLocal = topThing + 1; return innerLocal; }";
     let r = run_idnames(src, config(IdNaming::Hex, &[]), 7);
-    assert!(r.out.contains("topThing"), "top-level binding preserved: {}", r.out);
-    assert!(!r.out.contains("innerLocal"), "nested local renamed: {}", r.out);
+    assert!(
+        r.out.contains("topThing"),
+        "top-level binding preserved: {}",
+        r.out
+    );
+    assert!(
+        !r.out.contains("innerLocal"),
+        "nested local renamed: {}",
+        r.out
+    );
 }
 
 #[test]
 fn labels_are_not_renamed() {
     let src = "function r(n){ var acc = 0; myLabel: for (var i = 0; i < n; i++) { for (var j = 0; j < n; j++) { if (j > i) continue myLabel; acc += 1; } } return acc; } r(2);";
     let r = run_idnames(src, config(IdNaming::Hex, &[]), 7);
-    assert!(r.out.contains("myLabel"), "label preserved verbatim: {}", r.out);
-    assert!(!r.out.contains("continue _0x"), "label ref not renamed: {}", r.out);
+    assert!(
+        r.out.contains("myLabel"),
+        "label preserved verbatim: {}",
+        r.out
+    );
+    assert!(
+        !r.out.contains("continue _0x"),
+        "label ref not renamed: {}",
+        r.out
+    );
 }
 
 // ── keep-names ──────────────────────────────────────────────────────────────
@@ -156,10 +184,14 @@ fn keep_names_preserves_matching_local() {
     let src = "function f(){ var keepMe = 1, dropMe = 2; return keepMe + dropMe; } f();";
     let r = run_idnames(src, config(IdNaming::Hex, &["keepMe"]), 7);
     assert!(r.out.contains("keepMe"), "kept local preserved: {}", r.out);
-    assert!(!r.out.contains("dropMe"), "non-kept local renamed: {}", r.out);
+    assert!(
+        !r.out.contains("dropMe"),
+        "non-kept local renamed: {}",
+        r.out
+    );
     assert_eq!(
         r.control.reserved,
-        vec!["keepMe".to_string()],
+        vec!["f".to_string(), "keepMe".to_string()],
         "keep-names land in MangleControl.reserved"
     );
 }
@@ -168,9 +200,21 @@ fn keep_names_preserves_matching_local() {
 fn keep_names_glob_preserves_matching_locals() {
     let src = "function f(){ var initThing = 1, initOther = 2, dropMe = 3; return initThing + initOther + dropMe; } f();";
     let r = run_idnames(src, config(IdNaming::Hex, &["init*"]), 7);
-    assert!(r.out.contains("initThing"), "init* preserved initThing: {}", r.out);
-    assert!(r.out.contains("initOther"), "init* preserved initOther: {}", r.out);
-    assert!(!r.out.contains("dropMe"), "non-matching local renamed: {}", r.out);
+    assert!(
+        r.out.contains("initThing"),
+        "init* preserved initThing: {}",
+        r.out
+    );
+    assert!(
+        r.out.contains("initOther"),
+        "init* preserved initOther: {}",
+        r.out
+    );
+    assert!(
+        !r.out.contains("dropMe"),
+        "non-matching local renamed: {}",
+        r.out
+    );
 }
 
 // ── eval / with bail (no confusing names, swc mangle fallback) ───────────────
@@ -179,8 +223,16 @@ fn keep_names_glob_preserves_matching_locals() {
 fn eval_disables_confusing_scheme() {
     let src = "function f(paramLocal){ eval(\"0\"); return paramLocal + paramLocal; } f(2);";
     let r = run_idnames(src, config(IdNaming::Hex, &[]), 7);
-    assert!(!r.out.contains("_0x"), "eval disables Hex (no _0x): {}", r.out);
-    assert!(r.out.contains("paramLocal"), "local left as-is on bail: {}", r.out);
+    assert!(
+        !r.out.contains("_0x"),
+        "eval disables Hex (no _0x): {}",
+        r.out
+    );
+    assert!(
+        r.out.contains("paramLocal"),
+        "local left as-is on bail: {}",
+        r.out
+    );
     assert!(
         !r.control.suppress_builtin_mangle,
         "eval bail must leave swc mangle on"
@@ -191,7 +243,11 @@ fn eval_disables_confusing_scheme() {
 fn with_disables_confusing_scheme() {
     let src = "function f(o){ with(o){ return x + x; } } f({x:1});";
     let r = run_idnames(src, config(IdNaming::Hex, &[]), 7);
-    assert!(!r.out.contains("_0x"), "with disables Hex (no _0x): {}", r.out);
+    assert!(
+        !r.out.contains("_0x"),
+        "with disables Hex (no _0x): {}",
+        r.out
+    );
     assert!(
         !r.control.suppress_builtin_mangle,
         "with bail must leave swc mangle on"
@@ -222,7 +278,7 @@ fn short_scheme_still_carries_keep_names_to_reserved() {
     let r = run_idnames(src, config(IdNaming::Short, &["keepMe"]), 7);
     assert_eq!(
         r.control.reserved,
-        vec!["keepMe".to_string()],
+        vec!["f".to_string(), "keepMe".to_string()],
         "keep-names still reserved on the Short fallback path"
     );
 }
@@ -236,7 +292,11 @@ fn soup_scheme_emits_homoglyph_names_not_hex() {
         "soup renamed the local: {}",
         r.out
     );
-    assert!(!r.out.contains("_0x"), "soup must not emit _0x names: {}", r.out);
+    assert!(
+        !r.out.contains("_0x"),
+        "soup must not emit _0x names: {}",
+        r.out
+    );
     assert!(
         r.control.suppress_builtin_mangle,
         "Soup must suppress swc mangle"
@@ -253,7 +313,11 @@ fn generated_name_never_captures_a_hexlike_global() {
     // param instead of `7` and changing the result.
     let src = "var _0x1 = 7; function f(p) { var q = p + _0x1; return q; } String(f(3));";
     let r = run_idnames(src, config(IdNaming::Hex, &[]), 7);
-    assert!(r.out.contains("_0x1"), "the global _0x1 survives: {}", r.out);
+    assert!(
+        r.out.contains("_0x1"),
+        "the global _0x1 survives: {}",
+        r.out
+    );
     assert_behaviorally_equal_runtime(src, &r.out);
 }
 
@@ -280,7 +344,10 @@ fn soup_same_seed_identical() {
 fn soup_different_seed_differs() {
     let a = run_idnames(REPRO_SRC, config(IdNaming::Soup, &[]), 1);
     let b = run_idnames(REPRO_SRC, config(IdNaming::Soup, &[]), 2);
-    assert_ne!(a.out, b.out, "different seeds must produce different soup names");
+    assert_ne!(
+        a.out, b.out,
+        "different seeds must produce different soup names"
+    );
 }
 
 // ── rich behavioral round-trips ─────────────────────────────────────────────
@@ -394,4 +461,35 @@ fn object_literal_shorthand_round_trips() {
 /// `String(run())`), so this proves the rename preserved semantics.
 fn assert_behaviorally_equal_runtime(original: &str, transformed: &str) {
     mangler_testkit::eval::assert_behaviorally_equal(original, transformed);
+}
+
+#[test]
+fn callable_names_survive_without_keep_name_flags() {
+    let source = r#"
+        function run() {
+            function Declared() {}
+            class NamedClass {}
+            let arrow = () => 1;
+            let inferred = function() {};
+            let inferredClass = class {};
+            let assigned; assigned = function() {};
+            let logical; logical ??= class {};
+            let {propertyDefault = () => 1} = {};
+            let [arrayDefault = function() {}] = [];
+            function defaults(parameterDefault = class {}) { return parameterDefault.name; }
+            let ordinaryLocal = 7;
+            return JSON.stringify([Declared.name, NamedClass.name, arrow.name,
+                inferred.name, inferredClass.name, assigned.name, logical.name,
+                propertyDefault.name, arrayDefault.name, defaults(), ordinaryLocal]);
+        }
+        run();
+    "#;
+    for naming in [IdNaming::Hex, IdNaming::Soup] {
+        let result = run_idnames(source, config(naming, &[]), 91);
+        assert!(
+            !result.out.contains("ordinaryLocal"),
+            "ordinary data binding should still rename"
+        );
+        assert_behaviorally_equal_runtime(source, &result.out);
+    }
 }

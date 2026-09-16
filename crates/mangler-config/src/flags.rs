@@ -75,16 +75,14 @@ pub struct ConfigFlags {
     #[arg(long, value_name = "GLOB")]
     pub require_virtualized: Option<String>,
 
-    /// Virtualize the ENTIRE top-level program as one synthetic VM chunk
-    /// (all-or-nothing: if it compiles the whole top level is virtualized, else the
-    /// program is left native). Opt-in; bail-to-safe. When set, `--virtualize`
-    /// (`target`) is ignored. Phase-1 limitation: a program containing `import`/
-    /// `export` is left entirely native.
+    /// Virtualize top-level execution while preserving native binding and module
+    /// boundaries. Overrides `--virtualize`. Use `--require-virtualized` to enforce
+    /// coverage of matching source functions.
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub virtualize_program: bool,
 
     /// Keep functions whose names match this glob NATIVE (never virtualized), even
-    /// when they would otherwise be selected by `--virtualize`. Opt-in; bail-to-safe.
+    /// when they would otherwise be selected by `--virtualize`.
     #[arg(long, value_name = "GLOB")]
     pub virtualize_exclude: Option<String>,
 

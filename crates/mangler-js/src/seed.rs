@@ -296,7 +296,19 @@ impl Visit for Fingerprinter {
     fn visit_bin_expr(&mut self, n: &BinExpr) {
         self.tag(tag::BIN_EXPR);
         self.h.write_byte(bin_op_byte(n.op));
-        n.visit_children_with(self);
+        let mut pending = vec![&*n.right, &*n.left];
+        while let Some(expression) = pending.pop() {
+            match expression {
+                Expr::Bin(binary) => {
+                    self.tag(tag::BIN_EXPR);
+                    self.h.write_byte(bin_op_byte(binary.op));
+                    pending.push(&binary.right);
+                    pending.push(&binary.left);
+                }
+                Expr::Paren(paren) => pending.push(&paren.expr),
+                expression => expression.visit_with(self),
+            }
+        }
     }
     fn visit_unary_expr(&mut self, n: &UnaryExpr) {
         self.tag(tag::UNARY_EXPR);

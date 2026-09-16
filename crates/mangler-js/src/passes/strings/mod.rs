@@ -50,11 +50,12 @@
 //!   finalizer ([`stub::patch_self_coupled_expected`]) rewrites the sentinel with the
 //!   real expected hash.
 //!
-//! A `Note` is surfaced only if the decode primitive fails to compile (bail-to-safe:
-//! the plain-JS decoder is emitted instead).
+//! Requested VM decoding propagates compilation failures; it never substitutes
+//! a native decoder for a failed protected decoder.
 
 pub mod collect;
 pub mod encode;
+mod source_function;
 pub mod stub;
 
 use crate::artifacts::DecoderAnchorArtifact;
@@ -127,7 +128,7 @@ fn run_strings(
     cfg: &FileConfig,
     rng: &mut Rng,
     bus: &mut ArtifactBus,
-    notes: &mut Notes,
+    _notes: &mut Notes,
 ) -> Result<()> {
     let s = &cfg.resolved().passes.strings;
     let core_name = cfg.fresh_name();
@@ -237,8 +238,7 @@ fn run_strings(
     // Compile the per-index decode primitive to VM bytecode and emit it INLINE in
     // this stub (its OWN table + interpreter, NOT the virtualize pass's shared
     // table). The per-index decode then runs as bytecode. On any compile/build
-    // failure we fall back to the plain-JS decoder and surface a single Note, rather
-    // than emit a miscompiled chunk (bail-to-safe).
+    // failure the requested protection fails explicitly.
     //
     // Everything is drawn from `rng` ONLY when `in_vm` is on, so the default-off RNG
     // sequence — and the entire decoder output — stays byte-identical to a non-VM
@@ -262,8 +262,8 @@ fn run_strings(
         } else {
             std::borrow::Cow::Borrowed(stub::VM_DECODE_PRIMITIVE)
         };
-        match build_vm_decode(&primitive, cfg, rng) {
-            Some((params, prologue)) => {
+        match build_vm_decode(&primitive, cfg, rng, ast.program()) {
+            Ok((params, prologue)) => {
                 vm_prologue = prologue;
                 // Stage 4: self-coupled key — drawn first so the off-path RNG is stable.
                 if s.self_coupled_key {
@@ -294,14 +294,7 @@ fn run_strings(
                 }
                 vm_decode = Some(params);
             }
-            None => {
-                // Bail-to-safe: the decode primitive did not compile/build. Emit the
-                // plain-JS decoder and tell the caller the VM path was not taken.
-                notes.push(mangler_core::Note::from(
-                    "strings",
-                    "--strings-in-vm: decode primitive did not compile to bytecode; emitted plain-JS decoder",
-                ));
-            }
+            Err(error) => return Err(error),
         }
     }
 
@@ -346,6 +339,11 @@ fn run_strings(
     if !vm_prologue.is_empty() {
         inject_into_core_iife(&core_name, &mut stub_stmts, vm_prologue);
     }
+    let isolation = super::intrinsics::Isolation::prepare(ast.program());
+    isolation
+        .protect(&mut stub_stmts, "", cfg)
+        .map_err(|reason| Error::transform("strings", reason))?;
+    ast.register_runtime(&stub_stmts, None);
     splice_at_prologue(ast.program_mut(), stub_stmts);
 
     // Record the decoder anchor so downstream passes can build opaque values. Safe
@@ -367,8 +365,8 @@ fn run_strings(
 
 /// Compile the decode `primitive` (a `function(...){...}` expression source) to VM
 /// bytecode, register it in its OWN [`TableBuilder`], and emit the interpreter +
-/// program-table prologue. Returns `None` on any parse/compile/build failure
-/// (bail-to-safe — the caller emits the plain-JS decoder instead).
+/// program-table prologue. A requested VM decoder must compile successfully;
+/// errors are propagated instead of silently emitting a native decoder.
 ///
 /// The table is independent of the virtualize pass's shared table (per the design:
 /// strings-in-VM emits its own interpreter inline and does NOT `put` a `VmTable`).
@@ -376,9 +374,16 @@ fn build_vm_decode(
     primitive: &str,
     cfg: &FileConfig,
     rng: &mut Rng,
-) -> Option<(VmDecodeParams, Vec<Stmt>)> {
-    let (params, body) = parse_fn_expr(primitive)?;
-    let compiled = compile_body(&params, &body).ok()?;
+    program: &Program,
+) -> Result<(VmDecodeParams, Vec<Stmt>)> {
+    let (params, body) = parse_fn_expr(primitive)
+        .ok_or_else(|| Error::transform("strings", "invalid VM decoder primitive"))?;
+    let compiled = compile_body(&params, &body).map_err(|reason| {
+        Error::transform(
+            "strings",
+            format!("VM decoder compilation failed: {reason}"),
+        )
+    })?;
 
     // Draw the diversity from the pass RNG so the whole build stays deterministic and
     // gated behind the `in_vm` flag.
@@ -400,27 +405,26 @@ fn build_vm_decode(
         rc: cfg.fresh_name(),
         sy: cfg.fresh_name(),
     };
-    let vt = tb.finish(&names).ok()?;
-    // The decode primitive is a flat function: it never needs the EH interpreter. If
-    // it somehow did, the lean-interp thunk would be wrong — bail to safe.
-    if chunk.needs_eh {
-        return None;
-    }
+    let mut vt = tb.finish(&names)?;
+    let isolation = super::intrinsics::Isolation::prepare(program);
+    isolation
+        .protect(&mut vt.prologue, &names.table, cfg)
+        .map_err(|reason| Error::transform("strings", reason))?;
 
     let vm_decode = VmDecodeParams {
-        interp_name: names.lean_interp.clone(),
+        interp_name: names.interp_for(chunk.needs_eh, false).to_string(),
         table_name: names.table.clone(),
         chunk_index: chunk.index,
         captures: chunk.captures.clone(),
         cap_start: chunk.cap_start,
         pcount: chunk.pcount,
     };
-    Some((vm_decode, vt.prologue))
+    Ok((vm_decode, vt.prologue))
 }
 
 /// Parse a `function(...){...}` expression source into `(params, body)` for the VM
 /// compiler. Returns `None` if the source is not a single function expression.
-fn parse_fn_expr(src: &str) -> Option<(Vec<Param>, BlockStmt)> {
+fn parse_fn_expr(src: &str) -> Option<(Vec<Param>, FunctionBody)> {
     let wrapped = format!("var __f = ({src});");
     let ast = Js.parse(&wrapped, &ParseOpts::default()).ok()?;
     let stmt = match ast.into_program() {
@@ -449,9 +453,11 @@ fn parse_fn_expr(src: &str) -> Option<(Vec<Param>, BlockStmt)> {
 /// well-formed JS. A parse failure is a hard error (a malformed stub must never
 /// reach output).
 fn parse_stub_stmts(stub_src: &str) -> Result<Vec<Stmt>> {
-    let ast = Js
+    let mut ast = Js
         .parse(stub_src, &ParseOpts::default())
         .map_err(|e| Error::transform("strings", format!("decoder stub failed to parse: {e}")))?;
+    ast.program_mut()
+        .visit_mut_with(&mut mangler_jsast::span::GeneratedSpans);
     match ast.into_program() {
         Program::Script(s) => Ok(s.body),
         Program::Module(m) => Ok(m
@@ -504,7 +510,7 @@ fn inject_into_core_iife(core_name: &str, stub_stmts: &mut [Stmt], prologue: Vec
 
 /// Return the body block of the function-expression callee of an IIFE
 /// `(function(){…})()` (unwrapping a `Paren`), or `None` if `expr` is not that shape.
-fn iife_body_mut(expr: &mut Expr) -> Option<&mut BlockStmt> {
+fn iife_body_mut(expr: &mut Expr) -> Option<&mut FunctionBody> {
     let Expr::Call(call) = expr else { return None };
     let callee = match &mut call.callee {
         Callee::Expr(e) => e.as_mut(),

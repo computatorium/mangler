@@ -69,7 +69,7 @@ pub fn serialize(
             // Unary-layout operand-carrying ops. Most pass their operand verbatim;
             // a few translate it (Bin/Un sub-codes are permuted; Jump targets are
             // instruction indices rewritten to flat offsets).
-            Instr::PushConst(ci) => out.push(*ci as f64),
+            Instr::PushConst(ci) | Instr::NewRegExp(ci) => out.push(*ci as f64),
             Instr::LoadLocal(slot)
             | Instr::StoreLocal(slot)
             | Instr::MakeCell(slot)
@@ -77,7 +77,24 @@ pub fn serialize(
             | Instr::StoreCell(slot)
             | Instr::BeginLexical(slot)
             | Instr::InitLocal(slot)
-            | Instr::CloneLexical(slot) => out.push(*slot as f64),
+            | Instr::CloneLexical(slot)
+            | Instr::TypeOfBinding(slot)
+            | Instr::DeleteBinding(slot)
+            | Instr::UpdateProp(slot)
+            | Instr::LocalRef(slot)
+            | Instr::CaptureRef(slot)
+            | Instr::EnterWith(slot)
+            | Instr::UpdateRef(slot)
+            | Instr::SetFunctionLength(slot)
+            | Instr::ClearRef(slot)
+            | Instr::SuperAssign(slot)
+            | Instr::SuperUpdate(slot)
+            | Instr::BeginVarEnvironment(slot)
+            | Instr::CaptureClosureEnvironment(slot)
+            | Instr::EvalCall(slot)
+            | Instr::EnvironmentRef(slot)
+            | Instr::AccessorRef(slot)
+            | Instr::MakeSuperProvider(slot) => out.push(*slot as f64),
             Instr::Bin(o) => out.push(bin_perm[*o as usize] as f64),
             Instr::Un(o) => out.push(un_perm[*o as usize] as f64),
             Instr::MakeArray(n) | Instr::MakeObject(n) => out.push(*n as f64),
@@ -89,6 +106,12 @@ pub fn serialize(
                 out.push(offsets[*target as usize] as f64)
             }
             // Binary-layout (two-operand) ops.
+            Instr::MapArgument(index, slot)
+            | Instr::WithRef(index, slot)
+            | Instr::WithRefCell(index, slot) => {
+                out.push(*index as f64);
+                out.push(*slot as f64);
+            }
             Instr::PushHandler(catch_pc, fin_pc) => {
                 out.push(handler_pc(*catch_pc, &offsets));
                 out.push(handler_pc(*fin_pc, &offsets));
@@ -182,7 +205,7 @@ pub(crate) fn code_decode_js(key: u32) -> String {
     let mask = key & 63;
     format!(
         "if(!code.d){{t=code[0];code.length=0;n=0;k=0;\
-for(i=0;i<t.length;i++){{v=(t.charCodeAt(i)-63)^{mask};n|=(v&31)<<k;\
+for(i=0;i<t.length;i++){{v=(Reflect.apply(String.prototype.charCodeAt,t,[i])-63)^{mask};n|=(v&31)<<k;\
 if(v&32)k+=5;else{{code.push(n>>>0);n=0;k=0;}}}}code.d=1;}}C=code;"
     )
 }
@@ -191,8 +214,12 @@ if(v&32)k+=5;else{{code.push(n>>>0);n=0;k=0;}}}}code.d=1;}}C=code;"
 /// the interpreter de-XORs + `String.fromCharCode`s on first use). `ck` is the
 /// 16-bit non-zero key.
 fn enc_str(s: &str, ck: u32) -> String {
+    enc_units(s.encode_utf16(), ck)
+}
+
+fn enc_units(units: impl IntoIterator<Item = u16>, ck: u32) -> String {
     let mut out = String::from("[");
-    for (i, u) in s.encode_utf16().enumerate() {
+    for (i, u) in units.into_iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
@@ -206,12 +233,12 @@ fn enc_str(s: &str, ck: u32) -> String {
 /// `NaN`/`±Infinity`/`-0`).
 fn num_js(n: f64) -> String {
     if n.is_nan() {
-        "NaN".to_string()
+        "(0/0)".to_string()
     } else if n.is_infinite() {
         if n > 0.0 {
-            "Infinity".to_string()
+            "(1/0)".to_string()
         } else {
-            "-Infinity".to_string()
+            "(-1/0)".to_string()
         }
     } else if n == 0.0 && n.is_sign_negative() {
         "-0".to_string()
@@ -234,6 +261,18 @@ pub fn consts_array_js(consts: &[Const], key: u32) -> String {
             Const::Num(n) => s.push_str(&num_js(*n)),
             Const::Bool(b) => s.push_str(if *b { "true" } else { "false" }),
             Const::Str(st) => s.push_str(&enc_str(st, ck)),
+            Const::Utf16(units) => s.push_str(&enc_units(units.iter().copied(), ck)),
+            Const::BigInt(value) => s.push_str(&format!("{{b:{}}}", enc_str(value, ck))),
+            Const::RegExp { pattern, flags } => s.push_str(&format!(
+                "{{r:{},f:{}}}",
+                enc_str(pattern, ck),
+                enc_str(flags, ck)
+            )),
+            Const::RegExpUtf16 { pattern, flags } => s.push_str(&format!(
+                "{{r:{},f:{}}}",
+                enc_units(pattern.iter().copied(), ck),
+                enc_str(flags, ck)
+            )),
             // D4: a tagged-template object renders as `{q:[cooked...],w:[raw...]}`.
             // Each raw element is an encrypted-Str array; each cooked element is an
             // encrypted-Str array OR the number `0` for an invalid-escape hole.
@@ -263,6 +302,92 @@ pub fn consts_array_js(consts: &[Const], key: u32) -> String {
             // `.q` object), so the interpreter's const-decode loop leaves it
             // untouched. The source is already deterministic (built from the AST), so
             // the bytes are identical for a given seed.
+            Const::TemplateObjectUtf16 { cooked, raw } => {
+                s.push_str("{q:[");
+                for (j, el) in cooked.iter().enumerate() {
+                    if j > 0 {
+                        s.push(',');
+                    }
+                    match el {
+                        Some(u) => s.push_str(&enc_units(u.iter().copied(), ck)),
+                        None => s.push('0'),
+                    }
+                }
+                s.push_str("],w:[");
+                for (j, u) in raw.iter().enumerate() {
+                    if j > 0 {
+                        s.push(',');
+                    }
+                    s.push_str(&enc_units(u.iter().copied(), ck));
+                }
+                s.push_str("]}");
+            }
+            Const::Environment(metadata) => {
+                use crate::eval::EnvironmentScope;
+                s.push_str(&format!("{{c:{}", metadata.source_context as u8));
+                if let Some(class) = &metadata.class_context {
+                    s.push_str(&format!(
+                        ",k:{{capsuleSlot:{},capsuleCell:{},privateNames:[",
+                        class.capsule_slot, class.capsule_cell
+                    ));
+                    for (index, name) in class.private_names.iter().enumerate() {
+                        if index > 0 {
+                            s.push(',');
+                        }
+                        s.push('"');
+                        for unit in name.encode_utf16() {
+                            s.push_str(&format!("\\u{unit:04x}"));
+                        }
+                        s.push('"');
+                    }
+                    s.push_str(&format!(
+                        "],allowSuperProperty:{},allowSuperCall:{},argumentsForbidden:{}}}",
+                        class.allow_super_property,
+                        class.allow_super_call,
+                        class.arguments_forbidden
+                    ));
+                }
+                s.push_str(",e:[");
+                for (i, scope) in metadata.scopes.iter().enumerate() {
+                    if i > 0 {
+                        s.push(',');
+                    }
+                    match scope {
+                        EnvironmentScope::Variables => s.push('0'),
+                        EnvironmentScope::WithObject(slot) => s.push_str(&format!("{{w:{slot}}}")),
+                        EnvironmentScope::Bindings(bindings) => {
+                            s.push('[');
+                            for (j, binding) in bindings.iter().enumerate() {
+                                if j > 0 {
+                                    s.push(',');
+                                }
+                                s.push_str(&format!(
+                                    "[{},{},{}",
+                                    binding.name_const,
+                                    binding.slot,
+                                    u8::from(binding.cell)
+                                        | (u8::from(binding.lexical) * 2)
+                                        | (u8::from(binding.accessor_cell) * 4)
+                                ));
+                                if !binding.objects.is_empty() {
+                                    s.push_str(",[");
+                                    for (index, (slot, boxed)) in binding.objects.iter().enumerate()
+                                    {
+                                        if index > 0 {
+                                            s.push(',');
+                                        }
+                                        s.push_str(&format!("[{slot},{boxed}]"));
+                                    }
+                                    s.push(']');
+                                }
+                                s.push(']');
+                            }
+                            s.push(']');
+                        }
+                    }
+                }
+                s.push_str("]}");
+            }
             Const::NativeFactory(src) => {
                 s.push('(');
                 s.push_str(src);
@@ -309,6 +434,7 @@ mod tests {
 
     fn compiled(code: Vec<Instr>, consts: Vec<Const>) -> Compiled {
         Compiled {
+            requires_source_compiler: false,
             code,
             consts,
             captures: vec![],
@@ -401,6 +527,47 @@ mod tests {
             Instr::RequireObject,
             Instr::BeginFinally,
             Instr::IterElide,
+            Instr::NewRegExp(0),
+            Instr::MapArgument(0, 0),
+            Instr::ArrayAppend,
+            Instr::ArraySpread,
+            Instr::ArrayHole,
+            Instr::NewArray,
+            Instr::DefineData,
+            Instr::DefineGetter,
+            Instr::DefineSetter,
+            Instr::SetPrototype,
+            Instr::SetFunctionName,
+            Instr::DefineMethod,
+            Instr::TypeOfBinding(0),
+            Instr::DeleteBinding(0),
+            Instr::UpdateProp(0),
+            Instr::LocalRef(0),
+            Instr::WithRef(0, 0),
+            Instr::ResolveRef,
+            Instr::GetRef,
+            Instr::PutRef,
+            Instr::RefCall,
+            Instr::CaptureRef(0),
+            Instr::DeleteRef,
+            Instr::TypeOfRef,
+            Instr::EnterWith(0),
+            Instr::UpdateRef(0),
+            Instr::UnmapArguments,
+            Instr::SetFunctionLength(0),
+            Instr::ClearRef(0),
+            Instr::SuperAssign(0),
+            Instr::SuperUpdate(0),
+            Instr::PushNewTarget,
+            Instr::BeginVarEnvironment(0),
+            Instr::CaptureClosureEnvironment(0),
+            Instr::EvalCall(0),
+            Instr::EnvironmentRef(0),
+            Instr::AccessorRef(0),
+            Instr::RefAdapter,
+            Instr::WithRefCell(0, 0),
+            Instr::MakeSuperProvider(0),
+            Instr::ThrowReferenceError,
         ];
         assert_eq!(code.len(), N_OPCODES);
         let src_discs: Vec<usize> = code.iter().map(|i| i.discriminant()).collect();
@@ -603,7 +770,7 @@ var first=JSON.stringify(code);{decode}globalThis.__out=first+'|'+JSON.stringify
             Const::Str("hi".to_string()),
         ];
         let js = consts_array_js(&consts, key);
-        assert!(js.starts_with("[3,true,NaN,-0,["));
+        assert!(js.starts_with("[3,true,(0/0),-0,["));
         // The string "hi" is rendered as XOR'd UTF-16 units.
         let h = ('h' as u32) ^ ck;
         let i = ('i' as u32) ^ ck;

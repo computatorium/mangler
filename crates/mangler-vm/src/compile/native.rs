@@ -41,18 +41,20 @@ fn up_param(i: usize) -> String {
 /// Dynamic scope can resolve names hidden inside strings or with objects. Walk
 /// through nested functions and parameter defaults: moving any such closure into
 /// a factory would change its lexical environment.
-pub(crate) fn unsupported_scope(params: &[Pat], body: &BlockStmt) -> Option<&'static str> {
+pub(crate) fn unsupported_scope(params: &[Pat], body: &FunctionBody) -> Option<&'static str> {
     struct Scan(Option<&'static str>);
     impl Visit for Scan {
+        fn visit_bin_expr(&mut self, n: &BinExpr) {
+            super::walk_binary_chain(n, self);
+        }
         fn visit_call_expr(&mut self, call: &CallExpr) {
-            if matches!(&call.callee, Callee::Expr(expr) if matches!(&**expr, Expr::Ident(id) if id.sym.as_ref() == "eval"))
-            {
-                self.0 = Some("native_direct_eval");
+            if mangler_jsast::analysis::scope::is_direct_eval_callee(&call.callee) {
+                self.0.get_or_insert("native_direct_eval");
             }
             call.visit_children_with(self);
         }
         fn visit_with_stmt(&mut self, stmt: &WithStmt) {
-            self.0 = Some("native_with");
+            self.0.get_or_insert("native_with");
             stmt.visit_children_with(self);
         }
     }
@@ -62,6 +64,28 @@ pub(crate) fn unsupported_scope(params: &[Pat], body: &BlockStmt) -> Option<&'st
     scan.0
 }
 
+fn resolve_native_expression(expression: &mut Expr, unresolved: Mark) {
+    let mut program = Program::Script(Script {
+        body: vec![Stmt::Expr(ExprStmt {
+            span: DUMMY_SP,
+            expr: Box::new(std::mem::replace(
+                expression,
+                Expr::Invalid(Invalid { span: DUMMY_SP }),
+            )),
+        })],
+        ..Default::default()
+    });
+    program.visit_mut_with(&mut resolver(unresolved, Mark::new(), false));
+    mangler_jsast::Js::repair_resolver_scopes(&mut program);
+    let Program::Script(mut script) = program else {
+        unreachable!()
+    };
+    let Stmt::Expr(statement) = script.body.remove(0) else {
+        unreachable!()
+    };
+    *expression = *statement.expr;
+}
+
 /// Build the factory function-expression SOURCE for `is_arrow` original, given its
 /// `params`/`body` and the ordered `upvalues`. `self_name` is the original named
 /// function expression's own name (re-attached so its self-recursion resolves
@@ -69,11 +93,12 @@ pub(crate) fn unsupported_scope(params: &[Pat], body: &BlockStmt) -> Option<&'st
 /// (defensive — never expected; the caller then bails to native-subtree).
 pub(crate) fn build_factory_src(
     params: &[Pat],
-    body: &BlockStmt,
+    body: &FunctionBody,
     is_arrow: bool,
     is_async: bool,
     is_generator: bool,
     self_name: Option<&str>,
+    inherited_strict: bool,
     upvalues: &[Upvalue],
 ) -> Option<String> {
     // Dynamic scope cannot be represented by static capture rewrites.
@@ -84,7 +109,7 @@ pub(crate) fn build_factory_src(
         let mut inner_expr =
             build_inner_expr(params, body, is_arrow, is_async, is_generator, self_name);
         let unresolved = Mark::new();
-        inner_expr.visit_mut_with(&mut resolver(unresolved, Mark::new(), false));
+        resolve_native_expression(&mut inner_expr, unresolved);
         let unresolved = SyntaxContext::empty().apply_mark(unresolved);
         let mut reserved = Names::default();
         inner_expr.visit_with(&mut reserved);
@@ -124,6 +149,8 @@ pub(crate) fn build_factory_src(
             rename: &rename,
             this_param: this_param.as_deref(),
             unresolved,
+            own_arguments: false,
+            strict: inherited_strict,
         };
         inner_expr.visit_mut_with(&mut rw);
 
@@ -145,6 +172,7 @@ pub(crate) fn build_factory_src(
         let factory = Expr::Fn(FnExpr {
             ident: None,
             function: Box::new(Function {
+                this_param: None,
                 params: factory_params
                     .into_iter()
                     .map(|pat| Param {
@@ -156,7 +184,7 @@ pub(crate) fn build_factory_src(
                 decorators: vec![],
                 span: DUMMY_SP,
                 ctxt: Default::default(),
-                body: Some(BlockStmt {
+                body: Some(FunctionBody {
                     span: DUMMY_SP,
                     stmts: vec![Stmt::Return(ReturnStmt {
                         span: DUMMY_SP,
@@ -193,7 +221,7 @@ pub(crate) fn build_factory_src(
 /// expression-bodied arrow into `{ return e; }`).
 fn build_inner_expr(
     params: &[Pat],
-    body: &BlockStmt,
+    body: &FunctionBody,
     is_arrow: bool,
     is_async: bool,
     is_generator: bool,
@@ -204,7 +232,7 @@ fn build_inner_expr(
             span: DUMMY_SP,
             ctxt: Default::default(),
             params: params.to_vec(),
-            body: Box::new(BlockStmtOrExpr::BlockStmt(body.clone())),
+            body: Box::new(ArrowFunctionBody::FunctionBody(body.clone())),
             is_async,
             is_generator,
             type_params: None,
@@ -214,6 +242,7 @@ fn build_inner_expr(
         Expr::Fn(FnExpr {
             ident: self_name.map(|n| Ident::new(n.into(), DUMMY_SP, Default::default())),
             function: Box::new(Function {
+                this_param: None,
                 params: params
                     .iter()
                     .map(|pat| Param {
@@ -238,6 +267,9 @@ fn build_inner_expr(
 #[derive(Default)]
 struct Names(HashSet<String>);
 impl Visit for Names {
+    fn visit_bin_expr(&mut self, n: &BinExpr) {
+        super::walk_binary_chain(n, self);
+    }
     fn visit_ident(&mut self, id: &Ident) {
         self.0.insert(id.sym.to_string());
     }
@@ -245,20 +277,43 @@ impl Visit for Names {
 
 /// Native escapes and their factories use one scope authority: SWC's resolver.
 /// Parameter defaults, block/catch shadows and nested scopes therefore agree.
-pub(crate) fn free_names(params: &[Pat], body: &BlockStmt, self_name: Option<&str>) -> Vec<String> {
+pub(crate) fn free_names(
+    params: &[Pat],
+    body: &FunctionBody,
+    self_name: Option<&str>,
+) -> Vec<String> {
     GLOBALS.set(&Globals::new(), || {
         let mut expr = build_inner_expr(params, body, true, false, false, self_name);
         let mark = Mark::new();
-        expr.visit_mut_with(&mut resolver(mark, Mark::new(), false));
+        resolve_native_expression(&mut expr, mark);
         struct Free {
             unresolved: SyntaxContext,
             names: Vec<String>,
             seen: HashSet<String>,
+            own_arguments: bool,
         }
         impl Visit for Free {
+            fn visit_bin_expr(&mut self, n: &BinExpr) {
+                super::walk_binary_chain(n, self);
+            }
+            fn visit_function(&mut self, function: &Function) {
+                let old = self.own_arguments;
+                self.own_arguments = true;
+                function.visit_children_with(self);
+                self.own_arguments = old;
+            }
+            fn visit_constructor(&mut self, constructor: &Constructor) {
+                let old = self.own_arguments;
+                self.own_arguments = true;
+                constructor.visit_children_with(self);
+                self.own_arguments = old;
+            }
             fn visit_ident(&mut self, id: &Ident) {
                 let name = id.sym.to_string();
-                if id.ctxt == self.unresolved && self.seen.insert(name.clone()) {
+                if id.ctxt == self.unresolved
+                    && !(self.own_arguments && name == "arguments")
+                    && self.seen.insert(name.clone())
+                {
                     self.names.push(name);
                 }
             }
@@ -267,6 +322,7 @@ pub(crate) fn free_names(params: &[Pat], body: &BlockStmt, self_name: Option<&st
             unresolved: SyntaxContext::empty().apply_mark(mark),
             names: Vec::new(),
             seen: HashSet::new(),
+            own_arguments: false,
         };
         expr.visit_with(&mut free);
         free.names.retain(|name| Some(name.as_str()) != self_name);
@@ -288,11 +344,13 @@ struct Rewriter<'a> {
     rename: &'a HashMap<String, RewriteTarget>,
     this_param: Option<&'a str>,
     unresolved: SyntaxContext,
+    own_arguments: bool,
+    strict: bool,
 }
 
 impl Rewriter<'_> {
     fn is_free(&self, id: &Ident) -> bool {
-        id.ctxt == self.unresolved
+        id.ctxt == self.unresolved && !(self.own_arguments && id.sym.as_ref() == "arguments")
     }
 
     /// A free call must keep an undefined receiver after becoming a cell member.
@@ -301,6 +359,27 @@ impl Rewriter<'_> {
             && self.is_free(id)
             && let Some(target) = self.target_expr(id.sym.as_ref(), id.span)
         {
+            if let Some(target) = self.rename.get(id.sym.as_ref())
+                && !target.celled
+            {
+                **callee = Expr::Member(MemberExpr {
+                    span: id.span,
+                    obj: Box::new(Expr::Ident(Ident::new(
+                        target.param.clone().into(),
+                        id.span,
+                        Default::default(),
+                    ))),
+                    prop: MemberProp::Computed(ComputedPropName {
+                        span: id.span,
+                        expr: Box::new(Expr::Lit(Lit::Num(Number {
+                            span: id.span,
+                            value: if self.strict { 3.0 } else { 1.0 },
+                            raw: None,
+                        }))),
+                    }),
+                });
+                return;
+            }
             **callee = Expr::Paren(ParenExpr {
                 span: id.span,
                 expr: Box::new(Expr::Seq(SeqExpr {
@@ -339,7 +418,7 @@ impl Rewriter<'_> {
         let mut expr = Expr::Ident(Ident::new(t.param.clone().into(), span, Default::default()));
         // Every native upvalue is a live accessor cell over its parent frame slot.
         // Boxed slots add one further dereference to the shared binding cell.
-        for _ in 0..if t.celled { 2 } else { 1 } {
+        for depth in 0..if t.celled { 2 } else { 1 } {
             expr = Expr::Member(MemberExpr {
                 span,
                 obj: Box::new(expr),
@@ -347,7 +426,7 @@ impl Rewriter<'_> {
                     span,
                     expr: Box::new(Expr::Lit(Lit::Num(Number {
                         span,
-                        value: 0.0,
+                        value: if depth == 0 && self.strict { 2.0 } else { 0.0 },
                         raw: None,
                     }))),
                 }),
@@ -361,7 +440,64 @@ impl VisitMut for Rewriter<'_> {
     // Regular functions own their receiver; nested arrows inherit the active one.
     fn visit_mut_function(&mut self, f: &mut Function) {
         let previous = self.this_param.take();
+        let arguments = self.own_arguments;
+        let strict = self.strict;
+        self.strict |= f
+            .body
+            .as_ref()
+            .is_some_and(|body| mangler_jsast::directives::has_use_strict(&body.stmts));
+        self.own_arguments = true;
         f.visit_mut_children_with(self);
+        self.strict = strict;
+        self.own_arguments = arguments;
+        self.this_param = previous;
+    }
+
+    fn visit_mut_arrow_expr(&mut self, arrow: &mut ArrowExpr) {
+        let strict = self.strict;
+        if let ArrowFunctionBody::FunctionBody(body) = &*arrow.body {
+            self.strict |= mangler_jsast::directives::has_use_strict(&body.stmts);
+        }
+        arrow.visit_mut_children_with(self);
+        self.strict = strict;
+    }
+
+    fn visit_mut_class(&mut self, class: &mut Class) {
+        let strict = self.strict;
+        self.strict = true;
+        class.visit_mut_children_with(self);
+        self.strict = strict;
+    }
+
+    // Computed class keys and heritage evaluate in the enclosing receiver scope;
+    // field initializers, constructors and static blocks own a new receiver.
+    fn visit_mut_class_prop(&mut self, property: &mut ClassProp) {
+        property.key.visit_mut_with(self);
+        property.decorators.visit_mut_with(self);
+        let previous = self.this_param.take();
+        property.value.visit_mut_with(self);
+        self.this_param = previous;
+    }
+
+    fn visit_mut_private_prop(&mut self, property: &mut PrivateProp) {
+        property.decorators.visit_mut_with(self);
+        let previous = self.this_param.take();
+        property.value.visit_mut_with(self);
+        self.this_param = previous;
+    }
+
+    fn visit_mut_constructor(&mut self, constructor: &mut Constructor) {
+        let previous = self.this_param.take();
+        let arguments = self.own_arguments;
+        self.own_arguments = true;
+        constructor.visit_mut_children_with(self);
+        self.own_arguments = arguments;
+        self.this_param = previous;
+    }
+
+    fn visit_mut_static_block(&mut self, block: &mut StaticBlock) {
+        let previous = self.this_param.take();
+        block.visit_mut_children_with(self);
         self.this_param = previous;
     }
 
@@ -503,7 +639,7 @@ fn print_expr(e: &Expr) -> String {
             comments: None,
             wr,
         };
-        let program = Program::Script(Script {
+        let mut program = Program::Script(Script {
             span: DUMMY_SP,
             body: vec![Stmt::Expr(ExprStmt {
                 span: DUMMY_SP,
@@ -511,6 +647,7 @@ fn print_expr(e: &Expr) -> String {
             })],
             shebang: None,
         });
+        program.visit_mut_with(&mut swc_core::ecma::transforms::base::fixer::fixer(None));
         use swc_core::ecma::codegen::Node;
         program
             .emit_with(&mut emitter)
@@ -523,4 +660,104 @@ fn print_expr(e: &Expr) -> String {
         s.pop();
     }
     s
+}
+
+#[cfg(test)]
+mod dynamic_scope_tests {
+    use super::unsupported_scope;
+    use crate::test_support::parse_fn_with_params;
+
+    #[test]
+    fn strict_native_scopes_select_strict_reference_views() {
+        use mangler_testkit::eval::{CaptureMode, assert_behaviorally_equal_with};
+        let (_, body) = parse_fn_with_params(
+            "function(){return [x,function(){'use strict';return [x,()=>x,x()]},()=>{'use strict';return x},class {m(){return x}}]}",
+        );
+        for inherited_strict in [false, true] {
+            let source = super::build_factory_src(
+                &[],
+                &body,
+                false,
+                false,
+                false,
+                None,
+                inherited_strict,
+                &[super::Upvalue {
+                    name: Some("x".into()),
+                    celled: false,
+                    is_this: false,
+                }],
+            )
+            .unwrap();
+            let transformed = format!(
+                "var cells={{0:7,2:9,1:function(){{return 11}},3:function(){{return 13}}}};var a=({source})(cells)(),b=a[1]();globalThis.__out=JSON.stringify([a[0],b[0],b[1](),b[2],a[2](),new (a[3])().m()]);"
+            );
+            let expected = if inherited_strict { 9 } else { 7 };
+            assert_behaviorally_equal_with(
+                &format!("globalThis.__out='[{expected},9,9,13,9,9]';"),
+                &transformed,
+                &CaptureMode::sink(),
+            );
+        }
+    }
+
+    #[test]
+    fn class_receiver_and_arguments_scopes_survive_factory_rewrite() {
+        use mangler_testkit::eval::{CaptureMode, assert_behaviorally_equal_with};
+        let (_, body) = parse_fn_with_params(
+            "function(){return class {static x=this; x=this; [this.key]=this; m(){return arguments[0]}}}",
+        );
+        assert!(!super::free_names(&[], &body, None).contains(&"arguments".to_string()));
+        let source = super::build_factory_src(
+            &[],
+            &body,
+            true,
+            false,
+            false,
+            None,
+            false,
+            &[super::Upvalue {
+                name: None,
+                celled: false,
+                is_this: true,
+            }],
+        )
+        .unwrap();
+        let transformed = format!(
+            "var C=({source})({{key:'field'}})();var c=new C;globalThis.__out=JSON.stringify([C.x===C,c.x===c,c.field===c,c.m(7)]);"
+        );
+        let original = "var C=(function(){return class {static x=this;x=this;[this.key]=this;m(){return arguments[0]}}}).call({key:'field'});var c=new C;globalThis.__out=JSON.stringify([C.x===C,c.x===c,c.field===c,c.m(7)]);";
+        assert_behaviorally_equal_with(original, &transformed, &CaptureMode::sink());
+    }
+
+    #[test]
+    fn parenthesized_eval_retains_direct_eval_semantics() {
+        for source in [
+            "function(){ return (eval)('x'); }",
+            "function(){ return ((eval))('x'); }",
+            "function(a=(eval)('x')){ return a; }",
+            "function(){ return ()=>((eval))('x'); }",
+        ] {
+            let (params, body) = parse_fn_with_params(source);
+            let params: Vec<_> = params.into_iter().map(|p| p.pat).collect();
+            assert_eq!(
+                unsupported_scope(&params, &body),
+                Some("native_direct_eval"),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn indirect_eval_does_not_require_caller_environment() {
+        for source in [
+            "function(){ return (0, eval)('x'); }",
+            "function(){ return eval?.('x'); }",
+            "function(){ return globalThis.eval('x'); }",
+        ] {
+            let (params, body) = parse_fn_with_params(source);
+            let params: Vec<_> = params.into_iter().map(|p| p.pat).collect();
+            assert_eq!(unsupported_scope(&params, &body), None, "{source}");
+        }
+    }
 }

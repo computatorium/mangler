@@ -64,7 +64,7 @@ struct Binding {
 /// the `let`/`const` bindings declared inside loops; a captured one would need
 /// per-iteration freshness the lowering does not emulate, so the caller must skip
 /// the body.
-pub fn loop_let_captured(body: &BlockStmt, names: &[String]) -> bool {
+pub fn loop_let_captured(body: &FunctionBody, names: &[String]) -> bool {
     let names: HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
     let mut cs = CaptureScan {
         names: &names,
@@ -124,7 +124,7 @@ impl<'a> Visit for NameRefScan<'a> {
 /// body contains only `var` declarations and is ready for flattening.
 ///
 /// Caller must have checked the TDZ-safety gates first.
-pub fn rewrite(body: &mut BlockStmt, cfg: &FileConfig, helpers: &TdzHelpers) -> bool {
+pub fn rewrite(body: &mut FunctionBody, cfg: &FileConfig, helpers: &TdzHelpers) -> bool {
     let mut collector = BindingCollector { order: Vec::new() };
     body.visit_with(&mut collector);
     if collector.order.is_empty() {
@@ -170,7 +170,7 @@ pub fn rewrite(body: &mut BlockStmt, cfg: &FileConfig, helpers: &TdzHelpers) -> 
             decls: tdz_decls,
         }))),
     ];
-    let at = mangler_jsast::directives::leading_directive_count(&body.stmts);
+    let at = mangler_jsast::directives::leading_initialization_count(&body.stmts);
     body.stmts.splice(at..at, hoist);
     true
 }
@@ -248,7 +248,11 @@ impl<'a> Rewriter<'a> {
                 }
             };
             if let Some(init) = init {
-                out.push(assign_stmt(&val, AssignOp::Assign, *init));
+                out.push(assign_stmt(
+                    &val,
+                    AssignOp::Assign,
+                    *preserve_inferred_name(&bi.id.sym, init),
+                ));
             }
             out.push(assign_stmt(&tdz, AssignOp::Assign, num(0.0)));
         }
@@ -286,7 +290,11 @@ impl<'a> VisitMut for Rewriter<'a> {
                 {
                     let (val, tdz) = (b.val.clone(), b.tdz.clone());
                     if let Some(init) = d.init {
-                        exprs.push(Box::new(assign_expr(&val, AssignOp::Assign, *init)));
+                        exprs.push(Box::new(assign_expr(
+                            &val,
+                            AssignOp::Assign,
+                            *preserve_inferred_name(&bi.id.sym, init),
+                        )));
                     }
                     exprs.push(Box::new(assign_expr(&tdz, AssignOp::Assign, num(0.0))));
                 }
@@ -338,8 +346,21 @@ impl<'a> VisitMut for Rewriter<'a> {
                 let snap = simple_target_key(&a.left).and_then(|k| self.snapshot(&k));
                 if let Some(b) = snap {
                     let op = a.op;
+                    let grouped =
+                        matches!(a.left, AssignTarget::Simple(SimpleAssignTarget::Paren(_)));
                     a.right.visit_mut_with(self);
-                    let rhs = std::mem::replace(&mut a.right, Box::new(undefined_expr()));
+                    let mut rhs = std::mem::replace(&mut a.right, Box::new(undefined_expr()));
+                    if matches!(
+                        op,
+                        AssignOp::Assign
+                            | AssignOp::AndAssign
+                            | AssignOp::OrAssign
+                            | AssignOp::NullishAssign
+                    ) && let Some(name) =
+                        mangler_jsast::assignment_target::inferred_name(&a.left)
+                    {
+                        rhs = preserve_inferred_name(name, rhs);
+                    }
                     *e = if b.is_const {
                         let throw_const = call_throw(&self.helpers.throw_const, &b.val);
                         if op == AssignOp::Assign {
@@ -375,7 +396,16 @@ impl<'a> VisitMut for Rewriter<'a> {
                         let inner = Expr::Assign(AssignExpr {
                             span: DUMMY_SP,
                             op,
-                            left: ident_target(&b.val),
+                            // Grouping changes NamedEvaluation even though it
+                            // denotes the same binding reference.
+                            left: if grouped {
+                                AssignTarget::Simple(SimpleAssignTarget::Paren(ParenExpr {
+                                    span: DUMMY_SP,
+                                    expr: Box::new(ident_expr(&b.val)),
+                                }))
+                            } else {
+                                ident_target(&b.val)
+                            },
                             right: rhs,
                         });
                         guard(&b.tdz, &self.helpers.throw_tdz, &b.val, inner)
@@ -386,8 +416,10 @@ impl<'a> VisitMut for Rewriter<'a> {
             }
             // Update: `x++` / `--x`.
             Expr::Update(u) => {
-                let snap = match &*u.arg {
-                    Expr::Ident(id) => self.snapshot(&(id.sym.to_string(), id.ctxt)),
+                let snap = match mangler_jsast::assignment_target::expression_reference(&u.arg) {
+                    mangler_jsast::assignment_target::Reference::Ident(id) => {
+                        self.snapshot(&(id.sym.to_string(), id.ctxt))
+                    }
                     _ => None,
                 };
                 if let Some(b) = snap {
@@ -535,10 +567,18 @@ fn guard(tdz: &str, throw_tdz: &str, name: &str, value: Expr) -> Expr {
 }
 
 fn simple_target_key(t: &AssignTarget) -> Option<Key> {
-    match t {
-        AssignTarget::Simple(SimpleAssignTarget::Ident(bi)) => {
-            Some((bi.id.sym.to_string(), bi.id.ctxt))
+    match mangler_jsast::assignment_target::reference(t) {
+        mangler_jsast::assignment_target::Reference::Ident(id) => {
+            Some((id.sym.to_string(), id.ctxt))
         }
         _ => None,
+    }
+}
+
+fn preserve_inferred_name(name: &str, value: Box<Expr>) -> Box<Expr> {
+    if mangler_jsast::assignment_target::is_anonymous_definition(&value) {
+        mangler_jsast::assignment_target::named_value(name, value)
+    } else {
+        value
     }
 }

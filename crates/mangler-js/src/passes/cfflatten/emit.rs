@@ -26,9 +26,9 @@
 //! back to a bare numeric literal.
 
 use super::cfg::{BasicBlock, Edge};
-use crate::opaque::{opaque_u32, OpaqueAnchor};
+use crate::opaque::{OpaqueAnchor, opaque_u32};
 use mangler_core::Rng;
-use swc_core::common::{SyntaxContext, DUMMY_SP};
+use swc_core::common::{DUMMY_SP, SyntaxContext};
 use swc_core::ecma::ast::*;
 
 /// How the dispatcher key is represented in emitted code.
@@ -38,7 +38,11 @@ pub enum Dispatch {
     /// Two state variables. State value `V` is stored as `name1 = V / k`,
     /// `name2 = V % k`. Discriminant is a seed-chosen recombination evaluating to
     /// `name1 * k + name2 == V`.
-    Two { name1: String, name2: String, k: usize },
+    Two {
+        name1: String,
+        name2: String,
+        k: usize,
+    },
 }
 
 /// Options controlling how the state machine is rendered.
@@ -101,7 +105,10 @@ struct DataDep<'a> {
 
 impl<'a> DataDep<'a> {
     fn disabled() -> Self {
-        DataDep { vars: &[], rate: 0.0 }
+        DataDep {
+            vars: &[],
+            rate: 0.0,
+        }
     }
 
     fn enabled(&self) -> bool {
@@ -153,7 +160,10 @@ fn u32_of(var: &Ident) -> Expr {
 
 /// Wraps `e` in parentheses.
 fn paren(e: Expr) -> Expr {
-    Expr::Paren(ParenExpr { span: DUMMY_SP, expr: Box::new(e) })
+    Expr::Paren(ParenExpr {
+        span: DUMMY_SP,
+        expr: Box::new(e),
+    })
 }
 
 /// `op` applied as a binary expression to `(l) op (r)`, both operands parenthesized.
@@ -217,8 +227,12 @@ fn zero_offset(form: usize, var: &Ident) -> Expr {
 /// The set of wrapper operators `apply_offset_trick` may combine `base` with the
 /// provably-zero offset under. Each is the IDENTITY when the right operand is
 /// exactly `0` and `base` is a small non-negative int `< 2^31`.
-const OFFSET_WRAPPER_OPS: [BinaryOp; 4] =
-    [BinaryOp::BitXor, BinaryOp::Add, BinaryOp::Sub, BinaryOp::BitOr];
+const OFFSET_WRAPPER_OPS: [BinaryOp; 4] = [
+    BinaryOp::BitXor,
+    BinaryOp::Add,
+    BinaryOp::Sub,
+    BinaryOp::BitOr,
+];
 
 /// Wraps `base` as `base <op> (<self-cancelling zero in v>)`, with `<op>` one of
 /// [`OFFSET_WRAPPER_OPS`]. Behavior is preserved (the offset is `0`) while the
@@ -339,7 +353,11 @@ fn edge_tail(
             out.push(break_stmt());
             out
         }
-        Edge::Branch { cond, then_id, else_id } => {
+        Edge::Branch {
+            cond,
+            then_id,
+            else_id,
+        } => {
             // Then-branch state first, then else-branch, for deterministic RNG use.
             let then_stmts = set_state(rng, anchor, dd, dispatch, labels[then_id]);
             let else_stmts = set_state(rng, anchor, dd, dispatch, labels[else_id]);
@@ -363,8 +381,14 @@ fn edge_tail(
                 break_stmt(),
             ]
         }
-        Edge::Return(arg) => vec![Stmt::Return(ReturnStmt { span: DUMMY_SP, arg })],
-        Edge::Throw(arg) => vec![Stmt::Throw(ThrowStmt { span: DUMMY_SP, arg })],
+        Edge::Return(arg) => vec![Stmt::Return(ReturnStmt {
+            span: DUMMY_SP,
+            arg,
+        })],
+        Edge::Throw(arg) => vec![Stmt::Throw(ThrowStmt {
+            span: DUMMY_SP,
+            arg,
+        })],
     }
 }
 
@@ -435,14 +459,22 @@ fn two_discriminant(name1: &str, name2: &str, k: usize, form: usize) -> Expr {
         Some(p) => match form % TWO_DISC_FORMS {
             0 => or_zero(bin_raw(BinaryOp::Add, name1_times_k(name1, k), n2())),
             1 => or_zero(bin_raw(BinaryOp::Add, n2(), name1_times_k(name1, k))),
-            2 => or_zero(bin_raw(BinaryOp::Add, paren(or_zero(name1_times_k(name1, k))), n2())),
+            2 => or_zero(bin_raw(
+                BinaryOp::Add,
+                paren(or_zero(name1_times_k(name1, k))),
+                n2(),
+            )),
             3 => or_zero(bin_raw(BinaryOp::Add, paren(name1_shl(name1, p)), n2())),
             _ => bin_raw(BinaryOp::BitOr, name1_shl(name1, p), n2()),
         },
         None => match form % TWO_DISC_BASE_FORMS {
             0 => or_zero(bin_raw(BinaryOp::Add, name1_times_k(name1, k), n2())),
             1 => or_zero(bin_raw(BinaryOp::Add, n2(), name1_times_k(name1, k))),
-            _ => or_zero(bin_raw(BinaryOp::Add, paren(or_zero(name1_times_k(name1, k))), n2())),
+            _ => or_zero(bin_raw(
+                BinaryOp::Add,
+                paren(or_zero(name1_times_k(name1, k))),
+                n2(),
+            )),
         },
     }
 }
@@ -490,7 +522,10 @@ fn build_disc_coupling(rng: &mut Rng, anchor: Option<&OpaqueAnchor>) -> Option<D
     let a = anchor?;
     let wrapper = rng.pick(OFFSET_WRAPPER_OPS.len());
     let opaque_zero = opaque_u32(rng, a, 0);
-    Some(DiscCoupling { wrapper, opaque_zero })
+    Some(DiscCoupling {
+        wrapper,
+        opaque_zero,
+    })
 }
 
 /// Wraps the recombined discriminant `base` as `base <op> (opaque_zero)` where
@@ -512,7 +547,12 @@ fn couple_discriminant(base: Expr, c: DiscCoupling) -> Expr {
 }
 
 /// The initializing `var` declaration(s) that set the machine to `value`.
-fn init_decl(rng: &mut Rng, anchor: Option<&OpaqueAnchor>, dispatch: &Dispatch, value: usize) -> Stmt {
+fn init_decl(
+    rng: &mut Rng,
+    anchor: Option<&OpaqueAnchor>,
+    dispatch: &Dispatch,
+    value: usize,
+) -> Stmt {
     let mut decls: Vec<VarDeclarator> = Vec::new();
     let mut push = |name: &str, init: Expr| {
         decls.push(VarDeclarator {
@@ -556,7 +596,7 @@ pub fn render(
     entry: usize,
     _exit: usize,
     opts: &RenderOpts<'_>,
-) -> BlockStmt {
+) -> FunctionBody {
     let labels = opts.labels;
     let dispatch = &opts.dispatch;
     let anchor = opts.anchor;
@@ -592,7 +632,10 @@ pub fn render(
     // Each transitions unconditionally back to a LIVE state (the entry) and breaks.
     let dead_dd = if dd.enabled() {
         // Force the trick on every dead-state transition (rate 1.0).
-        DataDep { vars: dd.vars, rate: 1.0 }
+        DataDep {
+            vars: dd.vars,
+            rate: 1.0,
+        }
     } else {
         DataDep::disabled()
     };
@@ -610,6 +653,7 @@ pub fn render(
     // offset. This consumes new RNG ONLY when an anchor is present.
     let coupling = build_disc_coupling(rng, anchor);
     let switch = Stmt::Switch(SwitchStmt {
+        body_ctxt: Default::default(),
         span: DUMMY_SP,
         discriminant: Box::new(discriminant(dispatch, disc_form, coupling)),
         cases,
@@ -625,9 +669,8 @@ pub fn render(
         body: Box::new(switch),
     });
 
-    BlockStmt {
+    FunctionBody {
         span: DUMMY_SP,
-        ctxt: SyntaxContext::empty(),
         stmts: vec![init, while_stmt],
     }
 }
@@ -653,8 +696,14 @@ mod tests {
         let (blocks, entry, exit) =
             build_blocks("a = 1; if (a > 0) { a = 2; } else { a = 3; } b = a;");
         let labels = identity_labels(blocks.len());
-        let block = render(&mut r, blocks, entry, exit, &RenderOpts::single(&labels, "_0xst".into()));
-        let out = emit_block(&block);
+        let block = render(
+            &mut r,
+            blocks,
+            entry,
+            exit,
+            &RenderOpts::single(&labels, "_0xst".into()),
+        );
+        let out = emit_block(&block.stmts);
         assert!(out.contains("while"), "missing while: {out}");
         assert!(out.contains("switch"), "missing switch: {out}");
         assert!(out.contains("case "), "missing case: {out}");
@@ -666,8 +715,14 @@ mod tests {
         let mut r = rng(1);
         let (blocks, entry, exit) = build_blocks("a = 1; b = 2; return a + b;");
         let labels = identity_labels(blocks.len());
-        let block = render(&mut r, blocks, entry, exit, &RenderOpts::single(&labels, "_0xst".into()));
-        let out = emit_block(&block);
+        let block = render(
+            &mut r,
+            blocks,
+            entry,
+            exit,
+            &RenderOpts::single(&labels, "_0xst".into()),
+        );
+        let out = emit_block(&block.stmts);
         assert!(out.contains("return"), "missing return: {out}");
     }
 
@@ -679,13 +734,17 @@ mod tests {
         let labels = identity_labels(blocks.len());
         let opts = RenderOpts {
             labels: &labels,
-            dispatch: Dispatch::Two { name1: "_s1".into(), name2: "_s2".into(), k: 3 },
+            dispatch: Dispatch::Two {
+                name1: "_s1".into(),
+                name2: "_s2".into(),
+                k: 3,
+            },
             anchor: None,
             inscope_vars: &[],
             data_dep_rate: 0.0,
         };
         let block = render(&mut r, blocks, entry, exit, &opts);
-        let out = emit_block(&block);
+        let out = emit_block(&block.stmts);
         assert!(out.contains("_s1"), "missing s1: {out}");
         assert!(out.contains("_s2"), "missing s2: {out}");
         assert!(out.contains("switch"), "missing switch: {out}");
@@ -700,15 +759,23 @@ mod tests {
         let anchor = OpaqueAnchor::decoder("_core");
         let opts = RenderOpts {
             labels: &labels,
-            dispatch: Dispatch::Single { name: "_0xst".into() },
+            dispatch: Dispatch::Single {
+                name: "_0xst".into(),
+            },
             anchor: Some(&anchor),
             inscope_vars: &[],
             data_dep_rate: 0.0,
         };
         let block = render(&mut r, blocks, entry, exit, &opts);
-        let out = emit_block(&block);
-        assert!(out.contains("_core("), "opaque transition must call anchor: {out}");
-        assert!(out.contains(">>>"), "opaque transition must use >>>0: {out}");
+        let out = emit_block(&block.stmts);
+        assert!(
+            out.contains("_core("),
+            "opaque transition must call anchor: {out}"
+        );
+        assert!(
+            out.contains(">>>"),
+            "opaque transition must use >>>0: {out}"
+        );
     }
 
     #[test]
@@ -720,7 +787,9 @@ mod tests {
         let labels: Vec<usize> = (0..total).collect();
         let opts = RenderOpts {
             labels: &labels,
-            dispatch: Dispatch::Single { name: "_0xst".into() },
+            dispatch: Dispatch::Single {
+                name: "_0xst".into(),
+            },
             anchor: None,
             inscope_vars: &[],
             data_dep_rate: 0.0,
@@ -734,7 +803,11 @@ mod tests {
             _ => None,
         });
         let sw = switch.expect("switch present");
-        assert_eq!(sw.cases.len(), total, "must emit a case per live + dead state");
+        assert_eq!(
+            sw.cases.len(),
+            total,
+            "must emit a case per live + dead state"
+        );
     }
 
     fn build_blocks(src: &str) -> (Vec<cfg::BasicBlock>, usize, usize) {
@@ -755,9 +828,12 @@ mod tests {
         let b = BlockStmt {
             span: DUMMY_SP,
             ctxt: SyntaxContext::empty(),
-            stmts: vec![Stmt::Expr(ExprStmt { span: DUMMY_SP, expr: Box::new(e) })],
+            stmts: vec![Stmt::Expr(ExprStmt {
+                span: DUMMY_SP,
+                expr: Box::new(e),
+            })],
         };
-        emit_block(&b)
+        emit_block(&b.stmts)
     }
 
     /// The offset must NOT carry a `% 1` folding signature, and all
@@ -793,8 +869,18 @@ mod tests {
     fn zero_offset_forms_evaluate_to_zero() {
         use mangler_testkit::eval::assert_behaviorally_equal;
         let vals = [
-            "0", "1", "2", "255", "65535", "2147483647", "2147483648",
-            "4294967295", "-1", "-2147483648", "3.5", "1e9",
+            "0",
+            "1",
+            "2",
+            "255",
+            "65535",
+            "2147483647",
+            "2147483648",
+            "4294967295",
+            "-1",
+            "-2147483648",
+            "3.5",
+            "1e9",
         ];
         let v = var("_n");
         for form in 0..ZERO_OFFSET_FORMS {
@@ -869,13 +955,17 @@ mod tests {
             let labels = identity_labels(blocks.len());
             let opts = RenderOpts {
                 labels: &labels,
-                dispatch: Dispatch::Two { name1: "_s1".into(), name2: "_s2".into(), k: 4 },
+                dispatch: Dispatch::Two {
+                    name1: "_s1".into(),
+                    name2: "_s2".into(),
+                    k: 4,
+                },
                 anchor: None,
                 inscope_vars: &[],
                 data_dep_rate: 0.0,
             };
             let block = render(&mut r, blocks, entry, exit, &opts);
-            let out = emit_block(&block);
+            let out = emit_block(&block.stmts);
             for line in out.lines() {
                 if line.contains("switch") {
                     shapes.insert(line.trim().to_string());
@@ -900,8 +990,13 @@ mod tests {
                 for seed in 0..16u64 {
                     let mut r = rng(seed);
                     let opaque_zero = opaque_u32(&mut r, &anchor, 0);
-                    let coupled =
-                        couple_discriminant(num_lit(base), DiscCoupling { wrapper, opaque_zero });
+                    let coupled = couple_discriminant(
+                        num_lit(base),
+                        DiscCoupling {
+                            wrapper,
+                            opaque_zero,
+                        },
+                    );
                     let inner = expr_src(coupled);
                     for ret in &rets {
                         assert_behaviorally_equal(
@@ -931,13 +1026,15 @@ mod tests {
             let labels = identity_labels(blocks.len());
             let opts = RenderOpts {
                 labels: &labels,
-                dispatch: Dispatch::Single { name: "_0xst".into() },
+                dispatch: Dispatch::Single {
+                    name: "_0xst".into(),
+                },
                 anchor: Some(&anchor),
                 inscope_vars: &[],
                 data_dep_rate: 0.0,
             };
             let block = render(&mut r, blocks, entry, exit, &opts);
-            let out = emit_block(&block);
+            let out = emit_block(&block.stmts);
             let head = out
                 .lines()
                 .find(|l| l.contains("switch"))
@@ -971,12 +1068,14 @@ mod tests {
             let labels = identity_labels(blocks.len());
             let opts = RenderOpts {
                 labels: &labels,
-                dispatch: Dispatch::Single { name: "_0xst".into() },
+                dispatch: Dispatch::Single {
+                    name: "_0xst".into(),
+                },
                 anchor: Some(&anchor),
                 inscope_vars: &[],
                 data_dep_rate: 0.0,
             };
-            emit_block(&render(&mut r, blocks, entry, exit, &opts))
+            emit_block(&render(&mut r, blocks, entry, exit, &opts).stmts)
         };
         assert_eq!(render_once(), render_once());
     }

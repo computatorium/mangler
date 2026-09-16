@@ -188,6 +188,8 @@ where
 /// don't need a new mechanism each time.
 #[non_exhaustive]
 pub enum SubtreeMark<'a> {
+    /// An expression with explicit compiler provenance or a caller-selected shape.
+    Expr { expression: &'a Expr },
     /// The initializer expression of `<kind> <name> = <init>`. The borrow lets a
     /// predicate match on the binding name (e.g. the decoder `core`).
     VarDeclaratorInit { name: &'a Pat },
@@ -211,6 +213,7 @@ where
     SK: FnMut(SubtreeMark) -> bool,
 {
     fn visit_mut_expr(&mut self, e: &mut Expr) {
+        if (self.skip)(SubtreeMark::Expr { expression: e }) { return; }
         match self.order {
             Order::Pre => {
                 (self.on_expr)(e);

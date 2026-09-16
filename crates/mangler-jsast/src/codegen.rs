@@ -49,6 +49,7 @@ pub fn fn_decl(name: &str, params: &[&str], body: Vec<Stmt>) -> Stmt {
 /// The shared [`Function`] node: simple-ident params + a block body.
 fn function(params: &[&str], body: Vec<Stmt>) -> Function {
     Function {
+        this_param: None,
         params: params
             .iter()
             .map(|p| Param {
@@ -63,7 +64,10 @@ fn function(params: &[&str], body: Vec<Stmt>) -> Function {
         decorators: vec![],
         span: injected_span(),
         ctxt: SyntaxContext::empty(),
-        body: Some(build::block(body)),
+        body: Some(FunctionBody {
+            span: injected_span(),
+            stmts: body,
+        }),
         is_generator: false,
         is_async: false,
         type_params: None,
@@ -142,7 +146,11 @@ pub fn djb2_fn(s_param: &str, h_var: &str, k_var: &str) -> Expr {
     );
     let mul = build::bin(BinaryOp::Mul, build::ident_expr(h_var), build::num_u32(33));
     let add = build::bin(BinaryOp::Add, mul, char_code);
-    let zero_fill = build::bin(BinaryOp::ZeroFillRShift, build::paren(add), build::num_u32(0));
+    let zero_fill = build::bin(
+        BinaryOp::ZeroFillRShift,
+        build::paren(add),
+        build::num_u32(0),
+    );
     let fold = build::expr_stmt(build::assign(h_var, zero_fill));
 
     // for (var k = 0; k < s.length; k++) { fold }
@@ -177,9 +185,9 @@ mod tests {
     use super::*;
     use crate::lang::{Js, ParseOpts};
     use mangler_core::hash::djb2_utf16;
-    use swc_core::common::sync::Lrc;
     use swc_core::common::SourceMap;
-    use swc_core::ecma::codegen::{text_writer::JsWriter, Config as CodegenConfig, Emitter};
+    use swc_core::common::sync::Lrc;
+    use swc_core::ecma::codegen::{Config as CodegenConfig, Emitter, text_writer::JsWriter};
 
     fn emit_stmt(s: Stmt) -> String {
         let cm: Lrc<SourceMap> = Default::default();
@@ -208,10 +216,17 @@ mod tests {
 
     #[test]
     fn fn_decl_and_expr_emit_and_reparse() {
-        let d = fn_decl("f", &["a", "b"], vec![build::return_stmt(build::ident_expr("a"))]);
+        let d = fn_decl(
+            "f",
+            &["a", "b"],
+            vec![build::return_stmt(build::ident_expr("a"))],
+        );
         let src = emit_stmt(d);
         assert!(src.contains("function f(a,b)"), "fn decl shape: {src}");
-        assert!(Js::reparse(&src, &ParseOpts::default()).is_ok(), "reparses: {src}");
+        assert!(
+            Js::reparse(&src, &ParseOpts::default()).is_ok(),
+            "reparses: {src}"
+        );
     }
 
     #[test]
@@ -221,12 +236,18 @@ mod tests {
         assert!(src.contains("5381"), "seed present: {src}");
         assert!(src.contains("33"), "*33 present: {src}");
         assert!(src.contains("charCodeAt"), "charCodeAt present: {src}");
-        assert!(src.contains(">>>0") || src.contains(">>> 0"), "zero-fill present: {src}");
+        assert!(
+            src.contains(">>>0") || src.contains(">>> 0"),
+            "zero-fill present: {src}"
+        );
         // The whole emitted expression is a valid function expression. `emit_expr`
         // appends a `;`; assign it to a var so a bare anonymous `function(){}` is
         // not mis-parsed as a (name-less, illegal) function declaration.
         let wrapped = format!("var _f = {src}");
-        assert!(Js::reparse(&wrapped, &ParseOpts::default()).is_ok(), "reparses: {src}");
+        assert!(
+            Js::reparse(&wrapped, &ParseOpts::default()).is_ok(),
+            "reparses: {src}"
+        );
     }
 
     /// The crucial guarantee: the emitted JS DJB2 computes the SAME digest the Rust

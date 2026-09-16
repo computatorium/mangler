@@ -70,11 +70,15 @@ pub enum SkipMethodWrappers {
 /// Walk a function body, returning [`Eligibility::Skip`] with the **first** reason a
 /// `reject` rule returns in depth-first order, else [`Eligibility::Eligible`].
 pub fn body_classify(
-    body: &BlockStmt,
+    body: &FunctionBody,
     skip: SkipMethodWrappers,
     reject: &dyn Fn(Probe) -> Option<&'static str>,
 ) -> Eligibility {
-    let mut w = Walker { reject, skip, reason: None };
+    let mut w = Walker {
+        reject,
+        skip,
+        reason: None,
+    };
     body.visit_with(&mut w);
     match w.reason {
         Some(r) => Eligibility::Skip(r),
@@ -100,6 +104,9 @@ impl Walker<'_> {
 }
 
 impl Visit for Walker<'_> {
+    fn visit_bin_expr(&mut self, binary: &BinExpr) {
+        crate::deep::walk_binary(binary, self);
+    }
     fn visit_with_stmt(&mut self, n: &WithStmt) {
         self.probe(Probe::With(n));
     }
@@ -184,7 +191,7 @@ mod tests {
     use crate::lang::{Js, ParseOpts};
     use mangler_core::Language;
 
-    fn parse_body(src: &str) -> BlockStmt {
+    fn parse_body(src: &str) -> FunctionBody {
         let wrapped = format!("function __t() {{ {src} }}");
         let program = Js
             .parse(&wrapped, &ParseOpts::default())

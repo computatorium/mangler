@@ -39,7 +39,18 @@ impl TryFrom<ConfigFlags> for ResolvedConfig {
     /// filled with `rand::random()` so the value plumbs through deterministically
     /// from here on.
     fn try_from(flags: ConfigFlags) -> Result<Self, Self::Error> {
-        let fallback = rand::random::<u64>();
+        let fallback = match flags.seed {
+            Some(seed) => seed,
+            #[cfg(not(target_family = "wasm"))]
+            None => rand::random::<u64>(),
+            #[cfg(target_family = "wasm")]
+            None => {
+                return Err(ConfigError::MissingDependency {
+                    flag: "WebAssembly configuration",
+                    requires: "an explicit seed or from_flags_with_seed",
+                });
+            }
+        };
         Self::from_flags_with_seed(flags, fallback)
     }
 }

@@ -10,7 +10,7 @@
 
 use std::collections::HashSet;
 
-use mangler_jsast::analysis::eligibility::{body_classify, Probe, SkipMethodWrappers};
+use mangler_jsast::analysis::eligibility::{Probe, SkipMethodWrappers, body_classify};
 use mangler_jsast::analysis::is_direct_eval_callee;
 use swc_core::ecma::ast::*;
 use swc_core::ecma::visit::{Visit, VisitWith};
@@ -20,7 +20,7 @@ pub use mangler_jsast::analysis::eligibility::Eligibility;
 /// Classify whether a function/arrow/method body is safe for control-flow flattening.
 /// Caller must already have checked that the containing Function is neither generator
 /// nor async (this function only walks the body).
-pub fn classify_function_body(body: &BlockStmt) -> Eligibility {
+pub fn classify_function_body(body: &FunctionBody) -> Eligibility {
     // `too_small` is a statement-count gate, not a body-walk concern: keep it as a
     // caller-side pre-check (mirrors the spec's scope rule).
     if body.stmts.len() <= 2 {
@@ -72,7 +72,10 @@ fn for_let_closure(n: &ForStmt) -> Option<&'static str> {
     if names.is_empty() {
         return None;
     }
-    let mut closure_scan = ClosureRefsScanner { names: &names, found: false };
+    let mut closure_scan = ClosureRefsScanner {
+        names: &names,
+        found: false,
+    };
     // Scan init/test/update/body so closures created in the test or update (not just
     // the body) are detected too.
     n.visit_with(&mut closure_scan);
@@ -94,14 +97,20 @@ impl<'a> Visit for ClosureRefsScanner<'a> {
     // function/arrow visitors to descend (NOT no-op) and check their bodies
     // for ident references to any of `names`.
     fn visit_function(&mut self, n: &Function) {
-        let mut ref_scan = IdentRefScanner { names: self.names, found: false };
+        let mut ref_scan = IdentRefScanner {
+            names: self.names,
+            found: false,
+        };
         n.visit_with(&mut ref_scan);
         if ref_scan.found {
             self.found = true;
         }
     }
     fn visit_arrow_expr(&mut self, n: &ArrowExpr) {
-        let mut ref_scan = IdentRefScanner { names: self.names, found: false };
+        let mut ref_scan = IdentRefScanner {
+            names: self.names,
+            found: false,
+        };
         n.visit_with(&mut ref_scan);
         if ref_scan.found {
             self.found = true;
@@ -157,7 +166,7 @@ pub struct BodyGates {
 ///
 /// Behavior is bit-for-bit identical to running separate visitors; each check
 /// keeps its own traversal boundary (see the per-handler comments on [`GateScan`]).
-pub fn scan_gates(body: &BlockStmt) -> BodyGates {
+pub fn scan_gates(body: &FunctionBody) -> BodyGates {
     // `too_small` is a statement-count gate evaluated before any walk, exactly
     // as in `classify_function_body`; the other gate fields are never read by
     // the caller on the Skip path.
@@ -484,7 +493,10 @@ mod tests {
         let src = "var a = []; for (let i = 0; i < 3; i++) { a.push(function(){ return i; }); } return a[0]();";
         match check(src) {
             Eligibility::Skip("per_iter_let_with_closure") => {}
-            other => panic!("expected per_iter_let_with_closure, got {:?}", reason(other)),
+            other => panic!(
+                "expected per_iter_let_with_closure, got {:?}",
+                reason(other)
+            ),
         }
     }
 
@@ -511,7 +523,10 @@ mod tests {
         let src = "var fns=[]; for (let i=0; (fns.push(function(){return i;}), i<3); i++) {} return fns[0]();";
         match check(src) {
             Eligibility::Skip("per_iter_let_with_closure") => {}
-            other => panic!("expected per_iter_let_with_closure, got {:?}", reason(other)),
+            other => panic!(
+                "expected per_iter_let_with_closure, got {:?}",
+                reason(other)
+            ),
         }
     }
 
@@ -553,20 +568,41 @@ mod tests {
     #[test]
     fn fused_break_continue_boundaries() {
         assert!(gates("var a=0; for(;;){ a++; break; } return a;").has_break_continue);
-        assert!(!gates("var a=1; var b=2; function g(){ for(;;) break; } return g;").has_break_continue);
-        assert!(gates("var a=1; var b=2; class C { constructor(){ for(;;){ break; } } } return C;").has_break_continue);
-        assert!(gates("var a=1; var b=2; class C { static { for(;;) break; } } return C;").has_break_continue);
-        assert!(gates("var a=1; var b=2; var o={ get g(){ for(;;) break; return 1; } }; return o;").has_break_continue);
-        assert!(!gates("var a=1; var b=2; class C { m(){ for(;;) break; } } return C;").has_break_continue);
+        assert!(
+            !gates("var a=1; var b=2; function g(){ for(;;) break; } return g;").has_break_continue
+        );
+        assert!(
+            gates("var a=1; var b=2; class C { constructor(){ for(;;){ break; } } } return C;")
+                .has_break_continue
+        );
+        assert!(
+            gates("var a=1; var b=2; class C { static { for(;;) break; } } return C;")
+                .has_break_continue
+        );
+        assert!(
+            !gates("var a=1; var b=2; var o={ get g(){ for(;;) break; return 1; } }; return o;")
+                .has_break_continue
+        );
+        assert!(
+            !gates("var a=1; var b=2; class C { m(){ for(;;) break; } } return C;")
+                .has_break_continue
+        );
     }
 
     #[test]
     fn fused_let_const_boundaries() {
         assert!(gates("let a = 1; var b = 2; return a + b;").has_let_const);
         assert!(gates("var a = 1; var b = 2; const c = 3; return c;").has_let_const);
-        assert!(!gates("var a=1; var b=2; class C { static { let x = 1; } } return C;").has_let_const);
-        assert!(!gates("var a=1; var b=2; function g(){ let x=1; return x; } return g;").has_let_const);
-        assert!(gates("var a=1; var b=2; var o={ get g(){ let x=1; return x; } }; return o;").has_let_const);
+        assert!(
+            !gates("var a=1; var b=2; class C { static { let x = 1; } } return C;").has_let_const
+        );
+        assert!(
+            !gates("var a=1; var b=2; function g(){ let x=1; return x; } return g;").has_let_const
+        );
+        assert!(
+            !gates("var a=1; var b=2; var o={ get g(){ let x=1; return x; } }; return o;")
+                .has_let_const
+        );
     }
 
     #[test]
@@ -576,19 +612,39 @@ mod tests {
         assert!(!gates("var a=1; var b=2; class C {} return C;").tdz_struct_safe);
         assert!(gates("var a=1; var b=2; var C = class {}; return C;").tdz_struct_safe);
         assert!(gates("var [x] = [1]; var b=2; return x + b;").tdz_struct_safe);
-        assert!(gates("var a=1; var b=2; function g(){ let [x]=[1]; return x; } return g;").tdz_struct_safe);
-        assert!(gates("var a=1; var b=2; var C = class { static { class D {} } }; return C;").tdz_struct_safe);
+        assert!(
+            gates("var a=1; var b=2; function g(){ let [x]=[1]; return x; } return g;")
+                .tdz_struct_safe
+        );
+        assert!(
+            gates("var a=1; var b=2; var C = class { static { class D {} } }; return C;")
+                .tdz_struct_safe
+        );
     }
 
     #[test]
     fn fused_loop_let_names() {
         let g = gates("var a=0; for (let i=0; i<3; i++) { let x=i; a+=x; } return a;");
         assert_eq!(g.loop_let_names, vec!["i".to_string(), "x".to_string()]);
-        let g = gates("var a=0; var o={}; while(a<1){ let w=1; a+=w; } for (var k in o) { let q=2; a+=q; } return a;");
+        let g = gates(
+            "var a=0; var o={}; while(a<1){ let w=1; a+=w; } for (var k in o) { let q=2; a+=q; } return a;",
+        );
         assert_eq!(g.loop_let_names, vec!["w".to_string(), "q".to_string()]);
-        assert!(gates("let a = 1; var b = 2; return a + b;").loop_let_names.is_empty());
-        assert!(gates("var a=1; var b=2; class C { static { for(;;){ let x=1; } } } return C;").loop_let_names.is_empty());
-        assert!(gates("var a=1; var b=2; function g(){ for(;;){ let x=1; } } return g;").loop_let_names.is_empty());
+        assert!(
+            gates("let a = 1; var b = 2; return a + b;")
+                .loop_let_names
+                .is_empty()
+        );
+        assert!(
+            gates("var a=1; var b=2; class C { static { for(;;){ let x=1; } } } return C;")
+                .loop_let_names
+                .is_empty()
+        );
+        assert!(
+            gates("var a=1; var b=2; function g(){ for(;;){ let x=1; } } return g;")
+                .loop_let_names
+                .is_empty()
+        );
     }
 
     #[test]
@@ -601,7 +657,8 @@ mod tests {
     fn first_reason_wins_dfs_order() {
         let src = "var a=1; var b=2; try { a=b; } catch(e){} switch(a){ case 1: break; } return a;";
         assert_eq!(reason(check(src)), "try_catch");
-        let src2 = "var a=1; var b=2; switch(a){ case 1: break; } try { a=b; } catch(e){} return a;";
+        let src2 =
+            "var a=1; var b=2; switch(a){ case 1: break; } try { a=b; } catch(e){} return a;";
         assert_eq!(reason(check(src2)), "switch");
     }
 }
